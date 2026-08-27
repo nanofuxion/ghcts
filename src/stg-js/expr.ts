@@ -59,6 +59,7 @@ import {
   ctxTarget,
   ctxUpdateLneFrame,
 } from "./expr-ctx.js";
+import { genForeignCall, genPrimCall } from "./ffi.js";
 import { closureField1, closureField2, closureInfo, closureInfo_, closureField1_, closureField2_, closureMeta_ } from "./heap.js";
 import {
   declVarsForId,
@@ -276,13 +277,11 @@ export function genExpr(gs: GenState, ctx: ExprCtx, stg: StgExpr): [JStgStat, Ex
     case "StgOpApp":
       switch (stg.op.tag) {
         case "StgFCallOp":
-          // GHC.StgToJS.FFI is not ported; a `foreign import javascript` never
-          // reaches codegen yet.
-          throw new Error("genExpr: foreign calls are not supported (GHC.StgToJS.FFI is unported)");
+          return genForeignCall(gs, ctx, stg.op.target, ctxTarget(ctx).flatMap((t) => t.expr), stg.args);
         case "StgPrimOp":
           return genPrimOp(gs, ctx, stg.op.op, stg.args);
         case "StgPrimCallOp":
-          throw new Error("genExpr: prim calls are not supported (GHC.StgToJS.FFI is unported)");
+          return genPrimCall(gs, ctx, stg.op.name, stg.args);
       }
       break;
     case "StgCase":

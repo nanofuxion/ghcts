@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { checkModule, classMembers, collectDictionaries, compileProject, instanceHead, instanceMembers, instanceMethodValues, lowerModule, selectInstance, serveProject } from '../dist/index.js';
+import { checkModule, classMembers, collectDictionaries, compileProject, coreToStg, desugarModule, instanceHead, instanceMembers, instanceMethodValues, lowerModule, selectInstance, serveProject } from '../dist/index.js';
+import { UpdateFlag } from '../dist/stg.js';
 import { applyLayout, lex, preprocess } from '../dist/lexer.js';
 import { parseModule } from '../dist/parser.js';
 import { collectInterface } from '../dist/interface.js';
@@ -293,9 +294,30 @@ test('invokes host requestAnimationFrame callbacks with a JS timestamp', () => {
 
 test('lowers surface expressions through the explicit Core boundary', () => {
   const parsed = parseModule('module Main where\nmain = let value = 40 in value + 2\n', 'CoreBoundary.hs');
-  const core = lowerModule(parsed.module.ast);
-  assert.equal(core.bindings[0].name, 'main');
-  assert.equal(core.bindings[0].equations[0].guards[0].body.tag, 'let');
+  const { program, diagnostics } = desugarModule(parsed.module.ast, 'CoreBoundary.hs');
+  assert.deepEqual(diagnostics, []);
+  const [main] = program.binds;
+  assert.equal(main.binder.name, 'main');
+  // let-bound value, then the saturated IntAddOp application `+` reduces to.
+  assert.equal(main.rhs.tag, 'Let');
+  assert.equal(main.rhs.body.tag, 'Op');
+  assert.equal(main.rhs.body.op.op, 'IntAddOp');
+  assert.equal(main.rhs.body.args.length, 2);
+
+  // Core to STG must leave every argument atomic and every closure carrying
+  // its update flag: `main` is a nullary CAF, so it is an updatable thunk.
+  const stg = coreToStg(program);
+  const binding = stg.bindings.find(b => b.binder?.name === 'main');
+  assert.equal(binding.rhs.tag, 'StgRhsClosure');
+  assert.equal(binding.rhs.update, UpdateFlag.Updatable);
+  assert.deepEqual(binding.rhs.args, []);
+  assert.deepEqual(binding.rhs.freeVars, []);
+});
+
+test('rejects class methods instead of guessing a dictionary', () => {
+  const parsed = parseModule('module Main where\nclass Shape a where\n  area :: a -> Int\nmain = area 1\n', 'Dict.hs');
+  const { diagnostics } = desugarModule(parsed.module.ast, 'Dict.hs');
+  assert.ok(diagnostics.some(d => d.message.includes('dictionary elaboration')));
 });
 
 test('preserves do bind patterns and local declarations in Core', () => {

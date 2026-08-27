@@ -14,7 +14,7 @@ import { bootModuleSource } from "./boot.js";
 import { parseCabalLibrary } from "./cabal.js";
 import { parseModule, type ParsedModule } from "./parser.js";
 import { checkModules } from "./typecheck.js";
-import { lowerModules } from "./core.js";
+import { lowerModules } from "./core-legacy.js";
 import { classMembers, instanceHead, instanceMethodValues } from "./dictionary.js";
 import * as Syntax from "./js/syntax.js";
 import * as Ppr from "./js/ppr.js";
