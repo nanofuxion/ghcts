@@ -1,34 +1,38 @@
-/** The hand-written half of GHC's JavaScript RTS.
+/** The hand-written half of GHC's JavaScript RTS - and the rest of lib.js.
  *
  * `src/stg-js/rts.ts` reproduces the half GHC *generates* from Haskell. This
- * is the other half: the files under `rts/js/` that GHC ships as ordinary
- * package JS sources. The linker concatenates them into `lib.js` rather than
- * `rts.js`, which is why they never showed up in the byte-for-byte diff -
- * but generated code calls into them constantly (`h$o`, `h$init_closure`,
- * `h$sti`, `h$stc`, `h$addCAF`, `h$rs`, `h$newByteArray`, `h$forkThread`),
- * so nothing ghcts emits runs without them.
+ * is the other half: the files packages ship as ordinary `js-sources`. The
+ * linker concatenates them into `lib.js` rather than `rts.js`, which is why
+ * they never showed up in the byte-for-byte rts.js diff - but generated code
+ * calls into them constantly (`h$o`, `h$init_closure`, `h$sti`, `h$stc`,
+ * `h$addCAF`, `h$rs`, `h$newByteArray`, `h$forkThread`), so nothing ghcts
+ * emits runs without them.
  *
  * Nothing here is ported. These are GHC's own files, used verbatim, in the
- * order `rts/rts.cabal`'s `js-sources` lists - which is the order the linker
- * emits them and the order the oracle's lib.js confirms.
+ * order their cabal files list them and the order `jsLinkBinary` walks the
+ * packages - which the oracle's lib.js confirms.
  *
  * The only code written here is CPP, because the sources carry
  * `//#OPTIONS: CPP` and GHC runs them through a real C preprocessor
  * (`GHC.StgToJS.Linker.Linker.jsLinkBinary` -> `doCpp` with `SCPJsCpp`),
  * after prepending the macro prelude that `genCommonCppDefs` builds.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { StgToJSConfig } from "./types.js";
 
 const packageRoot = dirname(dirname(dirname(new URL(import.meta.url).pathname)));
 
-/** Where GHC's own RTS sources live. */
-export const rtsJsDir = join(packageRoot, "references/ghc/rts/js");
+/** `js-sources` from libraries/ghc-internal/ghc-internal.cabal.in.
+ *
+ * The cabal file spells the reason for the order out: "platform must be linked
+ * first because it defines global constants (e.g. h$isNode)" - the rts sources
+ * below call those predicates at load time. */
+const ghcInternalJsFiles = ["platform.js", "base.js", "errno.js"];
 
 /** `js-sources` from rts/rts.cabal, in order. The linker emits them in this
  * order and later files depend on earlier ones, so it is not incidental. */
-export const rtsJsFiles = [
+const rtsJsFiles = [
   "config.js",
   "structs.js",
   "arith.js",
@@ -56,6 +60,22 @@ export const rtsJsFiles = [
   "weak.js",
   "globals.js",
   "time.js",
+];
+
+/** Every package that contributes `js-sources`, in link order.
+ *
+ * `jsLinkBinary` writes lib.js by walking `S.toList (lkp_archives link_plan)`
+ * - a `Set FilePath`, so the packages come out sorted by library path, which
+ * puts ghc-internal ahead of rts - and appending each archive's JS entries in
+ * archive order, which is the order the package's cabal file lists them.
+ *
+ * Only these two ship JS: a tree-wide sweep of GHC 9.12.2 finds `js-sources`
+ * in exactly rts/rts.cabal, ghc-internal.cabal.in, and ghc.cabal.in - and the
+ * last is one file (jsbits/genSym.js) that only links into programs depending
+ * on the ghc library itself. base and ghc-prim contribute nothing. */
+const jsSourcePackages: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+  ["references/ghc/libraries/ghc-internal/jsbits", ghcInternalJsFiles],
+  ["references/ghc/rts/js", rtsJsFiles],
 ];
 
 // ---------------------------------------------------------------------------
@@ -577,8 +597,8 @@ function evalIf(expr: string, macros: ReadonlyMap<string, Macro>): boolean {
  * read back off `PROFILING`, so callers only pass one thing.
  *
  * Deliberately unsupported, because these files use none of it: `#elif`,
- * `#include`, `#` stringification, arithmetic in `#if`, and `defined` combined
- * with anything other than `||`. */
+ * `#` stringification, arithmetic in `#if`, and `defined` combined with
+ * anything other than `||`. */
 export function preprocess(source: string, defines: ReadonlySet<string>): string {
   // GHC only runs cpp over files whose header pragma asks for it
   // (`getOptionsFromJsFile` -> `enableCPP`). The other eight rts/js sources go
@@ -587,7 +607,24 @@ export function preprocess(source: string, defines: ReadonlySet<string>): string
 
   const macros = new Map<string, Macro>();
   for (const d of defines) macros.set(d, { params: null, variadic: null, body: [] });
-  const text = genCommonCppDefs(defines.has("PROFILING")) + source;
+  // ghc-internal's base.js and errno.js `#include "HsBaseConfig.h"` for the
+  // errno numbers and struct stat layout of the JS target. Both ask for it on
+  // their first line, before any code, so splicing the header's text in where
+  // the directive sits is the whole of what cpp does with it.
+  //
+  // The header sits next to this file rather than in references/ghc because it
+  // is not in the source tree at all: configure generates it, so the copy that
+  // matters is the one the javascript-unknown-ghcjs build produced. It is that
+  // installed file verbatim (ghc-internal-9.1202.0/include/HsBaseConfig.h).
+  // Anything else a source includes is not on disk here, and an unresolvable
+  // quoted include must not silently expand to nothing - hence the throw.
+  const text =
+    genCommonCppDefs(defines.has("PROFILING")) +
+    source.replace(/^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$/gm, (_, name: string) => {
+      const path = join(packageRoot, "src/stg-js", name);
+      if (!existsSync(path)) throw new Error(`no header for #include "${name}"`);
+      return readFileSync(path, "utf8");
+    });
 
   const out: string[] = [];
   /** Emitted-but-not-yet-expanded lines. Flushed whenever the macro table
@@ -673,6 +710,9 @@ export function preprocess(source: string, defines: ReadonlySet<string>): string
       case "endif":
         stack.pop();
         break;
+      case "include":
+        // Already spliced in above; the header itself contributes no output.
+        break;
       default:
         // `//#OPTIONS:` lines and anything else pass through as comments.
         if (live()) pending.push(line);
@@ -697,12 +737,15 @@ export function definesFor(cfg: Pick<StgToJSConfig, "prof" | "debugAlloc">): Set
   return defines;
 }
 
-/** The hand-written RTS, preprocessed and concatenated in cabal order. */
+/** lib.js: every package's `js-sources`, preprocessed and concatenated in the
+ * order the linker emits them. */
 export function renderStaticRts(
   cfg: Pick<StgToJSConfig, "prof" | "debugAlloc"> = { prof: false, debugAlloc: false },
 ): string {
   const defines = definesFor(cfg);
-  return rtsJsFiles
-    .map((name) => preprocess(readFileSync(join(rtsJsDir, name), "utf8"), defines))
+  return jsSourcePackages
+    .flatMap(([dir, files]) =>
+      files.map((name) => preprocess(readFileSync(join(packageRoot, dir, name), "utf8"), defines)),
+    )
     .join("\n");
 }

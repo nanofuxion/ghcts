@@ -34,21 +34,7 @@ import { formatDiagnostic } from "../dist/diagnostics.js";
 
 const show = process.argv.includes("--print");
 const config = defaultStgToJSConfig;
-const baseShim = `
-var h$isNode_ = true, h$isJvm_ = false, h$isJsShell_ = false,
-    h$isJsCore_ = false, h$isBrowser_ = false, h$isGHCJSi_ = false;
-function h$isNode()    { return h$isNode_; }
-function h$isJvm()     { return h$isJvm_; }
-function h$isJsShell() { return h$isJsShell_; }
-function h$isJsCore()  { return h$isJsCore_; }
-function h$isBrowser() { return h$isBrowser_; }
-function h$isGHCJSi()  { return h$isGHCJSi_; }
-function h$getGlobal(that) {
-    if(typeof global !== 'undefined') return global;
-    return that;
-}
-`;
-const rts = baseShim + renderRts(config) + "\n" + renderStaticRts(config);
+const rts = renderRts(config) + "\n" + renderStaticRts(config);
 
 /** Test-only scaffolding: a stack, a trampoline and a stop frame that
  * captures R1 so a program's value can be read back. GHC's own h$main

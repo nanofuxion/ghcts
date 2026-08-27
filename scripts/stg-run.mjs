@@ -30,33 +30,13 @@ import { mkBinder, mkDataCon, UpdateFlag } from "../dist/stg.js";
 const show = process.argv.includes("--print");
 const config = defaultStgToJSConfig;
 const mod = { unitId: "main", moduleName: "Test" };
-/** rts/js/ calls the platform predicates and h$getGlobal at load time but does
- * not define them: they come from base's jsbits shim, which a real link
- * supplies and this harness does not (the oracle's all.js has them around line
- * 9155). Copied from there, with the node.js branch taken, and it has to land
- * before the RTS. */
-const baseShim = `
-var h$isNode_ = true, h$isJvm_ = false, h$isJsShell_ = false,
-    h$isJsCore_ = false, h$isBrowser_ = false, h$isGHCJSi_ = false;
-function h$isNode()    { return h$isNode_; }
-function h$isJvm()     { return h$isJvm_; }
-function h$isJsShell() { return h$isJsShell_; }
-function h$isJsCore()  { return h$isJsCore_; }
-function h$isBrowser() { return h$isBrowser_; }
-function h$isGHCJSi()  { return h$isGHCJSi_; }
-function h$getGlobal(that) {
-    if(typeof global !== 'undefined') return global;
-    return that;
-}
-`;
-
-const rts = baseShim + renderRts(config) + "\n" + renderStaticRts(config);
+const rts = renderRts(config) + "\n" + renderStaticRts(config);
 
 /** Test-only scaffolding: the harness drives one term to completion itself
  * rather than starting a real thread, so it supplies its own stack, its own
  * trampoline, and a stop frame that captures R1. Everything else the emitted
  * code touches - h$o, h$init_closure, h$sti, h$stc, h$addCAF, h$rs - comes
- * from renderStaticRts(), which is GHC's own rts/js/ sources.
+ * from renderStaticRts(), which is GHC's own package JS sources.
  */
 const bootstrap = `
 h$stack = new Array(1000);

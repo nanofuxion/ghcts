@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Fidelity check for src/stg-js/rts-static.ts against the golden GHC oracle.
+ * Fidelity check for src/stg-js/rts-static.ts - the whole of lib.js - against
+ * a golden GHC oracle.
  *
  * references/miso-lynx/oracle-jsexe/lib.js is real GHC 9.12.2 output. It holds
  * the rts/js/ sources already run through GHC's own CPP, alongside every other
@@ -10,12 +11,13 @@
  *   node scripts/static-rts-diff.mjs          # summary + first 3 differing
  *   node scripts/static-rts-diff.mjs -n 10
  *   node scripts/static-rts-diff.mjs --name h$rts_isThreaded
+ *   node scripts/static-rts-diff.mjs --oracle out.jsexe/lib.js
  */
 import { readFileSync } from "node:fs";
 
-const ORACLE = "references/miso-lynx/oracle-jsexe/lib.js";
 const args = process.argv.slice(2);
 const value = (f) => (args.indexOf(f) >= 0 ? args[args.indexOf(f) + 1] : undefined);
+const ORACLE = value("--oracle") ?? "references/miso-lynx/oracle-jsexe/lib.js";
 const show = Number(value("-n") ?? 3);
 const only = value("--name");
 
@@ -69,8 +71,15 @@ const same = shared.length - differing.length;
 
 console.log(`${same}/${shared.length} shared functions byte-identical (${((same / shared.length) * 100).toFixed(1)}%)`);
 console.log(`${oracle.size} in oracle lib.js, ${ours.size} in ghcts static RTS, ${shared.length} in both`);
-const missing = [...ours.keys()].filter((n) => !oracle.has(n));
-if (missing.length) console.log(`${missing.length} emitted by ghcts but absent from the oracle: ${missing.slice(0, 10).join(", ")}`);
+const extra = [...ours.keys()].filter((n) => !oracle.has(n));
+if (extra.length) console.log(`${extra.length} emitted by ghcts but absent from the oracle: ${extra.slice(0, 10).join(", ")}`);
+// The other direction is the coverage number: how much of GHC's lib.js we now
+// emit. Against a bundle that links extra packages (the miso oracle links
+// miso's own js-sources) the shortfall is those packages, not a gap in ours -
+// point --oracle at a lib.js from a plain program to see a true zero.
+const missing = [...oracle.keys()].filter((n) => !ours.has(n));
+console.log(`${shared.length}/${oracle.size} of the oracle's lib.js functions emitted by ghcts` +
+  (missing.length ? `; ${missing.length} not: ${missing.slice(0, 10).join(", ")}${missing.length > 10 ? ", ..." : ""}` : ""));
 
 const picked = only ? [only] : differing.slice(0, show);
 for (const name of picked) {

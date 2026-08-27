@@ -73,18 +73,6 @@ function symbolFor(name) {
 }
 const workSymbol = symbolFor("work");
 
-/** Base's jsbits supplies these platform predicates; rts/js/ calls them at
- * load time but never defines them. A real link gets them from base. */
-const baseShim = `
-function h$getGlobal(m) { return null; }
-function h$isNode() { return typeof process !== 'undefined' && !!(process.versions && process.versions.node); }
-function h$isJvm() { return false; }
-function h$isJsShell() { return false; }
-function h$isJsCore() { return false; }
-function h$isBrowser() { return !h$isNode(); }
-function h$isGHCJSi() { return false; }
-`;
-
 /** Entering Haskell from JavaScript, GHC's way.
  *
  * A one-argument call puts the closure in R1 and the argument in R2 and goes
@@ -187,7 +175,7 @@ globalThis.renderPage = function () {
 `;
 
 const all =
-  baseShim + renderRts(config) + "\n" + renderStaticRts(config) + "\n" + out + runmain + lynxPage;
+  renderRts(config) + "\n" + renderStaticRts(config) + "\n" + out + runmain + lynxPage;
 
 mkdirSync(OUT, { recursive: true });
 const file = join(OUT, "all.js");
