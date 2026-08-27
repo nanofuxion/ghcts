@@ -54,8 +54,18 @@ if (missing.length) console.log(`  ${missing.join(" ")}`);
 
 if (args.includes("--check")) process.exit(missing.length ? 1 : 0);
 
+// --stub-missing answers a different question than --check: of the symbols we
+// have not ported yet, which does the counter actually *call*? A stub that
+// throws its own name turns "the bundle will not load" into "here is the one
+// function that mattered", and proves whether the unported set is the only
+// thing left or merely the first thing.
+const stubs = args.includes("--stub-missing")
+  ? missing.map((n) => `function ${n}(){ throw new Error("STUB ${n}"); }\n`).join("")
+  : "";
+if (stubs) console.log(`stubbing ${missing.length} unported symbols`);
+
 mkdirSync(OUT, { recursive: true });
-const all = rts + lib + out + runmain;
+const all = rts + stubs + lib + out + runmain;
 const file = join(OUT, "all.js");
 writeFileSync(file, all);
 console.log(`\nwrote ${file}  (${(all.length / 1024 / 1024).toFixed(2)}MB)`);
