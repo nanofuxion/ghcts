@@ -17,6 +17,7 @@
  */
 import { readFileSync } from "node:fs";
 import { renderRts } from "../dist/stg-js/rts.js";
+import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
 import { defaultStgToJSConfig } from "../dist/stg-js/types.js";
 import { parseModule } from "../dist/parser.js";
@@ -27,43 +28,26 @@ import { formatDiagnostic } from "../dist/diagnostics.js";
 
 const show = process.argv.includes("--print");
 const config = defaultStgToJSConfig;
-const rts = renderRts(config);
+const baseShim = `
+var h$isNode_ = true, h$isJvm_ = false, h$isJsShell_ = false,
+    h$isJsCore_ = false, h$isBrowser_ = false, h$isGHCJSi_ = false;
+function h$isNode()    { return h$isNode_; }
+function h$isJvm()     { return h$isJvm_; }
+function h$isJsShell() { return h$isJsShell_; }
+function h$isJsCore()  { return h$isJsCore_; }
+function h$isBrowser() { return h$isBrowser_; }
+function h$isGHCJSi()  { return h$isGHCJSi_; }
+function h$getGlobal(that) {
+    if(typeof global !== 'undefined') return global;
+    return that;
+}
+`;
+const rts = baseShim + renderRts(config) + "\n" + renderStaticRts(config);
 
-/** The hand-written half of GHC's RTS that emitted code touches, transcribed
- * from references/ghc/rts/js/*.js, plus a trampoline and a stop frame.
- * Identical to scripts/stg-run.mjs's. */
+/** Test-only scaffolding: a stack, a trampoline and a stop frame that
+ * captures R1 so a program's value can be read back. GHC's own h$main
+ * supplies the equivalent. Everything else comes from the real RTS. */
 const bootstrap = `
-function h$o(o, typ, a, size, regs, srefs) {
-  h$setObjInfo(o, typ, "", [], a, size, regs, srefs);
-}
-function h$setObjInfo(o, typ, name, fields, a, size, regs, srefs) {
-  o.t = typ; o.i = fields; o.n = name; o.a = a;
-  o.r = regs; o.s = srefs; o.m = 0; o.size = size;
-}
-function h$init_closure(c, xs) {
-  c.m = 0;
-  switch(xs.length) {
-    case 0: c.d1 = null;  c.d2 = null;   return c;
-    case 1: c.d1 = xs[0]; c.d2 = null;   return c;
-    case 2: c.d1 = xs[0]; c.d2 = xs[1];  return c;
-    default:
-      c.d1 = xs[0]; c.d2 = {};
-      for (var i = 1; i < xs.length; i++) c.d2["d" + i] = xs[i];
-      return c;
-  }
-}
-var h$staticDelayed = [];
-function h$sti(i, c, xs) { i.f = c; h$init_closure(i, xs); }
-function h$stc(i, c, xs) { i.f = c; h$init_closure(i, xs); h$addCAF(i); }
-function h$d()   { var c = h$c(null); h$staticDelayed.push(c); return c; }
-function h$di(c) { h$staticDelayed.push(c); }
-function h$p(x)  { h$staticDelayed.push(x); return x; }
-function h$addCAF(o) { h$CAFs.push(o); h$CAFsReset.push([o.f, o.d1, o.d2]); }
-function h$static_thunk(f) {
-  var h = { f: f, d1: null, d2: null, m: 0 };
-  h$CAFs.push(h); h$CAFsReset.push(f); return h;
-}
-
 h$stack = new Array(10000);
 h$sp = 0;
 function h$rs() { return h$stack[h$sp]; }

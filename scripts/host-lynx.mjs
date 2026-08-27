@@ -39,6 +39,10 @@ const apps = {
   // The oracle's own lib.js/out.js driven by ghcts's generated rts.js - see
   // scripts/rts-swap.mjs. Real compiled Haskell on our RTS.
   "/rts-swap/main.lynx.bundle": join(root, "dist/rts-swap/lynx/main.lynx.bundle"),
+  // Haskell compiled by ghcts through Core/STG/StgToJS onto ghcts's own RTS,
+  // with none of the old interpretive runtime present - see
+  // scripts/build-newrts-lynx.mjs, which fails the build if any survives.
+  "/newrts/main.lynx.bundle": join(root, "dist/newrts/lynx/main.lynx.bundle"),
 };
 
 const lanAddresses = () => {
