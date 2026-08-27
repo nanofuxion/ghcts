@@ -30,3 +30,5 @@ export * as Literal from "./stg-js/literal.js";
 export * as DataCon from "./stg-js/datacon.js";
 export * as Arg from "./stg-js/arg.js";
 export * as Prim from "./stg-js/prim.js";
+export * as Expr from "./stg-js/expr.js";
+export * as CodeGen from "./stg-js/codegen.js";

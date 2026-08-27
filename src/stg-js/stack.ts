@@ -31,20 +31,19 @@ import { closureField1_, closureField2_, closureInfo_ } from "./heap.js";
 import { R1, register, sp, stack } from "./regs.js";
 import { hdBh, hdBlackHole, hdCurrentThread } from "./symbols.js";
 import type { StgToJSConfig } from "./types.js";
+import type { StackSlot } from "./monad.js";
+import { slotUnknown } from "./monad.js";
 import { sel_ } from "../js/make.js";
 
 /** GHC.StgToJS.Symbols computes this one rather than exporting a literal, so
  * it is not among symbols.ts's generated names. */
 const hdUpdFrame: JStgExpr = Var(name("h$upd_frame"));
 
-/** GHC.StgToJS.Types owns `StackSlot`; `SlotId` carries a Core `Id`, which the
- * Core-facing layers have not been ported yet, so the payload is left opaque
- * here and only compared for identity - exactly what Stack.hs does with it. */
-export type StackSlot =
-  | { tag: "SlotId"; id: object; num: number }
-  | { tag: "SlotUnknown" };
-
-export const slotUnknown: StackSlot = { tag: "SlotUnknown" };
+/** GHC.StgToJS.Types owns `StackSlot`; in ghcts it lives in monad.ts with the
+ * rest of GenState's vocabulary. Stack.hs only ever moves slots around
+ * opaquely, so nothing here inspects the payload. */
+export type { StackSlot } from "./monad.js";
+export { slotUnknown } from "./monad.js";
 
 /** The two GenGroupState fields Stack.hs reads and writes (GHC.StgToJS.Monad
  * owns the full state). Mutated in place, since `G` is a state monad. */
