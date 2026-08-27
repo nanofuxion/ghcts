@@ -29,3 +29,4 @@ export * as Utils from "./stg-js/utils.js";
 export * as Literal from "./stg-js/literal.js";
 export * as DataCon from "./stg-js/datacon.js";
 export * as Arg from "./stg-js/arg.js";
+export * as Prim from "./stg-js/prim.js";
