@@ -110,17 +110,23 @@ h$o(h$stopFrame, -1, 0, 0, 0, null);
 const lynxPage = `
 globalThis.processData = function () {};
 globalThis.renderPage = function () {
-  // The load-bearing proof: what the Haskell actually computed, on the device.
-  console.error("[ghcts] main = " + globalThis.__ghctsMain + " foreign = " + globalThis.__ghctsResult);
+  // console.log, never console.error: Lynx's JSErrorReporter escalates every
+  // console.error into a reported error - red banner, error_code 1101 - so a
+  // diagnostic logged that way ships as a permanent fault.
+  console.log("[ghcts] main = " + globalThis.__ghctsMain + " foreign = " + globalThis.__ghctsResult);
   if (typeof __CreatePage !== "function") return;
   var page = __CreatePage("0", 0);
   var view = __CreateView(0);
-  __SetInlineStyles(view, "display:flex;align-items:center;justify-content:center;height:100%;background:#ffa500;");
+  __SetInlineStyles(view, "display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px;");
+  var label = __CreateText(0);
+  __SetInlineStyles(label, "font-size:15px;color:#666;letter-spacing:1px;");
+  __SetAttribute(label, "text", "square 6 + sumTo 10");
   var text = __CreateText(0);
-  __SetInlineStyles(text, "font-size:96px;color:#000;");
+  __SetInlineStyles(text, "font-size:88px;color:#111;margin-top:8px;");
   var raw = __CreateRawText(String(globalThis.__ghctsMain));
   __SetAttribute(text, "text", String(globalThis.__ghctsMain));
   __AppendElement(text, raw);
+  __AppendElement(view, label);
   __AppendElement(view, text);
   __AppendElement(page, view);
   __FlushElementTree(page);
