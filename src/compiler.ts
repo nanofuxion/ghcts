@@ -78,7 +78,7 @@ async function readConfig(
     };
   }
 }
-async function walk(root: string): Promise<string[]> {
+export async function walk(root: string): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
   return (
     await Promise.all(

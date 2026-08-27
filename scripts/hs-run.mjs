@@ -20,12 +20,14 @@
  * string, which is the one thing `putStrLn` would otherwise be for.
  */
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { walk } from "../dist/compiler.js";
 import { renderRts } from "../dist/stg-js/rts.js";
 import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
 import { defaultStgToJSConfig } from "../dist/stg-js/types.js";
 import { parseModule } from "../dist/parser.js";
-import { elaborateModule } from "../dist/elaborate.js";
+import { elaborateProgram } from "../dist/elaborate.js";
 import { desugarModule } from "../dist/desugar.js";
 import { coreToStg } from "../dist/core-to-stg.js";
 import { formatDiagnostic } from "../dist/diagnostics.js";
@@ -74,16 +76,28 @@ function h$runEntry(c) {
 }
 `;
 
-/** parse -> ... -> JS. Returns the emitted module and `main`'s symbol. */
-function compile(source, file) {
-  const parsed = parseModule(source, file);
-  if (parsed.diagnostics.some((d) => d.severity === "error")) {
-    throw new Error(parsed.diagnostics.map(formatDiagnostic).join("\n"));
+/** parse -> ... -> JS. Returns the emitted module and `main`'s symbol.
+ *
+ * `sources` is a list of `{ file, source }`; the module named `Main` is the
+ * root, and the rest are reachable only through its imports, exactly as
+ * `src/modules.ts` resolves them. */
+function compile(sources, file) {
+  const modules = new Map();
+  for (const unit of sources) {
+    const parsed = parseModule(unit.source, unit.file);
+    if (parsed.diagnostics.some((d) => d.severity === "error")) {
+      throw new Error(parsed.diagnostics.map(formatDiagnostic).join("\n"));
+    }
+    modules.set(parsed.module.ast.name, parsed.module.ast);
   }
-  const elaborated = elaborateModule(parsed.module.ast, file);
+  if (!modules.has("Main")) throw new Error(`${file}: no \`Main\` module`);
+  const elaborated = elaborateProgram(modules, "Main", file);
+  if (elaborated.diagnostics.some((d) => d.severity === "error")) {
+    throw new Error(elaborated.diagnostics.map(formatDiagnostic).join("\n"));
+  }
   const desugared = desugarModule(elaborated.module, file);
   const stg = coreToStg(desugared.program);
-  const units = stgToJS(config, { unitId: "main", moduleName: parsed.module.ast.name }, stg.bindings);
+  const units = stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings);
   const emitted = renderModule(config, units);
   const mainBinder = stg.bindings
     .flatMap((b) => (b.tag === "StgNonRec" ? [b.binder] : b.pairs.map(([x]) => x)))
@@ -360,18 +374,111 @@ const programs = [
     source: "module Main where\nf x = if x then 1 else 2\nmain = f False\n",
     expect: 2,
   },
+  {
+    // 1. a plain import: a name defined elsewhere, brought in bare.
+    name: "modules: plain import",
+    sources: {
+      Arith: "module Arith where\ntriple :: Int -> Int\ntriple x = x + x + x\n",
+      Main: "module Main where\nimport Arith\nmain = triple 14\n",
+    },
+    expect: 42,
+  },
+  {
+    // 2. `qualified ... as`: the bare name must NOT be in scope, only `A.`.
+    name: "modules: qualified as",
+    sources: {
+      Arith: "module Arith where\ntriple :: Int -> Int\ntriple x = x + x + x\n",
+      Main: "module Main where\nimport qualified Arith as A\nmain = A.triple 5\n",
+    },
+    expect: 15,
+  },
+  {
+    // 3. an explicit import list lets `keep` through and leaves `drop` out.
+    name: "modules: explicit import list",
+    sources: {
+      Pair: "module Pair where\nkeep :: Int -> Int\nkeep x = x + 1\ndrop2 :: Int -> Int\ndrop2 x = x - 1\n",
+      Main: "module Main where\nimport Pair (keep)\nmain = keep 9\n",
+    },
+    expect: 10,
+  },
+  {
+    // 4. `hiding`: the module's other name is still bare-visible.
+    name: "modules: hiding",
+    sources: {
+      Pair: "module Pair where\nkeep :: Int -> Int\nkeep x = x + 1\ndrop2 :: Int -> Int\ndrop2 x = x - 1\n",
+      Main: "module Main where\nimport Pair hiding (drop2)\nmain = keep 9\n",
+    },
+    expect: 10,
+  },
+  {
+    // 5. two levels: Main sees `base` only because Mid re-exports it.
+    name: "modules: two levels of import",
+    sources: {
+      Base: "module Base where\nbase :: Int\nbase = 6\n",
+      Mid: "module Mid (base, scale) where\nimport Base\nscale :: Int -> Int\nscale x = x * base\n",
+      Main: "module Main where\nimport Mid\nmain = scale base\n",
+    },
+    expect: 36,
+  },
+  {
+    // 6. instances are global: `Show Colour` is used here although nothing
+    // from `Paint` was imported by name.
+    name: "modules: instance from a module whose names are not imported",
+    sources: {
+      Paint:
+        "module Paint (Colour(..)) where\ndata Colour = Red | Green\ninstance Show Colour where\n  show Red = \"red\"\n  show Green = \"green\"\nsecret :: Int\nsecret = 1\n",
+      Main: "module Main where\nimport Paint (Colour(..))\nmain = show Green\n",
+    },
+    expect: "green",
+  },
+  {
+    // A local binder must beat the imported name of the same spelling.
+    name: "modules: local shadows an import",
+    sources: {
+      Arith: "module Arith where\ntriple :: Int -> Int\ntriple x = x + x + x\n",
+      Main: "module Main where\nimport Arith\nmain = let triple y = y in triple 7\n",
+    },
+    expect: 7,
+  },
+  {
+    // Same top-level name in two modules: renaming keeps them apart.
+    name: "modules: same name in two modules",
+    sources: {
+      One: "module One where\nvalue :: Int\nvalue = 10\n",
+      Two: "module Two where\nvalue :: Int\nvalue = 20\n",
+      Main:
+        "module Main where\nimport qualified One as O\nimport qualified Two as T\nmain = O.value + T.value\n",
+    },
+    expect: 30,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
+/** A file on the command line brings its whole directory with it, so a
+ * multi-module program on disk compiles the same way the inline cases do. */
+const fromDisk = file
+  ? (await walk(dirname(resolve(file)))).map((path) => ({
+      file: path,
+      source: readFileSync(path, "utf8"),
+    }))
+  : [];
 const cases = file
-  ? [{ name: file, source: readFileSync(file, "utf8"), expect: undefined }]
-  : programs;
+  ? [{ name: file, sources: fromDisk, expect: undefined }]
+  : programs.map((program) => ({
+      ...program,
+      sources: program.sources
+        ? Object.entries(program.sources).map(([name, source]) => ({
+            file: `${name}.hs`,
+            source,
+          }))
+        : [{ file: `${program.name}.hs`, source: program.source }],
+    }));
 
 let failures = 0;
 for (const program of cases) {
   let compiled;
   try {
-    compiled = compile(program.source, file ?? `${program.name}.hs`);
+    compiled = compile(program.sources, file ?? `${program.name}.hs`);
   } catch (cause) {
     console.log(`  FAIL  ${program.name}: ${cause instanceof Error ? cause.message : cause}`);
     failures++;

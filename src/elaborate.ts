@@ -52,6 +52,7 @@ import type {
   ValueDeclaration,
 } from "./ast.js";
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
+import { renameDeclarations, renameValue, resolveProgram, type Scope } from "./modules.js";
 import { error } from "./diagnostics.js";
 import { constructorTable, derivedEqMethod, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
@@ -790,13 +791,41 @@ const valueDecl = (name: string, patterns: Pattern[], body: Expr, span: Span = N
 // --------------------------------------------------------------- driver ----
 
 export function elaborateModule(user: Module, file = `${user.name}.hs`): ElaborateResult {
+  return elaborateProgram(new Map([[user.name, user]]), user.name, file);
+}
+
+/** Compile a set of modules as one program, rooted at `root`.  The modules are
+ * ordered by their imports and merged into the single flat declaration pile
+ * this pass has always worked on, each module's uses first rewritten through
+ * its own scope by `src/modules.ts`. */
+export function elaborateProgram(
+  modules: ReadonlyMap<string, Module>,
+  root: string,
+  file = `${root}.hs`,
+): ElaborateResult {
   nextTVar = 0;
+  const user = modules.get(root) ?? { name: root, imports: [], exports: [], reexports: [], declarations: [] };
+  const resolved = resolveProgram(modules, root);
   const elaborator = new Elaborator(file);
   const prelude = parseModule(PRELUDE_SOURCE, "GHCTS/Prelude.hs");
   if (!prelude.module || prelude.diagnostics.some((d) => d.severity === "error")) {
     return { module: user, diagnostics: prelude.diagnostics };
   }
-  const declarations = [...prelude.module.ast.declarations, ...user.declarations];
+  elaborator.diagnostics.push(...resolved.diagnostics);
+  if (resolved.diagnostics.some((d) => d.severity === "error"))
+    return { module: user, diagnostics: elaborator.diagnostics };
+  // Instance and class declarations keep their members as unparsed source, so
+  // the scope they were written in has to survive until those members are
+  // parsed, further down.
+  const scopeOf = new Map<Declaration, Scope>();
+  const declarations: Declaration[] = [...prelude.module.ast.declarations];
+  for (const module of resolved.order) {
+    const scope = resolved.scopes.get(module.name)!;
+    for (const decl of renameDeclarations(module, scope, module.name === root)) {
+      scopeOf.set(decl, scope);
+      declarations.push(decl);
+    }
+  }
   const env: Env = new Map();
 
   // --- data constructors -----------------------------------------------
@@ -841,11 +870,12 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
     vars.set(decl.parameters[0]!, variableType);
     const supers = superclassesOf(decl);
     const own = new Map<string, ValueDeclaration>();
+    const classScope = scopeOf.get(decl);
     for (const value of instanceMethodValues(
       { tag: "instance", head: decl.name, members: [], rawMembers: decl.rawMembers, span: decl.span },
       file,
     )) {
-      own.set(value.name, value);
+      own.set(value.name, classScope ? renameValue(value, classScope) : value);
     }
     const methods: ClassMethod[] = [];
     for (const member of decl.members) {
@@ -894,7 +924,9 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
       continue;
     }
     const methods = new Map<string, ValueDeclaration>();
-    for (const value of instanceMethodValues(decl, file)) methods.set(value.name, value);
+    const instanceScope = scopeOf.get(decl);
+    for (const value of instanceMethodValues(decl, file))
+      methods.set(value.name, instanceScope ? renameValue(value, instanceScope) : value);
     elaborator.instances.set(`${parsed.className} ${targetCon}`, {
       cls: parsed.className,
       target,
