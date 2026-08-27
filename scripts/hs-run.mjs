@@ -348,6 +348,18 @@ const programs = [
       "module Main where\ndata Colour = Red | Green\ninstance Show Colour where\n  show Red = \"red\"\n  show Green = \"green\"\nmain = show Green\n",
     expect: "green",
   },
+  {
+    name: "Prelude operators: $, &&, ++ and Eq Char",
+    source: 'module Main where\nmain = show $ "ab" ++ "c" == "abc" && not False\n',
+    expect: "True",
+  },
+  {
+    // `Bool` is an unboxable type, so a nullary `False` passed as an argument
+    // must reach the callee as the static value, not a fresh (truthy) closure.
+    name: "a Bool constructor passed as an argument",
+    source: "module Main where\nf x = if x then 1 else 2\nmain = f False\n",
+    expect: 2,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

@@ -16,9 +16,9 @@
  * Hindley-Milner inference. Deliberate restrictions, each of which produces a
  * diagnostic rather than a wrong dictionary:
  *
- *   - single-parameter classes only, and instance heads must be ground
- *     (`Eq Int`, not `Eq a => Eq [a]`). A ground instance needs no dictionary
- *     of its own, which is what keeps instance construction a plain CAF.
+ *   - single-parameter classes only. An instance head may be non-ground and
+ *     carry a context (`Eq a => Eq [a]`); such an instance is a *function*
+ *     from dictionaries to a dictionary, and selecting it is recursive.
  *   - a binding with a signature takes its constraints from that signature, in
  *     that order; those are the *givens*, and a wanted constraint is discharged
  *     against them directly or through a superclass path. A binding without a
@@ -1058,6 +1058,7 @@ const PRIMITIVE_TYPES: Record<string, string> = {
   primIntGt: "IntPrim -> IntPrim -> Bool",
   primIntGe: "IntPrim -> IntPrim -> Bool",
   primChr: "IntPrim -> CharPrim",
+  primCharEq: "CharPrim -> CharPrim -> Bool",
 };
 
 /** `class Eq a => Ord a where` keeps only its name and parameters in the

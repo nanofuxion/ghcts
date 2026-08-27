@@ -782,6 +782,15 @@ export function allocCls(gs: GenState, dynMiddle: JStgStat | undefined, xs: Arra
   const stat: JStgStat[] = [];
   const dyn: ClsEntry[] = [];
   for (const [i, rhs] of xs) {
+    // GHC's `toCl` has three cases, and the nullary one comes first: a
+    // no-argument constructor is `allocCon`'d, which for `Bool` and the other
+    // unboxable types yields the static value rather than a fresh - and so
+    // always truthy - closure.
+    if (rhs.tag === "StgRhsCon" && rhs.args.length === 0) {
+      const ii = identForId(gs, i);
+      stat.push(mconcatJStgStat([decl(ii), allocCon(gs, ii, rhs.con, [])]));
+      continue;
+    }
     if (rhs.tag === "StgRhsCon" && rhs.args.length === 1 && isUnboxableCon(rhs.con)) {
       // statics
       const ii = identForId(gs, i);

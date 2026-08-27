@@ -13,10 +13,10 @@
  *     0/1 machine value; wrapping it into a real constructor is GHC's
  *     `tagToEnum# (<# a b)` and it happens once, in the desugarer, so no
  *     Haskell here ever has to `case` on a raw machine word.
- *   - class and instance bodies stay on one line each. Class/instance member
- *     slices are re-parsed from their tokens (`src/dictionary.ts`), which
- *     joins them with spaces and so cannot preserve layout. Anything that
- *     wants `case`/`where` lives in a top-level helper instead.
+ *   - each class/instance member equation stays on one line. Member slices are
+ *     re-parsed from their tokens (`src/dictionary.ts`), which joins them with
+ *     spaces; separate equations of one method are rejoined there, but a body
+ *     wanting `case`/`where` still lives in a top-level helper instead.
  */
 export const PRELUDE_SOURCE = `module GHCTS.Prelude where
 
@@ -76,6 +76,9 @@ instance Num Int where
 
 instance Show Int where
   show n = showInt n
+
+instance Eq Char where
+  (==) (C a) (C b) = primCharEq a b
 
 instance Eq Bool where
   (==) a b = eqBool a b

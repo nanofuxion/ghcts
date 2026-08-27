@@ -68,6 +68,7 @@ const primOps: Record<string, Prim> = {
   primIntGt: { op: "IntGtOp", arity: 2, bool: true },
   primIntGe: { op: "IntGeOp", arity: 2, bool: true },
   primChr: { op: "ChrOp", arity: 1 },
+  primCharEq: { op: "CharEqOp", arity: 2, bool: true },
 };
 
 /** What a name resolves to. Locals shadow top levels, which shadow
