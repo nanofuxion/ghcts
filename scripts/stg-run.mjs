@@ -22,6 +22,7 @@
  * enters `test`'s thunk under a trampoline and inspects R1.
  */
 import { renderRts } from "../dist/stg-js/rts.js";
+import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
 import { defaultStgToJSConfig } from "../dist/stg-js/types.js";
 import { mkBinder, mkDataCon, UpdateFlag } from "../dist/stg.js";
@@ -29,48 +30,37 @@ import { mkBinder, mkDataCon, UpdateFlag } from "../dist/stg.js";
 const show = process.argv.includes("--print");
 const config = defaultStgToJSConfig;
 const mod = { unitId: "main", moduleName: "Test" };
-const rts = renderRts(config);
+/** rts/js/ calls the platform predicates and h$getGlobal at load time but does
+ * not define them: they come from base's jsbits shim, which a real link
+ * supplies and this harness does not (the oracle's all.js has them around line
+ * 9155). Copied from there, with the node.js branch taken, and it has to land
+ * before the RTS. */
+const baseShim = `
+var h$isNode_ = true, h$isJvm_ = false, h$isJsShell_ = false,
+    h$isJsCore_ = false, h$isBrowser_ = false, h$isGHCJSi_ = false;
+function h$isNode()    { return h$isNode_; }
+function h$isJvm()     { return h$isJvm_; }
+function h$isJsShell() { return h$isJsShell_; }
+function h$isJsCore()  { return h$isJsCore_; }
+function h$isBrowser() { return h$isBrowser_; }
+function h$isGHCJSi()  { return h$isGHCJSi_; }
+function h$getGlobal(that) {
+    if(typeof global !== 'undefined') return global;
+    return that;
+}
+`;
 
-/** ghcts's rts.ts generates the 533 *generated* RTS functions; GHC's RTS also
- * has a hand-written half (references/ghc/rts/js/{rts,mem,thread}.js) that
- * ghcts has not ported. These are the pieces of it that emitted code touches,
- * transcribed verbatim, plus a trampoline and a stop frame to drive one term.
+const rts = baseShim + renderRts(config) + "\n" + renderStaticRts(config);
+
+/** Test-only scaffolding: the harness drives one term to completion itself
+ * rather than starting a real thread, so it supplies its own stack, its own
+ * trampoline, and a stop frame that captures R1. Everything else the emitted
+ * code touches - h$o, h$init_closure, h$sti, h$stc, h$addCAF, h$rs - comes
+ * from renderStaticRts(), which is GHC's own rts/js/ sources.
  */
 const bootstrap = `
-function h$o(o, typ, a, size, regs, srefs) {
-  h$setObjInfo(o, typ, "", [], a, size, regs, srefs);
-}
-function h$setObjInfo(o, typ, name, fields, a, size, regs, srefs) {
-  o.t = typ; o.i = fields; o.n = name; o.a = a;
-  o.r = regs; o.s = srefs; o.m = 0; o.size = size;
-}
-function h$init_closure(c, xs) {
-  c.m = 0;
-  switch(xs.length) {
-    case 0: c.d1 = null;  c.d2 = null;   return c;
-    case 1: c.d1 = xs[0]; c.d2 = null;   return c;
-    case 2: c.d1 = xs[0]; c.d2 = xs[1];  return c;
-    default:
-      c.d1 = xs[0]; c.d2 = {};
-      for (var i = 1; i < xs.length; i++) c.d2["d" + i] = xs[i];
-      return c;
-  }
-}
-var h$staticDelayed = [];
-function h$sti(i, c, xs) { i.f = c; h$init_closure(i, xs); }
-function h$stc(i, c, xs) { i.f = c; h$init_closure(i, xs); h$addCAF(i); }
-function h$d()   { var c = h$c(null); h$staticDelayed.push(c); return c; }
-function h$di(c) { h$staticDelayed.push(c); }
-function h$p(x)  { h$staticDelayed.push(x); return x; }
-function h$addCAF(o) { h$CAFs.push(o); h$CAFsReset.push([o.f, o.d1, o.d2]); }
-function h$static_thunk(f) {
-  var h = { f: f, d1: null, d2: null, m: 0 };
-  h$CAFs.push(h); h$CAFsReset.push(f); return h;
-}
-
 h$stack = new Array(1000);
 h$sp = 0;
-function h$rs() { return h$stack[h$sp]; }
 var h$testResult;
 function h$stopFrame() { h$testResult = h$r1; return null; }
 h$stopFrame.f = h$stopFrame;
