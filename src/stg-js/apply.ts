@@ -27,14 +27,17 @@ import {
   appS,
   assign_,
   bor_,
+  declAssign_,
   gt_,
   ge_,
   ifBlockS,
   ifS,
   jAdd,
+  jFor,
   jFunctionSized,
   jFunction_,
   jInt,
+  jLam2,
   jMul,
   jString,
   jSub,
@@ -45,6 +48,7 @@ import {
   land_,
   lt_,
   mask8,
+  neq_,
   null_,
   postDecrS,
   postIncrS,
@@ -89,12 +93,9 @@ import {
   papArity,
 } from "./heap.js";
 import {
-  highReg_expr,
   jsReg,
   jsRegsFromR2,
-  maxLowReg,
   R1,
-  regNumber,
   register,
   sp,
   stack,
@@ -113,7 +114,9 @@ import {
   hdEntryStr,
   hdGetRegStr,
   hdInitClosure,
+  hdInitStatic,
   hdMoveRegs2,
+  hdPapGen,
   hdPapGenStr,
   hdPaps,
   hdPapsStr,
@@ -154,6 +157,11 @@ const throwStr = "throw";
 const typeofStr = "typeof";
 
 const r1: JStgExpr = register(R1);
+
+/** GHC.StgToJS.Regs.maxReg - the JS backend supports exactly 128 registers.
+ * Kept local because regs.ts's `maxReg` is still a StgReg (0-indexed) rather
+ * than 9.12.2's `Int` register number. */
+const maxReg = 128;
 
 // ---------------------------------------------------------------------------
 // GHC.StgToJS.Profiling (inlined - see the module header)
@@ -292,33 +300,49 @@ export function selectApply(spec: ApplySpec): { generic: boolean; fun: JStgExpr 
   return e === undefined ? { generic: true, fun: genericApplyExpr(spec.specConv) } : { generic: false, fun: e };
 }
 
-/** Build functions to quickly lookup apply functions
+/** Build arrays to quickly lookup apply functions
  *
- *  h$apply(r << 8 | n) = function application for r regs, n args
- *  h$paps(r)           = partial application for r registers (number of args
+ *  h$apply[r << 8 | n] = function application for r regs, n args
+ *  h$paps[r]           = partial application for r registers (number of args
  *                        is in the object)
  */
 export function mkApplyArr(js: JSM): JStgStat {
-  const casePap = (p: number): [JStgExpr, JStgStat] => [jInt(p), returnS(global(`${hdPapStr_}${p}`))];
+  const assignPap = (p: number): JStgStat =>
+    assign_(idx_(hdPaps, jInt(p)), global(`${hdPapStr_}${p}`));
   // Both fast/slow (regs/stack) specialized apply functions have the same
   // tags. We store the stack ones in the array because they are used as
   // continuation stack frames.
-  const caseApply = (spec: ApplySpec): Array<[JStgExpr, JStgStat]> =>
-    spec.specConv === ApplyConv.StackConv ? [[specTagExpr(spec), returnS(specApplyExpr(spec))]] : [];
+  const assignSpec = (spec: ApplySpec): JStgStat =>
+    spec.specConv === ApplyConv.StackConv
+      ? assign_(idx_(hdApply, specTagExpr(spec)), specApplyExpr(spec))
+      : memptyJStgStat;
 
-  const papsFun = jFunctionSized(js, name(hdPapsStr), 1, ([i]) => ({
-    tag: "SwitchStat",
-    scrut: i!,
-    cases: specPap.map(casePap),
-    default: returnS(global(hdPapGenStr)),
-  }));
-  const applyFun = jFunctionSized(js, name(hdApplyStr), 1, ([i]) => ({
-    tag: "SwitchStat",
-    scrut: i!,
-    cases: applySpec.flatMap(caseApply),
-    default: returnS(hdApGen),
-  }));
-  return mconcatJStgStat([papsFun, applyFun]);
+  // Prefill both tables with the generic entries, so that an unspecialized
+  // tag still finds a usable function; the specific entries then overwrite.
+  const mkApGens = jFor(js, (j) => assign_(j, zero_), (j) => lt_(j, jInt(65536)), preIncrS, (j) =>
+    assign_(idx_(hdApply, j), hdApGen),
+  );
+  const mkPapGens = jFor(js, (j) => assign_(j, zero_), (j) => lt_(j, jInt(128)), preIncrS, (j) =>
+    assign_(idx_(hdPaps, j), hdPapGen),
+  );
+  return mconcatJStgStat([
+    declAssign_(name(hdApplyStr), toJExpr([])),
+    declAssign_(name(hdPapsStr), toJExpr([])),
+    {
+      tag: "ApplStat",
+      fn: sel_(hdInitStatic, "push"),
+      args: [
+        jLam2(
+          mconcatJStgStat([
+            mkApGens,
+            mkPapGens,
+            mconcatJStgStat(applySpec.map(assignSpec)),
+            mconcatJStgStat(specPap.map(assignPap)),
+          ]),
+        ),
+      ],
+    },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +436,7 @@ export function genericStackApply(js: JSM, cfg: StgToJSConfig): JStgStat {
                 // compute new tag with consumed register values and args removed
                 assign_(newTag!, bor_(shl_(jSub(givenRegs!, neededRegs!), jInt(8)), jSub(givenArgs!, neededArgs!))),
                 // find application function for the remaining regs/args
-                assign_(newAp!, { tag: "ApplExpr", fn: hdApply, args: [newTag!] }),
+                assign_(newAp!, idx_(hdApply, newTag!)),
                 traceRts(cfg, jAdd(jString("h$ap_gen: next: "), sel_(newAp!, "n"))),
                 // Drop used registers from the stack.
                 // Test if the application function needs a tag and push it.
@@ -435,7 +459,7 @@ export function genericStackApply(js: JSM, cfg: StgToJSConfig): JStgStat {
               [
                 traceRts(cfg, jString("h$ap_gen: undersat")),
                 // find PAP entry function corresponding to given_regs count
-                assign_(p!, { tag: "ApplExpr", fn: hdPaps, args: [givenRegs!] }),
+                assign_(p!, idx_(hdPaps, givenRegs!)),
                 // build PAP payload: R1 + tag + given register values
                 assign_(newTag!, bor_(shl_(jSub(neededRegs!, givenRegs!), jInt(8)), jSub(neededArgs!, givenArgs!))),
                 assign_(dat!, toJExpr([r1, newTag!])),
@@ -484,35 +508,20 @@ export function genericStackApply(js: JSM, cfg: StgToJSConfig): JStgStat {
  *  R1 = closure to apply to
  */
 export function genericFastApply(js: JSM, s: StgToJSConfig): JStgStat {
-  const maxLowRegN = regNumber(maxLowReg);
-  // R1 isn't used for arguments
-  const lowRegsDesc: number[] = [];
-  for (let n = maxLowRegN; n >= 2; n--) lowRegsDesc.push(n);
-
   const pushAllRegs = (tag: JStgExpr): JStgStat =>
     jVar(js, (regs) => {
-      // rN stored in stack[sp - N - 2] so that r2 is stored in stack[sp], etc.
+      // The switch is on the *count* of pushed regs (r-1, since R1 isn't used
+      // for arguments); each case falls through to push R2..Rr.
       const pushReg = (r: number): [JStgExpr, JStgStat] => [
-        jInt(r),
+        jInt(r - 1),
         assign_(idx_(stack, jSub(sp, jInt(r - 2))), jsReg(r)),
       ];
+      const cases: Array<[JStgExpr, JStgStat]> = [];
+      for (let r = 65; r >= 2; r--) cases.push(pushReg(r));
       return mconcatJStgStat([
         assign_(regs, shr_(tag, jInt(8))),
         assign_(sp, jAdd(sp, regs)),
-        // increment the number of regs by 1, so that it matches register
-        // numbers (R1 is not used for args)
-        postIncrS(regs),
-        // copy high registers with a loop
-        {
-          tag: "WhileStat",
-          isDo: false,
-          cond: gt_(regs, jInt(maxLowRegN)),
-          body: mconcatJStgStat([
-            assign_(idx_(stack, jSub(jSub(sp, regs), jInt(2))), highReg_expr(regs)),
-            postDecrS(regs),
-          ]),
-        },
-        { tag: "SwitchStat", scrut: regs, cases: lowRegsDesc.map(pushReg), default: memptyJStgStat },
+        { tag: "SwitchStat", scrut: regs, cases, default: memptyJStgStat },
       ]);
     });
 
@@ -521,7 +530,7 @@ export function genericFastApply(js: JSM, s: StgToJSConfig): JStgStat {
     jVar(js, (ap) =>
       mconcatJStgStat([
         pushAllRegs(tag),
-        assign_(ap, { tag: "ApplExpr", fn: hdApply, args: [tag] }),
+        assign_(ap, idx_(hdApply, tag)),
         ifS(
           strictEq_(ap, hdApGen),
           mconcatJStgStat([assign_(sp, jAdd(sp, jInt(2))), assign_(idx_(stack, jSub(sp, jInt(1))), tag)]),
@@ -567,8 +576,8 @@ export function genericFastApply(js: JSM, s: StgToJSConfig): JStgStat {
               assign_(sp, jAdd(jSub(jAdd(sp, myRegs!), regsStart!), jInt(1))),
               traceRts(s, jAdd(jString("h$ap_gen_fast: oversat "), sp)),
               pushArgs(regsStart!, myRegs!),
-              assign_(newTag!, bor_(shl_(jSub(myRegs!, shr_(arity, jInt(8))), jInt(8)), jSub(myAr!, ar!))),
-              assign_(newAp!, { tag: "ApplExpr", fn: hdApply, args: [newTag!] }),
+              assign_(newTag!, jSub(bor_(shl_(jSub(myRegs!, shr_(arity, jInt(8))), jInt(8)), myAr!), ar!)),
+              assign_(newAp!, idx_(hdApply, newTag!)),
               ifS(
                 strictEq_(newAp!, hdApGen),
                 mconcatJStgStat([
@@ -584,9 +593,9 @@ export function genericFastApply(js: JSM, s: StgToJSConfig): JStgStat {
             [
               traceRts(s, jAdd(jAdd(jAdd(jString("h$ap_gen_fast: undersat: "), myRegs!), jString(" ")), tag)),
               jwhenS(
-                strictNeq_(tag, zero_),
+                neq_(tag, zero_),
                 mconcatJStgStat([
-                  assign_(p!, { tag: "ApplExpr", fn: hdPaps, args: [myRegs!] }),
+                  assign_(p!, idx_(hdPaps, myRegs!)),
                   assign_(
                     dat!,
                     toJExpr([
@@ -639,7 +648,7 @@ export function genericFastApply(js: JSM, s: StgToJSConfig): JStgStat {
               closureTypeToJExpr(ClosureType.Con),
               mconcatJStgStat([
                 traceRts(s, jString("h$ap_gen_fast: con")),
-                jwhenS(strictNeq_(tag!, zero_), appS(throwStr, [jString("h$ap_gen_fast: invalid apply")])),
+                jwhenS(neq_(tag!, zero_), appS(throwStr, [jString("h$ap_gen_fast: invalid apply")])),
                 returnS(c),
               ]),
             ],
@@ -716,11 +725,10 @@ export function stackApply(js: JSM, s: StgToJSConfig, funName: string, nargs: nu
         assign_(rs!, shr_(arity, jInt(8))),
         loadRegs,
         assign_(sp, jSub(sp, rs!)),
-        assign_(newAp!, {
-          tag: "ApplExpr",
-          fn: hdApply,
-          args: [bor_(jSub(jInt(nargs), arity0), shl_(jSub(jInt(nvars), rs!), jInt(8)))],
-        }),
+        assign_(
+          newAp!,
+          idx_(hdApply, bor_(jSub(jInt(nargs), arity0), shl_(jSub(jInt(nvars), rs!), jInt(8)))),
+        ),
         assign_(idx_(stack, sp), newAp!),
         profStat(s, pushRestoreCCS),
         traceRts(s, jAdd(jString(`${funName}: new stack frame: `), sel_(newAp!, "n"))),
@@ -852,11 +860,10 @@ export function fastApply(js: JSM, s: StgToJSConfig, funName: string, nargs: num
         ),
         saveRegs,
         assign_(sp, jAdd(jAdd(sp, rsRemain!), jInt(1))),
-        assign_(idx_(stack, sp), {
-          tag: "ApplExpr",
-          fn: hdApply,
-          args: [bor_(shl_(rsRemain!, jInt(8)), jSub(jInt(nargs), mask8(arity)))],
-        }),
+        assign_(
+          idx_(stack, sp),
+          idx_(hdApply, bor_(shl_(rsRemain!, jInt(8)), jSub(jInt(nargs), mask8(arity)))),
+        ),
         profStat(s, pushRestoreCCS),
         returnS(c),
       ]);
@@ -1201,34 +1208,16 @@ export const specPapIdents: Ident[] = specPap.map((r) => name(`${hdPapStr_}${r}`
 
 export function pap(js: JSM, s: StgToJSConfig, r: number): JStgStat {
   const funcName = `${hdPapStr_}${r}`;
-  const maxLowRegN = regNumber(maxLowReg);
-  // R1 isn't used for arguments
-  const lowRegsDesc: number[] = [];
-  for (let m = maxLowRegN; m >= 2; m--) lowRegsDesc.push(m);
 
-  const moveBy = (extra: JStgExpr): JStgStat =>
-    mconcatJStgStat([
-      // increment the number of args by 1, so that it matches register
-      // numbers (R1 is not used for args)
-      postIncrS(extra),
-      // copy high registers with a loop
-      {
-        tag: "WhileStat",
-        isDo: false,
-        cond: gt_(extra, jInt(maxLowRegN)),
-        body: mconcatJStgStat([
-          assign_(highReg_expr(jAdd(extra, jInt(r))), highReg_expr(extra)),
-          postDecrS(extra),
-        ]),
-      },
-      // then copy low registers with a case
-      {
-        tag: "SwitchStat",
-        scrut: extra,
-        cases: lowRegsDesc.map((m): [JStgExpr, JStgStat] => [jInt(m), assign_(jsReg(m + r), jsReg(m))]),
-        default: memptyJStgStat,
-      },
-    ]);
+  // Shift the `extra` already-applied arguments up by r places to make room
+  // for this PAP's own r arguments. One fall-through switch case per possible
+  // count, highest first, so `case extra` runs exactly the moves it needs.
+  const moveCase = (m: number): [JStgExpr, JStgStat] => [jInt(m), assign_(jsReg(m + r + 1), jsReg(m + 1))];
+  const moveBy = (extra: JStgExpr): JStgStat => {
+    const cases: Array<[JStgExpr, JStgStat]> = [];
+    for (let m = maxReg - r - 1; m >= 1; m--) cases.push(moveCase(m));
+    return { tag: "SwitchStat", scrut: extra, cases, default: memptyJStgStat };
+  };
 
   const dField = (d: JStgExpr, n: number): JStgExpr => sel_(d, `d${n - 1}`);
   const loadOwnArgs = (d: JStgExpr): JStgStat =>
@@ -1254,8 +1243,7 @@ export function pap(js: JSM, s: StgToJSConfig, r: number): JStgStat {
           profStat(s, enterCostCentreFunCurrentCCS),
           assign_(extra!, jSub(shr_(funOrPapArity(c!, f!), jInt(8)), jInt(r))),
           traceRts(s, jAdd(jString(`${funcName}: pap extra args moving: `), extra!)),
-          // in pap_0 we don't shift any register
-          r === 0 ? memptyJStgStat : moveBy(extra!),
+          moveBy(extra!),
           loadOwnArgs(d!),
           assign_(r1, c!),
           returnS(f!),
@@ -1267,30 +1255,15 @@ export function pap(js: JSM, s: StgToJSConfig, r: number): JStgStat {
 /** Construct a generic PAP */
 export function papGen(js: JSM, cfg: StgToJSConfig): JStgStat {
   const funcName = hdPapGenStr;
-  const maxLowRegN = regNumber(maxLowReg);
-  const lowRegsDesc: number[] = [];
-  for (let m = maxLowRegN; m >= 2; m--) lowRegsDesc.push(m);
 
-  const loadOwnArgs = (d: JStgExpr, r: JStgExpr): JStgStat =>
-    mconcatJStgStat([
-      // increment the number of args by 1, so that it matches register numbers
-      // (R1 is not used for args) and PAP fields (starting from d2)
-      postIncrS(r),
-      // copy high registers with a loop
-      {
-        tag: "WhileStat",
-        isDo: false,
-        cond: gt_(r, jInt(maxLowRegN)),
-        body: mconcatJStgStat([assign_(highReg_expr(r), idx_(d, jAdd(jString("d"), r))), postDecrS(r)]),
-      },
-      // then copy low registers with a case.
-      {
-        tag: "SwitchStat",
-        scrut: r,
-        cases: lowRegsDesc.map((n): [JStgExpr, JStgStat] => [jInt(n), assign_(jsReg(n), sel_(d, `d${n}`))]),
-        default: memptyJStgStat,
-      },
-    ]);
+  // Load the PAP's own r stored arguments into R2.. - one fall-through switch
+  // case per count, highest first. Register n+1 pairs with field d(n+1)
+  // because R1 is not used for args and the fields start at d2.
+  const loadOwnArgs = (d: JStgExpr, r: JStgExpr): JStgStat => {
+    const cases: Array<[JStgExpr, JStgStat]> = [];
+    for (let n = 127; n >= 1; n--) cases.push([jInt(n), assign_(jsReg(n + 1), sel_(d, `d${n + 1}`))]);
+    return { tag: "SwitchStat", scrut: r, cases, default: memptyJStgStat };
+  };
 
   return closure(
     js,

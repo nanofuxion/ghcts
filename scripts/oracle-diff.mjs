@@ -25,9 +25,15 @@ const value = (f) => (args.indexOf(f) >= 0 ? args[args.indexOf(f) + 1] : undefin
 /** Symbols a JS file *defines* (as opposed to merely references). */
 function definedSymbols(source) {
   const found = new Set();
-  for (const m of source.matchAll(/^(?:function|var|const|let)\s+(h\$[A-Za-z0-9_$]+)/gm)) found.add(m[1]);
+  // Fresh JSM identifiers (h$RTS_j33y in GHC, h$RTS_3126 here) are arbitrary
+  // per-compilation names for block-local temporaries, not RTS symbols. GHC
+  // numbers them from a Unique supply and we from a counter, so comparing
+  // them measures nothing.
+  const fresh = /^h\$RTS_/;
+  for (const m of source.matchAll(/^(?:function|var|const|let)\s+(h\$[A-Za-z0-9_$]+)/gm))
+    if (!fresh.test(m[1])) found.add(m[1]);
   // GHC also emits `h$foo = function(...)` and info-table registrations.
-  for (const m of source.matchAll(/^(h\$[A-Za-z0-9_$]+)\s*=/gm)) found.add(m[1]);
+  for (const m of source.matchAll(/^(h\$[A-Za-z0-9_$]+)\s*=/gm)) if (!fresh.test(m[1])) found.add(m[1]);
   return found;
 }
 

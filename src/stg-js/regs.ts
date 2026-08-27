@@ -1,21 +1,15 @@
-/** Ported from GHC/StgToJS/Regs.hs.
+/** Ported from GHC/StgToJS/Regs.hs (GHC 9.12.2).
  *
- * The JS backend's "registers": R1..Rn, the stack pointer/array, and the
+ * The JS backend's "registers": R1..R128, the stack pointer/array, and the
  * return registers used to smuggle extra results out of foreign calls.
  *
  * Two Haskell-isms have no TS counterpart and are handled as follows:
- *   - `newtype StgReg = StgReg Int` is a bare `number` here, holding the same
- *     0-indexed payload, so Haskell's derived Ord (`i <= maxCachedReg` in
- *     `register`) and Ix (array indexing) both fall out of plain arithmetic.
- *     The `R1`..`R4` pattern synonyms become constants of that type.
+ *   - `data StgReg = R1 | ... | R128 deriving (Enum, Bounded, Ix)` becomes a
+ *     bare `number` holding `fromEnum r` (so R1 = 0), which makes derived Ord
+ *     and Ix fall out of plain arithmetic and array indexing.
  *   - `instance ToJExpr` cannot be expressed, so each instance becomes a named
  *     function: `register` (StgReg), `foreignRegister` (StgRet), and
  *     `specialToJExpr` (Special).
- *
- * `regsFromR1` and friends are infinite lists in Haskell, consumed lazily by
- * callers that `take` as many registers as an application needs. TS arrays are
- * strict, so these are generator functions instead - same laziness, same
- * "too many registers" panic once the supply is exhausted.
  */
 import type { Ident } from "../js/ident.js";
 import { name } from "../js/ident.js";
@@ -27,8 +21,13 @@ import { StgRet } from "./types.js";
 
 export { StgRet };
 
-/** General purpose "registers". 0-indexed payload, exactly as GHC's newtype. */
+/** General purpose "registers". Payload is `fromEnum r`, so R1 is 0.
+ *
+ * The JS backend arbitrarily supports 128 registers. */
 export type StgReg = number;
+
+/** `maxBound :: StgReg`, i.e. `fromEnum R128`. */
+const maxBoundReg: StgReg = 127;
 
 export const R1: StgReg = 0;
 export const R2: StgReg = 1;
@@ -57,53 +56,31 @@ export const sp: JStgExpr = specialToJExpr(Special.Sp);
 
 export const stack: JStgExpr = specialToJExpr(Special.Stack);
 
-/** 1-indexed register number (R1 has index 1) */
-export const regNumber = (r: StgReg): number => r + 1;
+/** `jsRegToInt = (+1) . fromEnum` - the 1-indexed register number. */
+export const jsRegToInt = (r: StgReg): number => r + 1;
 
-/** StgReg from 1-indexed number */
-function regFromNumber(r: number): StgReg {
-  if (r < 1) throw new Error("StgToJS.Regs: assertion failed: r >= 1");
-  return r - 1;
-}
+/** `intToJSReg r = toEnum (r - 1)` */
+export const intToJSReg = (r: number): StgReg => r - 1;
 
-export const regsFromTo = (x: StgReg, y: StgReg): StgReg[] =>
-  Array.from({ length: Math.max(0, y - x + 1) }, (_, k) => x + k);
+/** Register expression from its 1-indexed number */
+export const jsReg = (r: number): JStgExpr => register(intToJSReg(r));
 
-/** Register expression from its 1-indexed index */
-export const jsReg = (r: number): JStgExpr => register(regFromNumber(r));
+export const maxReg: number = jsRegToInt(maxBoundReg);
 
-export const minReg: StgReg = R1;
-
-/** GHC uses `maxBound :: Int`; JS numbers top out earlier, and either bound is
- * far beyond any reachable register count. */
-export const maxReg: StgReg = regFromNumber(Number.MAX_SAFE_INTEGER);
-
-export const lowRegsCount = 31;
-
-export const maxLowReg: StgReg = regFromNumber(lowRegsCount);
-
-/** First register stored in h$regs array instead of having its own top-level
- * variable */
-export const minHighReg: StgReg = maxLowReg + 1;
+export const minReg: number = jsRegToInt(0);
 
 /** List of registers, starting from R1 */
-export function* regsFromR1(): Generator<StgReg> {
-  for (let r = R1; ; r++) {
-    if (r > maxReg) throw new Error("StgToJS: code requires too many registers");
-    yield r;
-  }
-}
+export const regsFromR1: StgReg[] = Array.from({ length: maxBoundReg + 1 }, (_, i) => i);
 
 /** List of registers, starting from R2 */
-export function* regsFromR2(): Generator<StgReg> {
-  const it = regsFromR1();
-  it.next();
-  yield* it;
-}
+export const regsFromR2: StgReg[] = regsFromR1.slice(1);
 
-/** List of registers, starting from R1 as JStgExpr */
+/** List of registers, starting from R1 as JStgExpr.
+ *
+ * Kept as a generator (rather than 9.12.2's list) so existing callers that
+ * `take` a prefix keep working. */
 export function* jsRegsFromR1(): Generator<JStgExpr> {
-  for (const r of regsFromR1()) yield register(r);
+  for (const r of regsFromR1) yield register(r);
 }
 
 /** List of registers, starting from R2 as JExpr */
@@ -113,54 +90,52 @@ export function* jsRegsFromR2(): Generator<JStgExpr> {
   yield* it;
 }
 
-/** List of registers, starting from given reg as JExpr */
-export function* jsRegsFrom(n: StgReg): Generator<JStgExpr> {
-  const it = jsRegsFromR1();
-  for (let i = 0; i < n; i++) it.next();
-  yield* it;
-}
-
-/** High register */
-export function highReg(r: number): JStgExpr {
-  if (r < regNumber(minHighReg)) throw new Error("StgToJS.Regs: assertion failed: r >= regNumber minHighReg");
-  return idx_(hdRegs, jInt(r - regNumber(minHighReg)));
-}
-
-/** High register indexing with a JS expression */
-export const highReg_expr = (r: JStgExpr): JStgExpr => idx_(hdRegs, jSub(r, jInt(regNumber(minHighReg))));
-
 // ---------------------------------------------------
 // caches
 // ---------------------------------------------------
 
-export const lowRegs: StgReg[] = regsFromTo(minReg, maxLowReg);
-
-/** low regs are named h$r1, h$r2, etc. */
-export const lowRegsIdents: Ident[] = lowRegs.map((r) => name(`${hdStr}r${regNumber(r)}`));
+/** `lowRegs = map reg_to_ident [R1 .. R31]` - note these are Idents, named
+ * h$r1 .. h$r31 (`map toLower . show`). */
+export const lowRegs: Ident[] = regsFromR1.slice(0, 31).map((r) => name(`${hdStr}r${jsRegToInt(r)}`));
 
 export const retRegs: Ident[] = Object.keys(StgRet)
   .filter((k) => isNaN(Number(k)))
   .map((n) => name(hdStr + n.toLowerCase()));
 
+/** cache JExpr representing StgReg.
+ *
+ * R1..R31 are the globals h$r1..h$r31; R32..R128 are `h$regs[fromEnum r - 32]`.
+ * `fromEnum R32` is 31, so R32 renders as `h$regs[-1]` and the array is used
+ * from index -1 upwards. That off-by-one is upstream's, and GHC's own rts.js
+ * agrees: `case(32):return h$regs[(-1)];`. */
+const registers: JStgExpr[] = [
+  ...lowRegs.map((i) => global(i)),
+  ...regsFromR1.slice(31).map((r) => idx_(hdRegs, jInt(r - 32))),
+];
+
 /** cache JExpr representing StgRet */
 const rets: JStgExpr[] = retRegs.map((i) => global(i));
 
 /** Given a register, return the JS syntax object representing that register */
-export const foreignRegister = (i: StgRet): JStgExpr => rets[i];
-
-/** Given a register, return the JS syntax object representing that register */
 export function register(i: StgReg): JStgExpr {
-  // Expressions of common registers are cached; higher ones are made on the fly.
-  return i <= maxCachedReg ? register_cache[i] : make_high_reg(i);
+  return registers[i]!;
 }
 
-const maxCachedReg: StgReg = regFromNumber(128);
+/** Given a register, return the JS syntax object representing that register */
+export const foreignRegister = (i: StgRet): JStgExpr => rets[i]!;
 
-/** Make h$regs[XXX] expression for the register */
-const make_high_reg = (r: StgReg): JStgExpr => highReg(regNumber(r));
+// ---------------------------------------------------
+// compatibility shims for apply.ts
+//
+// None of these exist in 9.12.2 (its Apply.hs goes through h$getReg/h$setReg
+// instead). They keep the 10.1-era apply.ts compiling until it is realigned.
+// ---------------------------------------------------
 
-/** cache JExpr representing StgReg */
-const register_cache: JStgExpr[] = [
-  ...lowRegsIdents.map((i) => global(i)),
-  ...regsFromTo(minHighReg, maxCachedReg).map(make_high_reg),
-];
+/** @deprecated 10.1 only; `jsRegToInt` in 9.12.2. */
+export const regNumber = jsRegToInt;
+
+/** @deprecated 10.1 only. Last register with its own global: R31. */
+export const maxLowReg: StgReg = 30;
+
+/** @deprecated 10.1 only. `h$regs[n - 32]` for a dynamic register number. */
+export const highReg_expr = (r: JStgExpr): JStgExpr => idx_(hdRegs, jSub(r, jInt(32)));

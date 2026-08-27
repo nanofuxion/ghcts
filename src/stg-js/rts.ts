@@ -12,7 +12,7 @@ import { initJSM, type JSM } from "../js/jstg-monad.js";
 import { jsOptimize } from "../js/optimizer.js";
 import { renderStat } from "../js/ppr.js";
 import { jStgStatToJS } from "../js/transform.js";
-import { assign_, decl, idx_, jAdd, jFunctionSized, jInt, jString, jSub, jVar, jwhenS, returnS, strictEq_, zero_ } from "../js/make.js";
+import { assign_, decl, idx_, jAdd, jBlock, jFunctionSized, jInt, jString, jSub, jVar, jwhenS, returnS, strictEq_, undefined_, zero_ } from "../js/make.js";
 import {
   hdCAFsResetStr,
   hdCAFsStr,
@@ -28,8 +28,10 @@ import {
   hdStaticThunksStr,
   hdC0Str,
   hdCStr,
+  hdResetRegisters,
+  hdResetResultVars,
 } from "./symbols.js";
-import { highReg_expr, lowRegs, lowRegsIdents, regNumber, regsFromR1, register, retRegs, sp, stack } from "./regs.js";
+import { jsRegToInt, lowRegs, regsFromR1, register, retRegs, sp, stack } from "./regs.js";
 import { clsName, dataFieldName, dataName, jsClosureCount, mkClosure, newClosure } from "./closure.js";
 import { closureCC_ } from "./heap.js";
 import { pushN, pushNN } from "./stack.js";
@@ -54,30 +56,35 @@ const hdLoads = (n: number): Ident => name(`h$l${n}`);
 export function declRegs(js: JSM): JStgStat {
   return mconcatJStgStat([
     globalAssign(hdRegsStr, emptyArray),
-    mconcatJStgStat(lowRegsIdents.map((r): JStgStat => ({ tag: "DeclStat", ident: r, value: zero_ }))),
+    mconcatJStgStat(lowRegs.map((r): JStgStat => ({ tag: "DeclStat", ident: r, value: zero_ }))),
     regGettersSetters(js),
     loadRegs(js),
   ]);
 }
 
 /** regGettersSetters - `h$getReg`/`h$setReg`, switching on the register
- * number. Registers above `h$r31` live in the `h$regs` array, which is what
- * the default case reaches for. */
+ * number. There is a case for every one of the 128 registers, and the switch
+ * default is `mempty` - a bare `default:` with no body.
+ *
+ * The names `setters`/`getters` are swapped upstream (the binding called
+ * `setters` builds h$getReg); kept verbatim so the emission order - h$getReg
+ * then h$setReg - matches. */
 export function regGettersSetters(js: JSM): JStgStat {
-  const setters = jFunctionSized(js, name(hdSetRegStr), 2, ([n, v]) => ({
+  const setters = jFunctionSized(js, name(hdGetRegStr), 1, ([n]) => ({
     tag: "SwitchStat",
     scrut: n!,
-    cases: lowRegs.map((r): [JStgExpr, JStgStat] => [
-      jInt(regNumber(r)),
-      mconcatJStgStat([assign_(register(r), v!), { tag: "BreakStat" }]),
-    ]),
-    default: assign_(highReg_expr(n!), v!),
+    cases: regsFromR1.map((r): [JStgExpr, JStgStat] => [jInt(jsRegToInt(r)), returnS(register(r))]),
+    default: memptyJStgStat,
   }));
-  const getters = jFunctionSized(js, name(hdGetRegStr), 1, ([n]) => ({
+  const getters = jFunctionSized(js, name(hdSetRegStr), 2, ([n, v]) => ({
     tag: "SwitchStat",
     scrut: n!,
-    cases: lowRegs.map((r): [JStgExpr, JStgStat] => [jInt(regNumber(r)), returnS(register(r))]),
-    default: returnS(highReg_expr(n!)),
+    cases: regsFromR1.map((r): [JStgExpr, JStgStat] => [
+      jInt(jsRegToInt(r)),
+      // a `return undefined;`, not a `break`
+      mconcatJStgStat([assign_(register(r), v!), returnS(undefined_)]),
+    ]),
+    default: memptyJStgStat,
   }));
   return mconcatJStgStat([setters, getters]);
 }
@@ -88,7 +95,7 @@ export function regGettersSetters(js: JSM): JStgStat {
 export function loadRegs(js: JSM): JStgStat {
   const mkLoad = (n: number): JStgStat =>
     jFunctionSized(js, hdLoads(n), n, (args) => {
-      const targets = take(regsFromR1(), n).reverse();
+      const targets = regsFromR1.slice(0, n).reverse();
       return mconcatJStgStat(args.map((a, i) => assign_(register(targets[i]!), a)));
     });
   return mconcatJStgStat(range(1, loaderCount).map(mkLoad));
@@ -102,8 +109,24 @@ export function assignRegs(s: StgToJSConfig, xs: JStgExpr[]): JStgStat {
   const l = xs.length;
   if (l <= 32 && !s.inlineLoadRegs)
     return { tag: "ApplStat", fn: { tag: "ValExpr", value: { tag: "JVar", ident: hdLoads(l) } }, args: [...xs].reverse() };
-  const targets = take(regsFromR1(), l);
+  const targets = regsFromR1.slice(0, l);
   return mconcatJStgStat(xs.map((ex, i) => assign_(register(targets[i]!), ex)).reverse());
+}
+
+/** garbageCollector - `h$resetRegisters` / `h$resetResultVars`.
+ *
+ * Both "reset" by assigning the *global named* `null` (GHC.JS.Make.null_),
+ * not JS's nil literal. 9.12.2 resets every one of the 128 registers one by
+ * one; there is no `h$regs.fill(null)` shortcut. */
+export function garbageCollector(js: JSM): JStgStat {
+  return jBlock([
+    jFunctionSized(js, name(hdResetRegisters), 0, () =>
+      mconcatJStgStat(regsFromR1.map((r) => assign_(register(r), jsNull))),
+    ),
+    jFunctionSized(js, name(hdResetResultVars), 0, () =>
+      mconcatJStgStat(retRegs.map((r) => assign_(global(r), jsNull))),
+    ),
+  ]);
 }
 
 /** declRets - declare the return variables `h$ret1..h$ret10`. */
@@ -266,6 +289,7 @@ export function rts(js: JSM, cfg: StgToJSConfig = defaultStgToJSConfig): JStgSta
   return js.withTag("h$RTS", (env) =>
     mconcatJStgStat([
       rtsDecls(env),
+      garbageCollector(env),
       closureTypeConstants,
       closureConstructors(env, cfg),
       stackManip(env),
