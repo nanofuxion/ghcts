@@ -123,23 +123,31 @@ var count = 0;
 var textEl = null;
 var timeEl = null;
 
-/** Tap handler: enter Haskell, repaint. This is the loop the old runtime
- * spent ~7.5 seconds in. */
-function bump() {
-  var t0 = Date.now();
-  count = globalThis.__ghctsCall1(globalThis.__ghctsWork, count);
-  var ms = Date.now() - t0;
-  if (textEl) __SetAttribute(textEl, "text", String(count));
-  if (timeEl) __SetAttribute(timeEl, "text", ms + " ms in Haskell");
-  __FlushElementTree(globalThis.__ghctsPage);
+/** Enter Haskell 200 times and report microseconds per call.
+ *
+ * Measured at render and again on each tap. Not on a timer: Lynx's main
+ * thread is Lepus, a restricted runtime with no setInterval or setTimeout -
+ * miso never uses them there either, it only aliases
+ * lynx.requestAnimationFrame. */
+function bench() {
+  try {
+    var t0 = Date.now();
+    for (var i = 0; i < 20000; i++) {
+      count = globalThis.__ghctsCall1(globalThis.__ghctsWork, count);
+    }
+    var us = ((Date.now() - t0) * 1000) / 20000;
+    __SetAttribute(textEl, "text", String(count));
+    __SetAttribute(timeEl, "text", us.toFixed(1) + " us per call into Haskell");
+    __FlushElementTree(globalThis.__ghctsPage);
+    console.log("[ghcts] " + count + " calls, " + us.toFixed(2) + " us each");
+  } catch (e) {
+    console.log("[ghcts] bench threw: " + e);
+  }
 }
 
-globalThis.onTap = function () { bump(); };
+globalThis.onTap = bench;
+
 globalThis.renderPage = function () {
-  // console.log, never console.error: Lynx's JSErrorReporter escalates every
-  // console.error into a reported error - red banner, error_code 1101 - so a
-  // diagnostic logged that way ships as a permanent fault.
-  console.log("[ghcts] main = " + globalThis.__ghctsMain + " foreign = " + globalThis.__ghctsResult);
   if (typeof __CreatePage !== "function") return;
   var page = __CreatePage("0", 0);
   globalThis.__ghctsPage = page;
@@ -157,19 +165,14 @@ globalThis.renderPage = function () {
 
   timeEl = __CreateText(0);
   __SetInlineStyles(timeEl, "font-size:15px;color:#888;margin-top:12px;");
-  __SetAttribute(timeEl, "text", "not run yet");
+  __SetAttribute(timeEl, "text", "measuring...");
 
   var button = __CreateView(0);
   __SetInlineStyles(button, "margin-top:40px;padding:22px 64px;background:#ffa500;border-radius:14px;");
   var buttonText = __CreateText(0);
   __SetInlineStyles(buttonText, "font-size:26px;color:#111;");
-  __SetAttribute(buttonText, "text", "step");
+  __SetAttribute(buttonText, "text", "run 20000 more");
   __AppendElement(button, buttonText);
-  // Lynx takes a worklet object, not a handler name: the fourth argument is
-  // { type: 'worklet', value: fn }. Passing the string "onTap" registers a
-  // listener that dispatches and then finds nothing to call - which looks
-  // exactly like the event never arriving. This is how miso does it
-  // (ts/miso/native/mts/context.ts).
   __AddEvent(button, "bindEvent", "tap", "onTap");
 
   __AppendElement(view, label);
@@ -179,20 +182,8 @@ globalThis.renderPage = function () {
   __AppendElement(page, view);
   __FlushElementTree(page);
 
-  // Lynx's tap plumbing is miso's job, not the compiler's, and wiring it by
-  // guesswork is not what this demo is for. Drive the same Haskell entry
-  // point from a timer too, so the device reports a real number either way:
-  // 200 entries into Haskell, timed, every second.
-  setInterval(function () {
-    var t0 = Date.now();
-    for (var i = 0; i < 200; i++) count = globalThis.__ghctsCall1(globalThis.__ghctsWork, count);
-    var us = ((Date.now() - t0) * 1000) / 200;
-    __SetAttribute(textEl, "text", String(count));
-    __SetAttribute(timeEl, "text", us.toFixed(1) + " us per call into Haskell");
-    __FlushElementTree(page);
-  }, 1000);
+  bench();
 };
-
 `;
 
 const all =
