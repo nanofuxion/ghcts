@@ -1,0 +1,20 @@
+{
+  "name": "ghcts",
+  "version": "0.1.0",
+  "description": "A TypeScript-native Haskell to TypeScript compiler",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": { "ghcts": "./dist/cli.js" },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:lynx": "npm run build && node scripts/build-lynx-bundles.mjs",
+    "build:bundles": "npm run build:lynx",
+    "test": "npm run build && node --test test/**/*.test.mjs",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": { "typescript": "^5.8.3" },
+  "devDependencies": { "@types/node": "^22.0.0" },
+  "engines": { "node": ">=20" }
+}

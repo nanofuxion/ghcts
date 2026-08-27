@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "sourceRoots": ["."],
+  "entry": { "module": "Main", "export": "main" },
+  "dependencies": ["miso"],
+  "targets": ["browser", "node"],
+  "outDir": "dist"
+}

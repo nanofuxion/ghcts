@@ -1,0 +1,12 @@
+[submodule "references/miso"]
+	path = references/miso
+	url = https://github.com/dmjio/miso.git
+[submodule "references/ghcjs"]
+	path = references/ghcjs
+	url = https://github.com/ghcjs/ghcjs.git
+[submodule "references/ghc"]
+	path = references/ghc
+	url = https://gitlab.haskell.org/ghc/ghc.git
+[submodule "references/aihc"]
+	path = references/aihc
+	url = https://github.com/ai-haskell-compiler/aihc.git

@@ -1,0 +1,25 @@
+node_modules/
+dist/
+test/fixtures/*/dist/
+
+# macOS
+.DS_Store
+
+# Scratch
+tmp/
+.tmp-*/
+
+# Reference checkouts that are not registered submodules. Each is its own
+# git repo; committing one would leave a gitlink with no .gitmodules entry.
+references/MicroHs/
+references/miso-lynx/
+references/misogram/
+references/video/
+
+# compiler-wasm: bootstrap experiment. Its build/ and toolchain/ hold multi-GB
+# vendored GHC/emsdk checkouts; only the notes and the extraction manifest are
+# worth tracking.
+compiler-wasm/build/
+compiler-wasm/toolchain/
+compiler-wasm/extracted/
+compiler-wasm/probes/
