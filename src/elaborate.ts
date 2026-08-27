@@ -53,6 +53,7 @@ import type {
 } from "./ast.js";
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { error } from "./diagnostics.js";
+import { constructorTable, derivedEqMethod, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
 import { parseModule } from "./parser.js";
 import type { Diagnostic } from "./types.js";
@@ -314,10 +315,57 @@ interface ClassInfo {
 
 interface InstanceInfo {
   cls: string;
+  /** The instance head's argument, with its own free type variables: `[a]` for
+   * `instance Eq a => Eq [a]`. Resolution matches a wanted type against it. */
   target: Type;
   targetCon: string;
+  /** `targetCon` made safe to spell inside a generated identifier. */
+  emitCon: string;
+  /** The instance context, over `target`'s variables. Non-empty makes the
+   * instance's dictionary a *function* of the dictionaries it names. */
+  context: Constraint[];
+  /** The context as named parameters, shared by the dictionary CAF and by
+   * every method implementation, so the two agree on argument order. */
+  params: Given[];
   methods: Map<string, ValueDeclaration>;
   span: Span;
+}
+
+/** A type constructor's name as it may appear inside a generated identifier;
+ * `[]` and friends are legal type constructors but not legal name fragments. */
+const conKey = (con: string): string =>
+  con === "[]" ? "List" : con === "->" ? "Fun" : /^\(,+\)$/.test(con) ? `Tuple${con.length - 1}` : con;
+
+/** One-way matching: instantiate the *pattern*'s variables only, so a wanted
+ * type is never mutated by trying an instance that does not apply. */
+function matchType(pattern: Type, target: Type, subst: Map<TVar, Type>): boolean {
+  const p = prune(pattern);
+  const t = prune(target);
+  if (p.tag === "var") {
+    const previous = subst.get(p.v);
+    if (!previous) {
+      subst.set(p.v, t);
+      return true;
+    }
+    return sameType(previous, t);
+  }
+  if (p.tag === "con") return t.tag === "con" && t.name === p.name;
+  if (p.tag === "app") return t.tag === "app" && matchType(p.fn, t.fn, subst) && matchType(p.arg, t.arg, subst);
+  return false;
+}
+
+function applySubst(t: Type, subst: ReadonlyMap<TVar, Type>): Type {
+  const p = prune(t);
+  if (p.tag === "var") return subst.get(p.v) ?? p;
+  if (p.tag === "app") return tapp(applySubst(p.fn, subst), applySubst(p.arg, subst));
+  return p;
+}
+
+function showType(t: Type): string {
+  const p = prune(t);
+  if (p.tag === "con") return p.name;
+  if (p.tag === "app") return `(${showType(p.fn)} ${showType(p.arg)})`;
+  return p.tag === "var" ? `t${p.v.id}` : `g${p.index}`;
 }
 
 const dictType = (cls: string): string => `Dict_${cls}`;
@@ -592,7 +640,7 @@ class Elaborator {
   /** Discharge one constraint, producing the expression that names its
    * dictionary. A given wins over an instance, and a superclass field of a
    * given wins over nothing at all. */
-  resolve(cls: string, type: Type, givens: readonly Given[], span: Span): Expr | undefined {
+  resolve(cls: string, type: Type, givens: readonly Given[], span: Span, depth = 0): Expr | undefined {
     const queue: Array<{ cls: string; expr: Expr }> = givens
       .filter((g) => sameType(g.type, type))
       .map((g) => ({ cls: g.cls, expr: variable(g.name, span) }));
@@ -617,7 +665,26 @@ class Elaborator {
       this.report(`no instance for \`${cls} ${con}\``, span);
       return undefined;
     }
-    return variable(dictValue(cls, con), span);
+    const self = variable(dictValue(cls, instance.emitCon), span);
+    if (instance.context.length === 0) return self;
+    // A constrained instance is a function from dictionaries to a dictionary,
+    // so selecting it is recursive. The depth bound is what turns a
+    // non-terminating instance chain into a diagnostic instead of a hang.
+    if (depth > 32) {
+      this.report(`instance resolution for \`${cls} ${showType(type)}\` did not terminate`, span);
+      return undefined;
+    }
+    const subst = new Map<TVar, Type>();
+    if (!matchType(instance.target, type, subst)) {
+      this.report(`no instance for \`${cls} ${showType(type)}\``, span);
+      return undefined;
+    }
+    return applyAll(
+      self,
+      instance.context.map(
+        (c) => this.resolve(c.cls, applySubst(c.type, subst), givens, span, depth + 1) ?? errorExpr(span),
+      ),
+    );
   }
 
   /** Ambiguous numeric constraints default to `Int`, which is what makes
@@ -667,7 +734,11 @@ class Elaborator {
       const params: Given[] = [];
       for (const c of this.wanted(binding)) {
         const t = prune(c.type);
-        if (t.tag !== "var" || !quantified.includes(t.v)) continue;
+        // A constraint counts as generalised when it *mentions* a quantified
+        // variable, not only when it is one: `Eq [a]` is as much a dictionary
+        // parameter as `Eq a`, and dropping it would leave it unsolvable.
+        const vars = typeVars(t);
+        if (vars.length === 0 || !vars.some((v) => quantified.includes(v))) continue;
         if (params.some((p) => p.cls === c.cls && sameType(p.type, t))) continue;
         params.push({ cls: c.cls, type: t, name: `$d${params.length}` });
       }
@@ -807,19 +878,19 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
       elaborator.report(`instance \`${decl.head}\`: unrecognised head`, decl.span);
       continue;
     }
-    if (/=>/.test(decl.head)) {
-      elaborator.report(`instance \`${decl.head}\`: instance contexts are not elaborated yet`, decl.span);
-      continue;
-    }
     const info = elaborator.classes.get(parsed.className);
     if (!info) {
       elaborator.report(`instance for unknown class \`${parsed.className}\``, decl.span);
       continue;
     }
-    const target = parseType(parsed.target, new Map());
+    // Head and context are parsed against one variable map, so `a` in
+    // `Eq a => Eq [a]` is the same type variable in both.
+    const vars = new Map<string, Type>();
+    const context = parseSignature(decl.head, vars).context;
+    const target = parseType(parsed.target, vars);
     const targetCon = headCon(target);
     if (targetCon === undefined) {
-      elaborator.report(`instance \`${decl.head}\`: instance heads must be ground`, decl.span);
+      elaborator.report(`instance \`${decl.head}\`: the instance head must have a type constructor`, decl.span);
       continue;
     }
     const methods = new Map<string, ValueDeclaration>();
@@ -828,7 +899,28 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
       cls: parsed.className,
       target,
       targetCon,
+      emitCon: conKey(targetCon),
+      context,
+      params: context.map((c, i) => ({ cls: c.cls, type: c.type, name: `$d${i}` })),
       methods,
+      span: decl.span,
+    });
+  }
+
+  // `deriving Eq` is an instance like any other: one constrained by `Eq` at
+  // each type parameter, whose `==` is the structural comparison.
+  for (const decl of datas) {
+    if (!decl.deriving.includes("Eq") || elaborator.instances.has(`Eq ${decl.name}`)) continue;
+    const vars = decl.parameters.map(() => freshVar());
+    const context = vars.map((type) => ({ cls: "Eq", type }));
+    elaborator.instances.set(`Eq ${decl.name}`, {
+      cls: "Eq",
+      target: vars.reduce<Type>(tapp, tcon(decl.name)),
+      targetCon: decl.name,
+      emitCon: conKey(decl.name),
+      context,
+      params: context.map((c, i) => ({ cls: c.cls, type: c.type, name: `$d${i}` })),
+      methods: new Map([["==", derivedEqMethod(decl)]]),
       span: decl.span,
     });
   }
@@ -837,13 +929,22 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
   const signatures = new Map(
     declarations.filter((d): d is SignatureDeclaration => d.tag === "signature").map((d) => [d.name, d.type]),
   );
+  // Record selectors are ordinary top-level functions; a user binding of the
+  // same name wins, exactly as a hand-written selector would.
+  const cons = constructorTable(datas);
+  const bound = new Set(declarations.flatMap((d) => (d.tag === "value" || d.tag === "foreign" ? [d.name] : [])));
+  declarations.push(...fieldSelectors(datas, bound));
+
   const bindings: Binding[] = [];
   const addBinding = (
     name: string,
-    decl: ValueDeclaration,
+    original: ValueDeclaration,
     signature?: { context: Constraint[]; type: Type },
     declared?: { context: Constraint[]; type: Type },
   ): void => {
+    // `do`, records and record patterns are expanded here, at the one point
+    // every value - top level, instance method and class default - passes.
+    const decl = expandSugar(original, cons, (message, span) => elaborator.report(message, span));
     const binding: Binding = {
       name,
       decl,
@@ -890,8 +991,14 @@ export function elaborateModule(user: Module, file = `${user.name}.hs`): Elabora
         if (!method.hasDefault) elaborator.report(`instance \`${instance.cls} ${instance.targetCon}\` has no \`${method.name}\` and the class has no default`, instance.span);
         continue;
       }
-      const at = skolemise({ context: [], type: substituteVar(method.type, varType(info.variable), instance.target) });
-      addBinding(methodImpl(instance.cls, instance.targetCon, method.name), { ...decl, name: methodImpl(instance.cls, instance.targetCon, method.name) }, at);
+      // The instance context becomes the method's givens, so a method of
+      // `instance Eq a => Eq [a]` takes the same `$d0` the dictionary does.
+      const at = skolemise({
+        context: instance.context,
+        type: substituteVar(method.type, varType(info.variable), instance.target),
+      });
+      const implName = methodImpl(instance.cls, instance.emitCon, method.name);
+      addBinding(implName, { ...decl, name: implName }, at);
     }
   }
   for (const info of elaborator.classes.values()) {
@@ -1158,25 +1265,25 @@ function classDeclarations(info: ClassInfo): Declaration[] {
 function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): ValueDeclaration | undefined {
   const info = elaborator.classes.get(instance.cls);
   if (!info) return undefined;
-  const self = variable(dictValue(instance.cls, instance.targetCon), instance.span);
-  const supers = info.superclasses.map((parent) => {
-    if (!elaborator.instances.has(`${parent} ${instance.targetCon}`)) {
-      elaborator.report(`instance \`${instance.cls} ${instance.targetCon}\` needs a superclass instance \`${parent} ${instance.targetCon}\``, instance.span);
-      return errorExpr(instance.span);
-    }
-    return variable(dictValue(parent, instance.targetCon), instance.span);
-  });
+  const args = instance.params.map((p) => variable(p.name, instance.span));
+  // With a context the dictionary is a function, so "itself" - what a default
+  // method is handed - is this binding applied to its own parameters.
+  const self = applyAll(variable(dictValue(instance.cls, instance.emitCon), instance.span), args);
+  const supers = info.superclasses.map(
+    (parent) =>
+      elaborator.resolve(parent, instance.target, instance.params, instance.span) ?? errorExpr(instance.span),
+  );
   const methods = info.methods.map((method) =>
     instance.methods.has(method.name)
-      ? variable(methodImpl(instance.cls, instance.targetCon, method.name), instance.span)
+      ? applyAll(variable(methodImpl(instance.cls, instance.emitCon, method.name), instance.span), args)
       : // The default is a function of this very dictionary, which is why the
         // instance binding is a genuinely self-referential CAF. It terminates
         // because the field is a thunk, never a forced value.
         apply(variable(defaultImpl(instance.cls, method.name), instance.span), self),
   );
   return valueDecl(
-    dictValue(instance.cls, instance.targetCon),
-    [],
+    dictValue(instance.cls, instance.emitCon),
+    instance.params.map((p): Pattern => ({ tag: "var", name: p.name, span: instance.span })),
     applyAll(variable(dictCon(instance.cls), instance.span), [...supers, ...methods]),
     instance.span,
   );

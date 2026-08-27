@@ -25,7 +25,16 @@ export interface ParsedModule {
 // symbolic application never leaks out and is misread as another declaration.
 type Assoc = "left" | "right";
 const operators: Record<string, { prec: number; assoc: Assoc }> = {
-  $: { prec: 0, assoc: "right" },
+  // This table runs one level below Haskell's report fixities, so the monadic
+  // operators (`infixl 1`) land at 0 and `$` (`infixr 0`) below everything.
+  $: { prec: -1, assoc: "right" },
+  ">>=": { prec: 0, assoc: "left" },
+  ">>": { prec: 0, assoc: "left" },
+  "=<<": { prec: 0, assoc: "right" },
+  "<$>": { prec: 3, assoc: "left" },
+  "<*>": { prec: 3, assoc: "left" },
+  "<*": { prec: 3, assoc: "left" },
+  "*>": { prec: 3, assoc: "left" },
   "&": { prec: 1, assoc: "left" },
   "||": { prec: 1, assoc: "right" },
   "&&": { prec: 2, assoc: "right" },
@@ -928,17 +937,22 @@ class Parser {
             continue;
           }
           if (this.current().text === "(" || this.current().text === "[") {
+            const spelling: string[] = [];
             let depth = 0;
             do {
               const token = this.take();
               if (token.text === "(" || token.text === "[") depth++;
               if (token.text === ")" || token.text === "]") depth--;
+              spelling.push(token.text);
             } while (depth > 0 && this.current().kind !== "eof");
             arity++;
+            // A positional field's type matters as much as a record field's:
+            // it is what ties `Just`'s argument to `Maybe a`'s parameter.
+            (fieldTypes ??= []).push(spelling.join(" "));
             continue;
           }
           if (this.current().kind === "ident") {
-            this.take();
+            (fieldTypes ??= []).push(this.take().text);
             arity++;
             continue;
           }
@@ -1210,7 +1224,7 @@ class Parser {
       this.take();
     this.skipLines();
   }
-  private expression(min = 0): Expr {
+  private expression(min = -1): Expr {
     let left = this.application();
     let operator =
       this.index === this.expressionStop ? undefined : this.currentOperator();

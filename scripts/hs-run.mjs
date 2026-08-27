@@ -223,6 +223,131 @@ const programs = [
       "module Main where\ntriple x = x + x + x\nmain = show (triple 14)\n",
     expect: "42",
   },
+  // Instance contexts: `Eq a => Eq [a]` / `Eq a => Eq (Maybe a)` make an
+  // instance a function from dictionaries to a dictionary.
+  {
+    name: "instance context: Eq on a list",
+    source: "module Main where\nmain = show ([1, 2, 3] == [1, 2, 3])\n",
+    expect: "True",
+  },
+  {
+    name: "instance context: a difference is found",
+    source: "module Main where\nmain = show ([1, 2] == [1, 3])\n",
+    expect: "False",
+  },
+  {
+    name: "instance context: nested, Eq [[Int]]",
+    source: "module Main where\nmain = show ([[1], [2]] == [[1], [2]])\n",
+    expect: "True",
+  },
+  {
+    name: "instance context: Eq (Maybe Int)",
+    source: "module Main where\nmain = show (Just 3 == Just 4)\n",
+    expect: "False",
+  },
+  {
+    name: "user instance with a context",
+    source:
+      "module Main where\ndata Box a = Box a\nunbox (Box x) = x\ninstance Eq a => Eq (Box a) where\n  (==) p q = unbox p == unbox q\nmain = show (Box 7 == Box 7)\n",
+    expect: "True",
+  },
+  // Functor / Applicative / Monad and `do`.
+  {
+    name: "fmap through the Functor dictionary",
+    source: "module Main where\nmain = show (fmap (\\x -> x + 1) (Just 41) == Just 42)\n",
+    expect: "True",
+  },
+  {
+    name: "Applicative: pure and <*>",
+    source: "module Main where\nmain = show (fmap (\\x -> x + 1) (pure 41) == Just 42)\n",
+    expect: "True",
+  },
+  {
+    name: "do notation over Maybe",
+    source:
+      "module Main where\nsum3 :: Maybe Int\nsum3 = do\n  x <- Just 1\n  y <- Just 2\n  z <- Just 39\n  pure (x + y + z)\nmain = show (sum3 == Just 42)\n",
+    expect: "True",
+  },
+  {
+    name: "do notation short-circuits on Nothing",
+    source:
+      "module Main where\nfailing :: Maybe Int\nfailing = do\n  x <- Just 1\n  y <- Nothing\n  pure (x + y)\nmain = show (failing == Nothing)\n",
+    expect: "True",
+  },
+  {
+    name: "do notation with >> and a let statement",
+    source:
+      "module Main where\nrun :: Maybe Int\nrun = do\n  Just 1\n  let k = 20\n  x <- Just 22\n  pure (k + x)\nmain = show (run == Just 42)\n",
+    expect: "True",
+  },
+  {
+    name: "do notation with a constructor binder",
+    source:
+      "module Main where\nunwrap :: Maybe Int\nunwrap = do\n  I n <- Just 42\n  pure (I n)\nmain = show (unwrap == Just 42)\n",
+    expect: "True",
+  },
+  // Records.
+  {
+    name: "record construction and a field selector",
+    source:
+      "module Main where\ndata Person = Person { name :: [Char], age :: Int }\nmain = show (age (Person { name = \"ada\", age = 42 }))\n",
+    expect: "42",
+  },
+  {
+    name: "record update",
+    source:
+      "module Main where\ndata Person = Person { name :: [Char], age :: Int }\nolder p = p { age = age p + 1 }\nmain = show (age (older (Person { name = \"ada\", age = 41 })))\n",
+    expect: "42",
+  },
+  {
+    name: "record selector on a newtype, and a record pattern",
+    source:
+      "module Main where\nnewtype Model = Model { value :: Int }\nbump (Model { value = v }) = Model { value = v + 1 }\nmain = show (value (bump (Model 41)))\n",
+    expect: "42",
+  },
+  {
+    name: "record wildcard pattern",
+    source:
+      "module Main where\ndata Point = Point { px :: Int, py :: Int }\nsumP (Point {..}) = px + py\nmain = show (sumP (Point 20 22))\n",
+    expect: "42",
+  },
+  // deriving.
+  {
+    name: "deriving Eq on an enumeration",
+    source:
+      "module Main where\ndata Colour = Red | Green | Blue deriving Eq\nmain = show (Green == Green)\n",
+    expect: "True",
+  },
+  {
+    name: "deriving Eq distinguishes constructors",
+    source:
+      "module Main where\ndata Colour = Red | Green | Blue deriving Eq\nmain = show (Green == Blue)\n",
+    expect: "False",
+  },
+  {
+    name: "deriving Eq with fields and a context",
+    source:
+      "module Main where\ndata Pair a = Pair a a deriving Eq\nmain = show (Pair 1 2 == Pair 1 3)\n",
+    expect: "False",
+  },
+  {
+    name: "deriving Eq reaches through the derived list instance",
+    source:
+      "module Main where\ndata Colour = Red | Green deriving Eq\nmain = show ([Red, Green] == [Red, Green])\n",
+    expect: "True",
+  },
+  {
+    name: "record type deriving Eq",
+    source:
+      "module Main where\ndata Point = Point { px :: Int, py :: Int } deriving Eq\nmain = show (Point 1 2 == Point 1 2)\n",
+    expect: "True",
+  },
+  {
+    name: "multi-equation instance method",
+    source:
+      "module Main where\ndata Colour = Red | Green\ninstance Show Colour where\n  show Red = \"red\"\n  show Green = \"green\"\nmain = show Green\n",
+    expect: "green",
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

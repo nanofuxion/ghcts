@@ -103,7 +103,13 @@ export function instanceMethodValues(declaration: InstanceDeclaration, file = '<
     const parsed = parseModule(`module Dictionary where\n${sourceTokens.join(' ')}\n`, file);
     if (parsed.diagnostics.length) continue;
     const value = parsed.module?.ast.declarations.find((candidate): candidate is ValueDeclaration => candidate.tag === 'value');
-    if (value) values.push(value);
+    if (!value) continue;
+    // Layout puts each equation of a multi-equation member in its own slice, so
+    // the equations arrive as separate declarations and have to be rejoined -
+    // otherwise `f A = ...` / `f B = ...` would keep only the last equation.
+    const existing = values.find((candidate) => candidate.name === value.name);
+    if (existing) existing.equations = [...existing.equations, ...value.equations];
+    else values.push(value);
   }
   return values;
 }
