@@ -36,6 +36,9 @@ const apps = {
     root,
     "references/miso-lynx/examples/main.lynx.bundle",
   ),
+  // The oracle's own lib.js/out.js driven by ghcts's generated rts.js - see
+  // scripts/rts-swap.mjs. Real compiled Haskell on our RTS.
+  "/rts-swap/main.lynx.bundle": join(root, "dist/rts-swap/lynx/main.lynx.bundle"),
 };
 
 const lanAddresses = () => {
