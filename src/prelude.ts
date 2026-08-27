@@ -95,15 +95,4 @@ append :: [a] -> [a] -> [a]
 append xs ys = case xs of
   [] -> ys
   (z : zs) -> z : append zs ys
-
-foreign import javascript unsafe "(() => '')" jsEmptyString :: JSString
-foreign import javascript unsafe "((s,c) => s + String.fromCharCode(c))" jsSnocChar :: JSString -> CharPrim -> JSString
-
-toJSString :: [Char] -> JSString
-toJSString cs = jsStringGo jsEmptyString cs
-
-jsStringGo :: JSString -> [Char] -> JSString
-jsStringGo acc cs = case cs of
-  [] -> acc
-  (C c : rest) -> jsStringGo (jsSnocChar acc c) rest
 `;

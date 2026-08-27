@@ -2,7 +2,7 @@
 /**
  * Compile real Haskell source all the way to JavaScript and run it.
  *
- * parse -> typecheck -> desugar -> Core -> STG -> stgToJS -> renderRts, then
+ * parse -> elaborate -> desugar -> Core -> STG -> stgToJS -> renderRts, then
  * evaluate under the same trampoline `scripts/stg-run.mjs` uses. That script
  * proves codegen against hand-built STG; this one proves the frontend that
  * now produces that STG.
@@ -11,9 +11,13 @@
  *   node scripts/hs-run.mjs --print         # also show the generated JS
  *   node scripts/hs-run.mjs file.hs         # compile and run one file
  *
- * The language is the class-free fragment src/desugar.ts documents: integer
- * literals are Int#, arithmetic is primops, Bool is 0/1. `main` is entered as
- * a thunk and whatever lands in R1 is reported.
+ * The language is Haskell with typeclasses: `src/elaborate.ts` prepends the
+ * minimal Prelude of `src/prelude.ts` and turns classes, instances and
+ * constrained call sites into explicit dictionary passing before desugaring.
+ * `main` is entered as a thunk and whatever lands in R1 is reported. `Int`,
+ * `Char` and `Bool` land unboxed, exactly as GHC's JS backend represents a
+ * one-constructor type over a primitive field; a `[Char]` is walked into a JS
+ * string, which is the one thing `putStrLn` would otherwise be for.
  */
 import { readFileSync } from "node:fs";
 import { renderRts } from "../dist/stg-js/rts.js";
@@ -21,7 +25,7 @@ import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
 import { defaultStgToJSConfig } from "../dist/stg-js/types.js";
 import { parseModule } from "../dist/parser.js";
-import { checkModule } from "../dist/typecheck.js";
+import { elaborateModule } from "../dist/elaborate.js";
 import { desugarModule } from "../dist/desugar.js";
 import { coreToStg } from "../dist/core-to-stg.js";
 import { formatDiagnostic } from "../dist/diagnostics.js";
@@ -55,6 +59,12 @@ var h$testResult;
 function h$stopFrame() { h$testResult = h$r1; return null; }
 h$stopFrame.f = h$stopFrame;
 h$o(h$stopFrame, -1, 0, 0, 0, null);
+/** Enter a closure and return its value. Entering an already-evaluated
+ * constructor returns it unchanged, so this works for a thunk and for a value.
+ */
+function h$forceClosure(c) {
+  return h$runEntry(function(){ h$r1 = c; return c.f; });
+}
 function h$runEntry(c) {
   h$sp = 0;
   h$stack[0] = h$stopFrame;
@@ -70,11 +80,10 @@ function compile(source, file) {
   if (parsed.diagnostics.some((d) => d.severity === "error")) {
     throw new Error(parsed.diagnostics.map(formatDiagnostic).join("\n"));
   }
-  const ast = parsed.module.ast;
-  const typed = checkModule(ast, file);
-  const desugared = desugarModule(ast, file);
+  const elaborated = elaborateModule(parsed.module.ast, file);
+  const desugared = desugarModule(elaborated.module, file);
   const stg = coreToStg(desugared.program);
-  const units = stgToJS(config, { unitId: "main", moduleName: ast.name }, stg.bindings);
+  const units = stgToJS(config, { unitId: "main", moduleName: parsed.module.ast.name }, stg.bindings);
   const emitted = renderModule(config, units);
   const mainBinder = stg.bindings
     .flatMap((b) => (b.tag === "StgNonRec" ? [b.binder] : b.pairs.map(([x]) => x)))
@@ -84,7 +93,7 @@ function compile(source, file) {
   return {
     emitted,
     symbol: unit.luObjBlock.oiSymbols[0],
-    diagnostics: [...typed.diagnostics, ...desugared.diagnostics],
+    diagnostics: [...elaborated.diagnostics, ...desugared.diagnostics],
   };
 }
 
@@ -92,9 +101,20 @@ function run(emitted, symbol) {
   // Indirect eval so the RTS's top-level `var h$...` land on globalThis.
   const entry = (0, eval)(
     `${rts}\n${bootstrap}\n${emitted}\n(function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
-      ` return h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; }); })`,
+      ` return { value: h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; }), force: h$forceClosure }; })`,
   );
-  return entry();
+  const { value, force } = entry();
+  // `Int`, `Char` and `Bool` arrive as plain JS values: the backend unboxes a
+  // one-constructor, one-primitive-field type (`isUnboxableCon`), and `Bool`
+  // is a JS boolean. Only a list is still a closure, so an object result is a
+  // `[Char]` to spell out; `[]` is allocated with null fields.
+  if (value === null || typeof value !== "object") return value;
+  let text = "";
+  for (let cell = value; cell.d2 !== null && cell.d2 !== undefined; cell = force(cell.d2)) {
+    const head = cell.d1;
+    text += String.fromCharCode(typeof head === "number" ? head : force(head));
+  }
+  return text;
 }
 
 const programs = [
@@ -150,14 +170,58 @@ const programs = [
     // GHC 9.12 requires the import string to be a JS expression denoting a
     // function, not a GHCJS `$r = ...` pattern.
     name: "foreign import javascript",
+    // The JS FFI is unlifted: it takes machine values, so its signature is
+    // written over `IntPrim` rather than the boxed `Int`.
     source:
-      'module Main where\nforeign import javascript unsafe "((x,y) => x + y)" jsAdd :: Int -> Int -> Int\nmain = jsAdd 19 23\n',
+      'module Main where\nforeign import javascript unsafe "((x,y) => x + y)" jsAdd :: IntPrim -> IntPrim -> IntPrim\nmain = jsAdd 19 23\n',
     expect: 42,
   },
   {
     name: "lambda",
     source: "module Main where\napply f x = f x\nmain = apply (\\y -> y * 3) 14\n",
     expect: 42,
+  },
+  // Everything below needs dictionaries: without instance selection there is
+  // no `show`, no user-defined `==`, no default method and no superclass.
+  {
+    name: "show through the Num and Show dictionaries",
+    source: "module Main where\nmain = show (1 + 2)\n",
+    expect: "3",
+  },
+  {
+    name: "show a negative Int",
+    source: "module Main where\nmain = show (negate 407)\n",
+    expect: "-407",
+  },
+  {
+    name: "user-defined Eq instance",
+    source:
+      "module Main where\ndata Colour = Red | Green\neqColour a b = case a of\n  Red -> isRed b\n  Green -> not (isRed b)\nisRed c = case c of\n  Red -> True\n  Green -> False\ninstance Eq Colour where\n  (==) a b = eqColour a b\nmain = show (Red == Green)\n",
+    expect: "False",
+  },
+  {
+    name: "class default method (/= comes from Eq)",
+    source:
+      "module Main where\ndata Colour = Red | Green\nisRed c = case c of\n  Red -> True\n  Green -> False\ninstance Eq Colour where\n  (==) a b = eqBool (isRed a) (isRed b)\nmain = show (Red /= Green)\n",
+    expect: "True",
+  },
+  {
+    name: "superclass: Eq reached through an Ord dictionary",
+    source:
+      "module Main where\neqViaOrd :: Ord a => a -> a -> Bool\neqViaOrd x y = x == y\nmain = show (eqViaOrd 3 3)\n",
+    expect: "True",
+  },
+  {
+    name: "user class with a default method calling another method",
+    source:
+      "module Main where\ndata Colour = Red | Green\nclass Describe a where\n  label :: a -> [Char]\n  describe :: a -> [Char]\n  describe x = label x\ninstance Describe Colour where\n  label c = colourName c\ncolourName c = case c of\n  Red -> \"red\"\n  Green -> \"green\"\nmain = describe Green\n",
+    expect: "green",
+  },
+  {
+    name: "dictionary passed into a polymorphic function",
+    source:
+      "module Main where\ntriple x = x + x + x\nmain = show (triple 14)\n",
+    expect: "42",
   },
 ];
 

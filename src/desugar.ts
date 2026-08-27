@@ -1,23 +1,25 @@
 /** Surface AST (`src/ast.ts`) to Core (`src/core.ts`).
  *
- * Scope. This pass deliberately targets the class-free fragment of Haskell:
- * literals, arithmetic, data types, constructors, pattern matching, `case`,
- * `let`/`where`, guards, lambdas, saturated application and `foreign import
- * javascript`. Anything that would need a dictionary - a class method, an
- * instance, `do` notation, a list comprehension - produces a diagnostic and
- * an expression that raises, so one unsupported construct never silently
- * corrupts the rest of the module.
+ * Scope. This pass targets class-free Haskell, which is what it now receives:
+ * `src/elaborate.ts` runs first and has already turned classes, instances and
+ * constrained call sites into data types, values and explicit dictionary
+ * arguments. Anything still unsupported here - `do` notation, list
+ * comprehensions, records - produces a diagnostic and an expression that
+ * raises, so one unsupported construct never silently corrupts the rest of
+ * the module.
  *
- * Representation choices that follow from having no classes:
+ * Representation, now that dictionaries exist:
  *
- *   - an integer literal IS an `Int#`. With no `Num` dictionary there is
- *     nothing to select an instance from, so `+` is `IntAddOp` directly and
- *     `Int` never gets boxed into `I#`. This is the same shape the terms in
- *     `scripts/stg-run.mjs` already run on.
- *   - `Bool` is an `Int#`: `False` is 0, `True` is 1. That is exactly what
- *     the comparison primops return in the JS backend (`IntEqOp` yields 1 or
- *     0), so `if x == y` needs no conversion at all, and pattern matching on
- *     `True`/`False` is literal matching.
+ *   - an integer literal is an `Int#` ONLY under `fromInteger`. `Int` itself
+ *     is the ordinary boxed `I Int#` the Prelude declares, so arithmetic goes
+ *     through `$fNumInt` and an `Int` argument can be a thunk again.
+ *   - `Bool` is an ordinary two-constructor data type. The comparison primops
+ *     still yield a 0/1 machine value, so each one is wrapped here into a
+ *     real `False`/`True` - GHC's `tagToEnum# (<# a b)`, applied once, at the
+ *     only place the machine value is visible.
+ *   - the `prim*` names below are the only primitives. They are typed over the
+ *     unboxed `IntPrim`/`CharPrim`, never over `Int`, so no builtin can be
+ *     mistaken for a class method.
  */
 import type {
   CaseAlternative,
@@ -43,23 +45,29 @@ export interface DesugarResult {
 
 const int = (value: number): Literal => ({ tag: "LitNumInt", value: BigInt(Math.trunc(value)) });
 
-/** Source name to primop. Every entry is binary except `negate`/`not`.
- * Only ops the JS backend implements appear here (see src/stg-js/prim.ts). */
-const primOps: Record<string, { op: string; arity: number }> = {
-  "+": { op: "IntAddOp", arity: 2 },
-  "-": { op: "IntSubOp", arity: 2 },
-  "*": { op: "IntMulOp", arity: 2 },
-  div: { op: "IntQuotOp", arity: 2 },
-  quot: { op: "IntQuotOp", arity: 2 },
-  mod: { op: "IntRemOp", arity: 2 },
-  rem: { op: "IntRemOp", arity: 2 },
-  "==": { op: "IntEqOp", arity: 2 },
-  "/=": { op: "IntNeOp", arity: 2 },
-  "<": { op: "IntLtOp", arity: 2 },
-  "<=": { op: "IntLeOp", arity: 2 },
-  ">": { op: "IntGtOp", arity: 2 },
-  ">=": { op: "IntGeOp", arity: 2 },
-  negate: { op: "IntNegOp", arity: 1 },
+/** Primitive name to primop. `bool` marks the ones whose 0/1 machine result
+ * is wrapped into a real `Bool` constructor. Only ops the JS backend
+ * implements appear here (see src/stg-js/prim.ts). */
+interface Prim {
+  op: string;
+  arity: number;
+  bool?: true;
+}
+
+const primOps: Record<string, Prim> = {
+  primIntAdd: { op: "IntAddOp", arity: 2 },
+  primIntSub: { op: "IntSubOp", arity: 2 },
+  primIntMul: { op: "IntMulOp", arity: 2 },
+  primIntQuot: { op: "IntQuotOp", arity: 2 },
+  primIntRem: { op: "IntRemOp", arity: 2 },
+  primIntNeg: { op: "IntNegOp", arity: 1 },
+  primIntEq: { op: "IntEqOp", arity: 2, bool: true },
+  primIntNe: { op: "IntNeOp", arity: 2, bool: true },
+  primIntLt: { op: "IntLtOp", arity: 2, bool: true },
+  primIntLe: { op: "IntLeOp", arity: 2, bool: true },
+  primIntGt: { op: "IntGtOp", arity: 2, bool: true },
+  primIntGe: { op: "IntGeOp", arity: 2, bool: true },
+  primChr: { op: "ChrOp", arity: 1 },
 };
 
 /** What a name resolves to. Locals shadow top levels, which shadow
@@ -69,6 +77,10 @@ type Scope = ReadonlyMap<string, Binder>;
 class Desugarer {
   readonly diagnostics: Diagnostic[] = [];
   readonly cons = new Map<string, DataCon>();
+  /** How many constructors each data type has, so an alternative list that
+   * covers all of them can drop its unreachable DEFAULT. Codegen emits no tag
+   * test for a single-constructor type, and would then see two defaults. */
+  readonly conCount = new Map<string, number>([["[]", 2]]);
   readonly top = new Map<string, Binder>();
   /** Names introduced by a `class` declaration, so a use of one can say
    * "dictionary elaboration" instead of "not in scope". */
@@ -103,7 +115,19 @@ class Desugarer {
       case "int":
         return { tag: "Lit", lit: int(e.value) };
       case "string":
-        return { tag: "Lit", lit: { tag: "LitString", value: e.value } };
+        // A `String` is `[Char]`, so a literal is the list it denotes. The
+        // backend's `LitString` is an address, which is a different type.
+        return [...e.value].reduceRight<CoreExpr>(
+          (tail, character) => ({
+            tag: "Con",
+            con: this.lookupCon(":", 2),
+            args: [
+              { tag: "Con", con: this.lookupCon("C", 1), args: [{ tag: "Lit", lit: { tag: "LitChar", value: character } }] },
+              tail,
+            ],
+          }),
+          { tag: "Con", con: this.lookupCon("[]", 0), args: [] },
+        );
       case "unit":
         return { tag: "Lit", lit: int(0) };
       case "var":
@@ -124,21 +148,12 @@ class Desugarer {
           body: this.alternatives({ tag: "Var", binder }, e.alternatives, scope, e.span),
         };
       }
-      case "if": {
-        // False is 0, so the literal alternative is the else branch and
-        // DEFAULT catches every non-zero value, matching what the comparison
-        // primops produce.
-        const binder = mkBinder("cond");
-        return {
-          tag: "Case",
-          scrutinee: this.expr(e.condition, scope),
-          binder,
-          alts: [
-            { con: { tag: "LitAlt", lit: int(0) }, binders: [], body: this.expr(e.elseBranch, scope) },
-            { con: { tag: "DEFAULT" }, binders: [], body: this.expr(e.thenBranch, scope) },
-          ],
-        };
-      }
+      case "if":
+        return this.boolCase(
+          this.expr(e.condition, scope),
+          () => this.expr(e.thenBranch, scope),
+          () => this.expr(e.elseBranch, scope),
+        );
       case "case": {
         const scrutinee = this.expr(e.subject, scope);
         return this.alternatives(scrutinee, e.alternatives, scope, e.span);
@@ -171,8 +186,6 @@ class Desugarer {
   varRef(name: string, scope: Scope, span: Span): CoreExpr {
     const local = scope.get(name);
     if (local) return { tag: "Var", binder: local };
-    if (name === "True" || name === "otherwise") return { tag: "Lit", lit: int(1) };
-    if (name === "False") return { tag: "Lit", lit: int(0) };
     const con = this.cons.get(name);
     if (con) return this.saturateCon(con, []);
     const prim = primOps[name];
@@ -195,13 +208,40 @@ class Desugarer {
     return mkLams(extra, { tag: "Con", con, args: [...args, ...extra.map(varOf)] });
   }
 
-  saturateOp(prim: { op: string; arity: number }, args: CoreExpr[]): CoreExpr {
+  saturateOp(prim: Prim, args: CoreExpr[]): CoreExpr {
     const op: StgOp = { tag: "StgPrimOp", op: prim.op };
-    if (args.length >= prim.arity) {
-      return mkApps({ tag: "Op", op, arity: prim.arity, args: args.slice(0, prim.arity) }, args.slice(prim.arity));
-    }
+    const call = (as: CoreExpr[]): CoreExpr => {
+      const raw: CoreExpr = { tag: "Op", op, arity: prim.arity, args: as };
+      // GHC's `tagToEnum#`: the machine comparison yields 0 or 1, and the
+      // whole rest of the compiler only ever sees a real constructor.
+      return prim.bool ? this.boolCase(raw, () => this.con("True"), () => this.con("False"), true) : raw;
+    };
+    if (args.length >= prim.arity) return mkApps(call(args.slice(0, prim.arity)), args.slice(prim.arity));
     const extra = Array.from({ length: prim.arity - args.length }, (_, i) => mkBinder(`p${i}`));
-    return mkLams(extra, { tag: "Op", op, arity: prim.arity, args: [...args, ...extra.map(varOf)] });
+    return mkLams(extra, call([...args, ...extra.map(varOf)]));
+  }
+
+  con(name: string): CoreExpr {
+    return { tag: "Con", con: this.lookupCon(name, 0), args: [] };
+  }
+
+  /** Scrutinise a condition. `primitive` says whether it is still the 0/1
+   * machine result of a comparison primop, or already a real `Bool`. */
+  boolCase(scrutinee: CoreExpr, whenTrue: () => CoreExpr, whenFalse: () => CoreExpr, primitive = false): CoreExpr {
+    return {
+      tag: "Case",
+      scrutinee,
+      binder: mkBinder("cond"),
+      alts: primitive
+        ? [
+            { con: { tag: "LitAlt", lit: int(0) }, binders: [], body: whenFalse() },
+            { con: { tag: "DEFAULT" }, binders: [], body: whenTrue() },
+          ]
+        : [
+            { con: { tag: "DataAlt", con: this.lookupCon("False", 0) }, binders: [], body: whenFalse() },
+            { con: { tag: "DataAlt", con: this.lookupCon("True", 0) }, binders: [], body: whenTrue() },
+          ],
+    };
   }
 
   application(head: Expr, args: Expr[], scope: Scope): CoreExpr {
@@ -218,7 +258,7 @@ class Desugarer {
   /** `case` and `\case` alternatives; guards inside an alternative fall
    * through to the next alternative when none succeeds. */
   alternatives(scrutinee: CoreExpr, alts: CaseAlternative[], scope: Scope, span: Span): CoreExpr {
-    const subject = mkBinder("scrut");
+    const subject = scrutinee.tag === "Var" ? scrutinee.binder : mkBinder("scrut");
     const rows = alts.map((alt) => ({
       patterns: [alt.pattern],
       guards: alt.guard ? [{ condition: alt.guard, body: alt.body }] : [{ body: alt.body }],
@@ -226,6 +266,10 @@ class Desugarer {
       hasPatternGuards: (alt.patternGuards?.length ?? 0) > 0,
     }));
     for (const row of rows) if (row.hasPatternGuards) this.fail("pattern guards", span);
+    // Naming an already-named scrutinee would add a `case` that enters it a
+    // second time; that is wrong for an unboxed scrutinee and pointless for
+    // any other.
+    if (scrutinee.tag === "Var") return this.match([subject], rows, scope, raise());
     return {
       tag: "Case",
       scrutinee,
@@ -290,13 +334,6 @@ class Desugarer {
           body: this.matchGroup(subjects, group, column, [], scope, fallback),
         };
       }
-      if (pattern.tag === "con" && (pattern.name === "True" || pattern.name === "False")) {
-        return {
-          con: { tag: "LitAlt", lit: int(pattern.name === "True" ? 1 : 0) },
-          binders: [],
-          body: this.matchGroup(subjects, group, column, [], scope, fallback),
-        };
-      }
       const con = this.lookupCon(patternConName(pattern), patternArity(pattern));
       const fields = Array.from({ length: con.arity }, (_, i) => mkBinder(`${con.name}_f${i}`));
       return {
@@ -306,11 +343,16 @@ class Desugarer {
       };
     });
 
+    const typeName = alts[0]?.con.tag === "DataAlt" ? alts[0].con.con.typeName : undefined;
+    // Rows whose pattern here is a variable were merged into every
+    // constructor group above, so once every constructor has an alternative
+    // the DEFAULT one is unreachable.
+    const exhaustive = typeName !== undefined && alts.length === this.conCount.get(typeName);
     return {
       tag: "Case",
       scrutinee: { tag: "Var", binder: subject },
       binder: mkBinder("c"),
-      alts: [{ con: { tag: "DEFAULT" }, binders: [], body: defaultBody() }, ...alts],
+      alts: exhaustive ? alts : [{ con: { tag: "DEFAULT" }, binders: [], body: defaultBody() }, ...alts],
     };
   }
 
@@ -354,15 +396,11 @@ class Desugarer {
       (rest, guard) =>
         guard.condition === undefined
           ? this.expr(guard.body, inner)
-          : {
-              tag: "Case",
-              scrutinee: this.expr(guard.condition, inner),
-              binder: mkBinder("g"),
-              alts: [
-                { con: { tag: "LitAlt", lit: int(0) }, binders: [], body: rest },
-                { con: { tag: "DEFAULT" }, binders: [], body: this.expr(guard.body, inner) },
-              ],
-            },
+          : this.boolCase(
+              this.expr(guard.condition, inner),
+              () => this.expr(guard.body, inner),
+              () => rest,
+            ),
       next(),
     );
     return wrap(chain);
@@ -411,6 +449,7 @@ interface MatchRow {
 
 const varOf = (binder: Binder): CoreExpr => ({ tag: "Var", binder });
 
+
 /** Pattern-match failure. `RaiseDivZeroOp` is the only nullary raising primop
  * the JS backend implements; a real `PatternMatchFail` needs an exception
  * closure, which needs `Control.Exception`, which needs classes. */
@@ -458,6 +497,7 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
       decl.constructors.forEach((con, i) => {
         d.cons.set(con.name, mkDataCon(con.name, i + 1, con.arity, decl.name));
       });
+      d.conCount.set(decl.name, decl.constructors.length);
     } else if (decl.tag === "class") {
       for (const member of decl.members) if ("name" in member) d.classMethods.add(member.name);
       d.diagnostics.push(

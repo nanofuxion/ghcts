@@ -1079,12 +1079,27 @@ class Parser {
       this.current().kind !== "eof"
     )
       header.push(this.take());
-    const uppercase = header.filter(
+    // The superclass context is part of the class's meaning - it decides the
+    // dictionary's first fields - so it is kept rather than skipped.
+    const arrow = header.findIndex((token) => token.text === "=>");
+    const context =
+      arrow < 0
+        ? []
+        : header
+            .slice(0, arrow)
+            .map((token) => token.text)
+            .join(" ")
+            .replace(/^\s*\(|\)\s*$/g, "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+    const rest = arrow < 0 ? header : header.slice(arrow + 1);
+    const uppercase = rest.filter(
       (token) => token.kind === "ident" && /^[A-Z]/.test(token.text),
     );
     const name = uppercase.at(-1)?.text ?? "<anonymous class>";
-    const classIndex = header.findIndex((token) => token.text === name);
-    const parameters = header
+    const classIndex = rest.findIndex((token) => token.text === name);
+    const parameters = rest
       .slice(classIndex + 1)
       .filter((token) => token.kind === "ident" && /^[a-z]/.test(token.text))
       .map((token) => token.text);
@@ -1092,6 +1107,7 @@ class Parser {
     return {
       tag: "class",
       name,
+      context,
       parameters: [...new Set(parameters)],
       members: body.members,
       rawMembers: body.rawMembers,

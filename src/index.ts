@@ -4,6 +4,8 @@ export { serveProject } from './server.js';
 export { checkModule } from './typecheck.js';
 export { classMembers, collectDictionaries, instanceHead, instanceMembers, instanceMethodValues, selectInstance } from './dictionary.js';
 export { lowerExpr, lowerModule, lowerModules } from './core-legacy.js';
+export { elaborateModule } from './elaborate.js';
+export { PRELUDE_SOURCE } from './prelude.js';
 export { desugarModule } from './desugar.js';
 export { coreToStg } from './core-to-stg.js';
 export { global, jblock, jcall, jfunction, jglobal, jif, jindex, jinfix, jnumber, jraw, jrawStat, jselect, jstring, junary, jvar, optimizeExpr, optimizeStat, printExpr, printStat } from './js-ast.js';

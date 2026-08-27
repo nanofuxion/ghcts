@@ -293,7 +293,9 @@ test('invokes host requestAnimationFrame callbacks with a JS timestamp', () => {
 });
 
 test('lowers surface expressions through the explicit Core boundary', () => {
-  const parsed = parseModule('module Main where\nmain = let value = 40 in value + 2\n', 'CoreBoundary.hs');
+  // `+` is a class method now (see src/elaborate.ts); the desugarer on its own
+  // lowers the primitive it is ultimately implemented by.
+  const parsed = parseModule('module Main where\nmain = let value = 40 in primIntAdd value 2\n', 'CoreBoundary.hs');
   const { program, diagnostics } = desugarModule(parsed.module.ast, 'CoreBoundary.hs');
   assert.deepEqual(diagnostics, []);
   const [main] = program.binds;

@@ -99,12 +99,14 @@ class Converter {
         return { tag: "StgLit", lit: e.lit };
       case "Con": {
         const floats: Float[] = [];
-        const args = e.args.map((arg) => this.atom(arg, floats));
+        const args = e.args.map((arg) => this.atom(arg, floats, false));
         return wrap(floats, { tag: "StgConApp", con: e.con, args });
       }
       case "Op": {
         const floats: Float[] = [];
-        const args = e.args.map((arg) => this.atom(arg, floats));
+        // A primop consumes machine values, so its arguments are evaluated
+        // here rather than thunked.
+        const args = e.args.map((arg) => this.atom(arg, floats, true));
         return wrap(floats, { tag: "StgOpApp", op: e.op, args });
       }
       case "Lam": {
@@ -138,20 +140,20 @@ class Converter {
           tag: "StgCase",
           scrutinee: this.expr(e.scrutinee),
           binder: e.binder,
-          altType: altTypeOf(e.alts),
+          altType: altTypeOf(e.alts, e.scrutinee),
           alts,
         };
       }
       case "App": {
         const [head, args] = flatten(e);
         const floats: Float[] = [];
-        const atoms = args.map((arg) => this.atom(arg, floats));
+        const atoms = args.map((arg) => this.atom(arg, floats, false));
         if (head.tag === "Var") {
           return wrap(floats, { tag: "StgApp", fn: head.binder, args: atoms });
         }
         // The head is itself a computation; name it, then apply the name.
         const headFloats: Float[] = [];
-        const headAtom = this.atom(head, headFloats);
+        const headAtom = this.atom(head, headFloats, true);
         if (headAtom.tag !== "StgVarArg") throw new Error("coreToStg: literal in function position");
         return wrap([...headFloats, ...floats], { tag: "StgApp", fn: headAtom.id, args: atoms });
       }
@@ -170,27 +172,51 @@ class Converter {
 
   /** Make one subexpression atomic, recording how to re-attach it.
    *
-   * Every argument is floated with `case`, not `let` - this language is
-   * call-by-value. That is forced by the desugarer's representation choice
-   * rather than chosen for speed: with no `Num` dictionary an `Int` IS an
-   * `Int#`, so a primop, a constructor field and a function parameter all
-   * hold a raw JS number. A thunk in any of those positions would be compared
-   * or added as a closure object, silently. Laziness comes back with boxing,
-   * which comes back with dictionaries. */
-  atom(e: CoreExpr, floats: Float[]): StgArg {
+   * `case` or `let` is a representation question, and dictionaries changed the
+   * answer. It used to be `case` unconditionally: with no `Num` dictionary an
+   * `Int` WAS an `Int#`, so a thunk in a constructor field or a function
+   * argument would have been added or compared as a closure object, silently.
+   * Now `Int` is the boxed `I Int#`, so those positions hold pointers and a
+   * thunk belongs there - that is where laziness lives, and a self-referential
+   * dictionary such as `$fEqInt = MkDict_Eq ... ($dmEq$/= $fEqInt)` only
+   * terminates because the field is one.
+   *
+   * What must still be evaluated here:
+   *
+   *   - `strict` positions, which is a primop's arguments and a call's head.
+   *     A primop consumes a machine value; entering a thunk there is not a
+   *     representation the backend has.
+   *   - a primop result or a literal, which IS a machine value, and cannot be
+   *     the payload of a thunk.
+   *   - a CAF reference, which is a pointer to an unentered thunk.
+   *
+   * The thunks this pass now builds are Updatable rather than SingleEntry: the
+   * argument they stand for can be duplicated by the callee, so the update is
+   * not provably wasted, and a missing update frame fails silently. */
+  atom(e: CoreExpr, floats: Float[], strict: boolean): StgArg {
     if (e.tag === "Lit") return litArg(e.lit);
-    // A CAF reference is a pointer to an unentered thunk, so even a bare
-    // variable needs forcing when it names one.
     if (e.tag === "Var" && !this.topLevelThunks.has(e.binder)) return varArg(e.binder);
     const binder = mkBinder("t");
     const value = this.expr(e);
-    floats.push((body) => ({
-      tag: "StgCase",
-      scrutinee: value,
-      binder,
-      altType: altTypeOfExpr(e),
-      alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
-    }));
+    const evaluate = strict || e.tag === "Op" || e.tag === "Var";
+    floats.push(
+      evaluate
+        ? (body) => ({
+            tag: "StgCase",
+            scrutinee: value,
+            binder,
+            altType: altTypeOfExpr(e),
+            alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
+          })
+        : (body) => ({
+            tag: "StgLet",
+            // `rhs` rather than `mkClosure`: a constructor application with
+            // atomic arguments is allocated directly, exactly as it would be
+            // in a source-level `let`, instead of behind a thunk.
+            binding: { tag: "StgNonRec", binder, rhs: this.rhs(e) },
+            body,
+          }),
+    );
     return varArg(binder);
   }
 }
@@ -210,12 +236,14 @@ function flatten(e: CoreExpr): [CoreExpr, CoreExpr[]] {
 
 /** What codegen dispatches on. A DataAlt anywhere means a tag test; a LitAlt
  * means a primitive comparison; only DEFAULT means nothing to test. */
-function altTypeOf(alts: readonly CoreAlt[]): AltType {
+function altTypeOf(alts: readonly CoreAlt[], scrutinee: CoreExpr): AltType {
   for (const alt of alts) {
     if (alt.con.tag === "DataAlt") return { tag: "AlgAlt", typeName: alt.con.con.typeName };
     if (alt.con.tag === "LitAlt") return { tag: "PrimAlt" };
   }
-  return { tag: "PolyAlt" };
+  // All-DEFAULT: the scrutinee is the only evidence left of whether the bound
+  // value is a machine value or a pointer.
+  return altTypeOfExpr(scrutinee);
 }
 
 /** The alt type for a case this pass invented around a floated argument.

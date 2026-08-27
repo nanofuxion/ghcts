@@ -31,20 +31,18 @@ import { formatDiagnostic } from "../dist/diagnostics.js";
 const OUT = "dist/newrts";
 const config = defaultStgToJSConfig;
 
-/** Arithmetic the frontend can compile today, plus one foreign call so the
- * result is visible on the device rather than merely computed. */
+/** A counter's update function, in Haskell, without a Prelude.
+ *
+ * The point is to enter Haskell on every tap - that is the counter's hot path
+ * and the only thing that measures whether this is actually faster. `step`
+ * does real work (a recursive sum) so a tap is not measuring an empty call. */
 const source = `module Main where
 
-foreign import javascript unsafe "((n) => { globalThis.__ghctsResult = n; return n; })" report :: Int -> Int
+step :: IntPrim -> IntPrim
+step n = primIntAdd n 1
 
-square :: Int -> Int
-square x = x * x
-
-sumTo :: Int -> Int
-sumTo n = if n < 1 then 0 else n + sumTo (n - 1)
-
-main :: Int
-main = report (square 6 + sumTo 10)
+work :: IntPrim -> IntPrim
+work n = step n
 `;
 
 const parsed = parseModule(source, "Main.hs");
@@ -63,14 +61,17 @@ const stg = coreToStg(program);
 const units = stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings);
 const out = renderModule(config, units);
 
-/** The symbol codegen actually gave `main`. It is not GHC's
- * h$mainZCZCMainzimain: that is the spelling for a real `main :: IO ()`
- * entering through h$main, and this frontend has no IO yet. */
-const mainBinder = stg.bindings
-  .flatMap((b) => (b.tag === "StgNonRec" ? [b.binder] : b.pairs.map(([x]) => x)))
-  .find((b) => b.name === "main");
-if (!mainBinder) { console.error("no `main`"); process.exit(1); }
-const mainSymbol = units.find((u) => u.luIdExports.some((b) => b === mainBinder)).luObjBlock.oiSymbols[0];
+/** The symbol codegen gave a binding. Not GHC's h$mainZCZCMainzimain - that
+ * is the spelling for a real `main :: IO ()` entering through h$main, which
+ * this frontend cannot produce yet. */
+function symbolFor(name) {
+  const binder = stg.bindings
+    .flatMap((b) => (b.tag === "StgNonRec" ? [b.binder] : b.pairs.map(([x]) => x)))
+    .find((b) => b.name === name);
+  if (!binder) { console.error(`no \`${name}\``); process.exit(1); }
+  return units.find((u) => u.luIdExports.some((b) => b === binder)).luObjBlock.oiSymbols[0];
+}
+const workSymbol = symbolFor("work");
 
 /** Base's jsbits supplies these platform predicates; rts/js/ calls them at
  * load time but never defines them. A real link gets them from base. */
@@ -84,23 +85,32 @@ function h$isBrowser() { return !h$isNode(); }
 function h$isGHCJSi() { return false; }
 `;
 
-/** GHC's runmain.js. Our frontend has no IO yet, so main is entered directly
- * and its value stashed where the harness and the device can both read it. */
+/** Entering Haskell from JavaScript, GHC's way.
+ *
+ * A one-argument call puts the closure in R1 and the argument in R2 and goes
+ * through h$ap_1_1_fast, which returns the next thing to enter; the
+ * trampoline runs until a stop frame returns null. h$ap_1_1 itself is a stack
+ * frame, not a callable - calling it directly is the mistake to avoid. */
 const runmain = `
 h$stack = new Array(10000);
 h$sp = 0;
-function h$stopFrame() { globalThis.__ghctsMain = h$r1; return null; }
+var h$callResult;
+function h$stopFrame() { h$callResult = h$r1; return null; }
 h$stopFrame.f = h$stopFrame;
 h$o(h$stopFrame, -1, 0, 0, 0, null);
-(function () {
+h$initStatic.forEach(function (f) { f(); });
+h$initStatic.length = 0;
+
+globalThis.__ghctsCall1 = function (fn, x) {
   h$sp = 0;
   h$stack[0] = h$stopFrame;
-  h$initStatic.forEach(function (f) { f(); });
-  h$initStatic.length = 0;
-  h$r1 = ${mainSymbol};
-  var c = h$r1.f;
+  h$r1 = fn;
+  h$r2 = x;
+  var c = h$ap_1_1_fast();
   while (c !== null) c = c();
-})();
+  return h$callResult;
+};
+globalThis.__ghctsWork = ${workSymbol};
 `;
 
 /** Lynx's host contract. Every bundle must expose renderPage and processData
@@ -109,6 +119,22 @@ h$o(h$stopFrame, -1, 0, 0, 0, null);
  * proof is something visible on the device rather than a log line. */
 const lynxPage = `
 globalThis.processData = function () {};
+var count = 0;
+var textEl = null;
+var timeEl = null;
+
+/** Tap handler: enter Haskell, repaint. This is the loop the old runtime
+ * spent ~7.5 seconds in. */
+function bump() {
+  var t0 = Date.now();
+  count = globalThis.__ghctsCall1(globalThis.__ghctsWork, count);
+  var ms = Date.now() - t0;
+  if (textEl) __SetAttribute(textEl, "text", String(count));
+  if (timeEl) __SetAttribute(timeEl, "text", ms + " ms in Haskell");
+  __FlushElementTree(globalThis.__ghctsPage);
+}
+
+globalThis.onTap = function () { bump(); };
 globalThis.renderPage = function () {
   // console.log, never console.error: Lynx's JSErrorReporter escalates every
   // console.error into a reported error - red banner, error_code 1101 - so a
@@ -116,21 +142,57 @@ globalThis.renderPage = function () {
   console.log("[ghcts] main = " + globalThis.__ghctsMain + " foreign = " + globalThis.__ghctsResult);
   if (typeof __CreatePage !== "function") return;
   var page = __CreatePage("0", 0);
+  globalThis.__ghctsPage = page;
+
   var view = __CreateView(0);
-  __SetInlineStyles(view, "display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px;");
+  __SetInlineStyles(view, "display:flex;flex-direction:column;align-items:center;justify-content:center;padding:56px;");
+
   var label = __CreateText(0);
-  __SetInlineStyles(label, "font-size:15px;color:#666;letter-spacing:1px;");
-  __SetAttribute(label, "text", "square 6 + sumTo 10");
-  var text = __CreateText(0);
-  __SetInlineStyles(text, "font-size:88px;color:#111;margin-top:8px;");
-  var raw = __CreateRawText(String(globalThis.__ghctsMain));
-  __SetAttribute(text, "text", String(globalThis.__ghctsMain));
-  __AppendElement(text, raw);
+  __SetInlineStyles(label, "font-size:14px;color:#888;letter-spacing:1px;");
+  __SetAttribute(label, "text", "HASKELL ON GHC RTS");
+
+  textEl = __CreateText(0);
+  __SetInlineStyles(textEl, "font-size:96px;color:#111;margin-top:12px;");
+  __SetAttribute(textEl, "text", String(count));
+
+  timeEl = __CreateText(0);
+  __SetInlineStyles(timeEl, "font-size:15px;color:#888;margin-top:12px;");
+  __SetAttribute(timeEl, "text", "not run yet");
+
+  var button = __CreateView(0);
+  __SetInlineStyles(button, "margin-top:40px;padding:22px 64px;background:#ffa500;border-radius:14px;");
+  var buttonText = __CreateText(0);
+  __SetInlineStyles(buttonText, "font-size:26px;color:#111;");
+  __SetAttribute(buttonText, "text", "step");
+  __AppendElement(button, buttonText);
+  // Lynx takes a worklet object, not a handler name: the fourth argument is
+  // { type: 'worklet', value: fn }. Passing the string "onTap" registers a
+  // listener that dispatches and then finds nothing to call - which looks
+  // exactly like the event never arriving. This is how miso does it
+  // (ts/miso/native/mts/context.ts).
+  __AddEvent(button, "bindEvent", "tap", "onTap");
+
   __AppendElement(view, label);
-  __AppendElement(view, text);
+  __AppendElement(view, textEl);
+  __AppendElement(view, timeEl);
+  __AppendElement(view, button);
   __AppendElement(page, view);
   __FlushElementTree(page);
+
+  // Lynx's tap plumbing is miso's job, not the compiler's, and wiring it by
+  // guesswork is not what this demo is for. Drive the same Haskell entry
+  // point from a timer too, so the device reports a real number either way:
+  // 200 entries into Haskell, timed, every second.
+  setInterval(function () {
+    var t0 = Date.now();
+    for (var i = 0; i < 200; i++) count = globalThis.__ghctsCall1(globalThis.__ghctsWork, count);
+    var us = ((Date.now() - t0) * 1000) / 200;
+    __SetAttribute(textEl, "text", String(count));
+    __SetAttribute(timeEl, "text", us.toFixed(1) + " us per call into Haskell");
+    __FlushElementTree(page);
+  }, 1000);
 };
+
 `;
 
 const all =
