@@ -61,8 +61,43 @@ if (args.includes("--check")) process.exit(missing.length ? 1 : 0);
 // thing left or merely the first thing.
 const stubs = args.includes("--stub-missing")
   ? missing.map((n) => `function ${n}(){ throw new Error("STUB ${n}"); }\n`).join("")
-  : "";
-if (stubs) console.log(`stubbing ${missing.length} unported symbols`);
+  : args.includes("--fill-missing")
+    ? fillFromOracle(missing)
+    : "";
+if (args.includes("--stub-missing")) console.log(`stubbing ${missing.length} unported symbols`);
+
+/** Take the oracle's own definition of each unported symbol.
+ *
+ * A DIAGNOSTIC, never a deliverable: it isolates "is what we ported correct?"
+ * from "have we ported everything?". If the counter works this way, then the
+ * 553 symbols we generate are driving real Haskell correctly and only the
+ * remaining port stands between us and a working bundle. If it still fails,
+ * something we already emit is wrong and finishing the port would not have
+ * fixed it. */
+function fillFromOracle(names) {
+  const oracle = part("rts.js");
+  const wanted = new Set(names);
+  const taken = [];
+  // Definitions are top-level and brace-balanced; an h$o(...) info-table
+  // registration follows a closure's entry function and belongs with it.
+  const re = /^(?:function|var)\s+(h\$[A-Za-z0-9_$]+)/gm;
+  for (let m = re.exec(oracle); m; m = re.exec(oracle)) {
+    if (!wanted.has(m[1])) continue;
+    let depth = 0;
+    let i = m.index;
+    for (; i < oracle.length; i++) {
+      if (oracle[i] === "{") depth++;
+      else if (oracle[i] === "}" && --depth === 0) break;
+      else if (depth === 0 && oracle[i] === ";") break;
+    }
+    let end = oracle.indexOf("\n", i) + 1;
+    const info = oracle.slice(end).match(/^h\$o\([^\n]*\n/);
+    if (info) end += info[0].length;
+    taken.push(oracle.slice(m.index, end));
+  }
+  console.log(`filling ${taken.length}/${names.length} unported symbols from the oracle (diagnostic)`);
+  return taken.join("");
+}
 
 mkdirSync(OUT, { recursive: true });
 const all = rts + stubs + lib + out + runmain;

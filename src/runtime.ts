@@ -1,47 +1,63 @@
-/** Generic call-by-need runtime used by all generated Haskell programs. */
-export interface Thunk<T = unknown> {
-  readonly __ghctsThunk: true;
-  force(): T;
+/** Generic call-by-need runtime used by all generated Haskell programs.
+ *
+ * A thunk is a class rather than an object literal so every one of them
+ * shares a single hidden class. `lazy` is the single hottest allocation in
+ * generated code - the counter's own module has ~22k call sites - and an
+ * object literal carrying a closure per instance costs three allocations
+ * (environment, object, method) and gives the engine a fresh shape to
+ * profile at each site. GHC's JS backend allocates one flat `{d1,d2,f,m}`
+ * for the same job. */
+export class Thunk<T = unknown> {
+  readonly __ghctsThunk = true as const;
+  /** 0 pending, 1 running, 2 done. A number keeps the shape monomorphic. */
+  private state = 0;
+  private result: T | undefined = undefined;
+  constructor(private compute: (() => T) | undefined) {}
+
+  force(): T {
+    if (this.state === 2) return this.result as T;
+    if (this.state === 1)
+      throw new Error("<<loop>>: recursive thunk forced while evaluating");
+    this.state = 1;
+    try {
+      const value = (this.compute as () => T)();
+      this.result = value;
+      this.state = 2;
+      // Drop the closure once it can never run again: a forced thunk keeps
+      // its whole captured environment alive otherwise, and most of them are
+      // forced exactly once.
+      this.compute = undefined;
+      return value;
+    } catch (cause) {
+      this.state = 0;
+      throw cause;
+    }
+  }
 }
 export type Value<T = unknown> = T | Thunk<T>;
 export function lazy<T>(compute: () => T): Thunk<T> {
-  let state: "pending" | "running" | "done" = "pending";
-  let result!: T;
-  return {
-    __ghctsThunk: true,
-    force() {
-      if (state === "done") return result;
-      if (state === "running")
-        throw new Error("<<loop>>: recursive thunk forced while evaluating");
-      state = "running";
-      try {
-        result = compute();
-        state = "done";
-        return result;
-      } catch (cause) {
-        state = "pending";
-        throw cause;
-      }
-    },
-  };
+  return new Thunk(compute);
 }
 /** Zero-arity IO actions must re-run on every force.  `lazy` would cache the
  * first `{}` from `create_ffi` and make every vnode the same object. */
+export class IOThunk<T = unknown> extends Thunk<T> {
+  private running = false;
+  constructor(private run: () => T) {
+    super(undefined);
+  }
+  override force(): T {
+    if (this.running)
+      throw new Error("<<loop>>: recursive IO thunk forced while evaluating");
+    this.running = true;
+    try {
+      return this.run();
+    } finally {
+      this.running = false;
+    }
+  }
+}
 export function io<T>(compute: () => T): Thunk<T> {
-  let running = false;
-  return {
-    __ghctsThunk: true,
-    force() {
-      if (running)
-        throw new Error("<<loop>>: recursive IO thunk forced while evaluating");
-      running = true;
-      try {
-        return compute();
-      } finally {
-        running = false;
-      }
-    },
-  };
+  return new IOThunk(compute);
 }
 
 // Host adapters may initialize `globalThis.runtime` after the generated
@@ -72,9 +88,16 @@ const installRuntimeHost = (): void => {
 };
 installRuntimeHost();
 function isThunk(value: unknown): value is Thunk {
+  // Fast path: one monomorphic check, and unlike a property read it cannot
+  // throw on a hostile host object. Lynx's PrimJS objects do throw on some
+  // property accesses, which is what the guarded path below is for.
+  if (value instanceof Thunk) return true;
   if (value == null) return false;
   const kind = typeof value;
   if (kind !== "object" && kind !== "function") return false;
+  // A thunk built by another copy of this runtime - Lynx evaluates the same
+  // linked program in two JS contexts - is not `instanceof` ours, so the
+  // brand still has to be honoured.
   try {
     const thunk = value as Thunk;
     return thunk.__ghctsThunk === true && typeof thunk.force === "function";
@@ -1450,6 +1473,33 @@ function ghcjsNewBody(javascript: string): string | null {
     return `return ${expr[2].replace(/\$(\d+)/g, (_, index: string) => `a${index}`)};`;
   return null;
 }
+/** Compiled bodies of `foreign import javascript` declarations.
+ *
+ * A foreign import's JS text is fixed at compile time, so the function it
+ * denotes can be built once. Building it per call - which is what this used
+ * to do - means a full JS parse and compile on every single FFI crossing,
+ * and Miso's event path crosses the boundary constantly. Keyed by body and
+ * arity because the body already has the argument names substituted in. */
+const foreignBodies = new Map<string, Function>();
+function compileForeignBody(body: string, parameterNames: string[]): Function {
+  const key = `${parameterNames.length} ${body}`;
+  let compiled = foreignBodies.get(key);
+  if (!compiled) {
+    compiled = Function(
+      ...parameterNames,
+      "force",
+      "lazy",
+      "apply",
+      "listToArray",
+      "listFromArray",
+      "jsString",
+      "rws",
+      body,
+    );
+    foreignBodies.set(key, compiled);
+  }
+  return compiled;
+}
 export function foreignFunction(javascript: string, arity: number): unknown {
   const invoke = (args: Thunk[]): unknown => {
     const expression = javascript.replace(
@@ -1593,17 +1643,16 @@ export function foreignFunction(javascript: string, arity: number): unknown {
           : `return (${expression.replace(/\r/g, "\\r").replace(/\n/g, "\\n")});`;
     let result: unknown;
     try {
-      result = Function(
-        ...parameterNames,
-        "force",
-        "lazy",
-        "apply",
-        "listToArray",
-        "listFromArray",
-        "jsString",
-        "rws",
-        functionBody,
-      )(...values, force, lazy, apply, listToArray, listFromArray, jsString, rws);
+      result = compileForeignBody(functionBody, parameterNames)(
+        ...values,
+        force,
+        lazy,
+        apply,
+        listToArray,
+        listFromArray,
+        jsString,
+        rws,
+      );
     } catch (cause) {
       console.error("[ghcts foreign]", javascript, cause);
       throw cause;

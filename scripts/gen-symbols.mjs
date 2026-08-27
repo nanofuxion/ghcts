@@ -8,13 +8,20 @@ const strs = new Map(), skipped = [];
 for (const m of src.matchAll(/^(hd[A-Za-z0-9_']*)\s*=\s*(.+)$/gm)) {
   const [, n, rhs] = m;
   if (strs.has(n)) continue;
-  const lit = rhs.trim().match(/^(?:fsLit\s+|name\s+|mkFastString\s+)?"((?:[^"\\]|\\.)*)"$/);
+  // `name $ fsLit "h$foo"` (an Ident) carries exactly the same symbol text as
+  // a bare `fsLit "h$foo"`, so accept any chain of wrapper applications.
+  const lit = rhs.trim().match(/^(?:(?:fsLit|name|mkFastString)\s*\$?\s*)*"((?:[^"\\]|\\.)*)"$/);
   if (lit) strs.set(n, { text: JSON.parse(`"${lit[1]}"`) });
   else if (!/^global\b/.test(rhs.trim())) skipped.push(`${n} = ${rhs.trim()}`);
 }
 const globals = new Map();
 for (const m of src.matchAll(/^(hd[A-Za-z0-9_']*)\s*::\s*JStgExpr\s*\n\1\s*=\s*global\s*(?:\(\s*identFS\s+)?([A-Za-z0-9_']+)\s*\)?/gm))
   globals.set(m[1], m[2]);
+// Some JStgExpr symbols inline their name (`hdDoneMain = global "h$doneMain"`)
+// instead of going through a *Str binding; they have no FastString to alias.
+const literalGlobals = new Map();
+for (const m of src.matchAll(/^(hd[A-Za-z0-9_']*)\s*::\s*JStgExpr\s*\n\1\s*=\s*global\s+"((?:[^"\\]|\\.)*)"/gm))
+  literalGlobals.set(m[1], JSON.parse(`"${m[2]}"`));
 let out = `/** Ported from GHC/StgToJS/Symbols.hs - the RTS symbol vocabulary.
  *
  * Generated from the Haskell source, so every name and spelling is GHC's own.
@@ -31,6 +38,8 @@ for (const [n, v] of [...strs].sort((a, b) => a[0].localeCompare(b[0])))
 out += `\n`;
 for (const [n, s] of [...globals].sort((a, b) => a[0].localeCompare(b[0])))
   if (strs.has(s)) out += `export const ${n}: JStgExpr = global(${s});\n`;
+for (const [n, s] of [...literalGlobals].sort((a, b) => a[0].localeCompare(b[0])))
+  out += `export const ${n}: JStgExpr = global(${JSON.stringify(s)});\n`;
 if (skipped.length)
   out += `\n// Computed in GHC rather than a literal; ported where used:\n` +
     skipped.map((s) => `//   ${s}`).join('\n') + '\n';
