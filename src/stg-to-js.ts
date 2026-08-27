@@ -18,3 +18,14 @@ export * as Closure from "./stg-js/closure.js";
 export * as RtsTypes from "./stg-js/rts-types.js";
 export * as Apply from "./stg-js/apply.js";
 export * as Rts from "./stg-js/rts.js";
+
+// The code generator: STG in, JS calling the runtime above out. GHC reaches
+// STG via Core, CorePrep and CoreToStg; ghcts is building that road from this
+// end, so these consume `src/stg.ts` before anything produces it.
+export * as Monad from "./stg-js/monad.js";
+export * as Ids from "./stg-js/ids.js";
+export * as ExprCtx from "./stg-js/expr-ctx.js";
+export * as Utils from "./stg-js/utils.js";
+export * as Literal from "./stg-js/literal.js";
+export * as DataCon from "./stg-js/datacon.js";
+export * as Arg from "./stg-js/arg.js";
