@@ -1588,6 +1588,11 @@ import Data.JSString (JSString, unpack)
 -- handler and kill the thread, which is what \\\`Prelude.error\\\` still does.
 data SomeException = SomeException JSValPrim
 
+-- GHC's IOException and IOError are one type; with a single exception shape
+-- here they are that shape, the same reading JSException already gets below.
+type IOException = SomeException
+type IOError = SomeException
+
 foreign import javascript unsafe "((s) => new Error(s))" jsError :: JSStringPrim -> JSValPrim
 foreign import javascript unsafe "((e) => String(e && e.message !== undefined ? e.message : e))" jsShowException :: JSValPrim -> JSStringPrim
 

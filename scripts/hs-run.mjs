@@ -2996,6 +2996,75 @@ const programs = [
     ].join("\n"),
     expect: 4,
   },
+  {
+    // `Enum` was in the stock-derivable list but nothing built the instance.
+    // The bounds matter as much as the mapping: the class's own `enumFrom`
+    // walks to `maxBound :: Int`, so `[Red ..]` on a three-constructor type
+    // ran until `toEnum` errored.
+    name: "deriving Enum, bounded by the last constructor",
+    source: [
+      "module Main where",
+      "data Colour = Red | Green | Blue deriving (Show, Eq, Enum)",
+      "main :: IO Int",
+      "main = pure (fromEnum Blue * 100 + fromEnum (toEnum 1 :: Colour) * 10 + length [Red ..])",
+      "",
+    ].join("\n"),
+    expect: 213,
+  },
+  {
+    // An instance method is re-lexed from tokens whose layout punctuation has
+    // already been printed as ordinary `{`/`;`/`}`. The scan that decides
+    // whether a do-statement is a bind only recognised the *virtual* spelling,
+    // so it ran past this statement's end and found the next statement's `<-`.
+    // The method then failed to parse and was dropped in silence, and the
+    // instance took the class default instead - which is how miso's
+    // `instance FromJSVal Closed` came to want a `Generic` instance.
+    name: "a non-bind do-statement inside an instance method",
+    source: [
+      "module Main where",
+      "",
+      "class Grab a where",
+      "  grab :: Maybe Int -> Maybe a",
+      "  grab m = Nothing",
+      "",
+      "newtype Boxed = Boxed Int",
+      "",
+      "unBox :: Maybe Boxed -> Int",
+      "unBox Nothing = 0",
+      "unBox (Just (Boxed n)) = n",
+      "",
+      "instance Grab Boxed where",
+      "  grab o = do",
+      "    n <- do pure =<< o",
+      "    m <- Just 10",
+      "    pure (Boxed (n + m))",
+      "",
+      "main :: IO Int",
+      "main = pure (unBox (grab (Just 30)))",
+      "",
+    ].join("\n"),
+    // 0 if the method were dropped and the class default used.
+    expect: 40,
+  },
+  {
+    // GHC's `IOException` is this frontend's one exception shape, so miso's
+    // `instance ToMisoString IOException` has a `Show` to reach.
+    name: "IOException is the exception shape there is",
+    source: [
+      "module Main where",
+      "import Control.Exception (IOException)",
+      "import GHC.JS.Prim (jsNull, mkJSException)",
+      "",
+      "shown :: IOException -> Int",
+      "shown e = length (show e)",
+      "",
+      "main :: IO Int",
+      "main = mkJSException jsNull >>= (\\e -> pure (shown e))",
+      "",
+    ].join("\n"),
+    // `null`
+    expect: 4,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

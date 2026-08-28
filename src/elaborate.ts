@@ -65,7 +65,7 @@ import type {
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { classMethodNames, renameDeclarations, renameValue, resolveProgram, type Scopes } from "./modules.js";
 import { error } from "./diagnostics.js";
-import { constructorTable, derivedEqMethod, derivedGenericSource, derivedShowSource, expandSugar, fieldSelectors } from "./sugar.js";
+import { constructorTable, derivedEqMethod, derivedGenericSource, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
 import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
@@ -1653,12 +1653,13 @@ export function elaborateProgram(
   // a hand-written `Generic` instance for the same type is seen first, and
   // wins the overlap comparison by being identical.
   const derivedDatas = declarations.filter((d): d is DataDeclaration => d.tag === "data");
-  // `deriving Show` is generated as Haskell too, and needs no scope at all:
-  // it names the flat constructors it was built from and the Prelude's own
-  // `showsPrec`/`showString`/`showParen`, which are never renamed.
-  const showSource = derivedShowSource(derivedDatas);
+  // `deriving Show` and `deriving Enum` are generated as Haskell too, and need
+  // no scope at all: they name the flat constructors they were built from and
+  // the Prelude's own `showsPrec`/`showString`/`showParen`/`error`, which are
+  // never renamed.
+  const showSource = derivedStockSource(derivedDatas);
   if (showSource) {
-    const parsed = parseModule(showSource, "GHCTS/DerivedShow.hs");
+    const parsed = parseModule(showSource, "GHCTS/DerivedStock.hs");
     if (parsed.module && !parsed.diagnostics.some((d) => d.severity === "error"))
       declarations.push(...parsed.module.ast.declarations);
     else elaborator.diagnostics.push(...parsed.diagnostics);

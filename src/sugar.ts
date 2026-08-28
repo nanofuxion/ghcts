@@ -492,9 +492,28 @@ export function derivedEqMethod(decl: DataDeclaration): ValueDeclaration {
  * A constructor written infix is skipped rather than printed prefix: GHC uses
  * its declared fixity, this pass does not track one, and a plausible guess
  * would print a value that does not read back. */
-export function derivedShowSource(datas: readonly DataDeclaration[]): string {
-  const out: string[] = ["module GHCTS.DerivedShow where"];
+export function derivedStockSource(datas: readonly DataDeclaration[]): string {
+  const out: string[] = ["module GHCTS.DerivedStock where"];
   let derived = 0;
+  // `deriving Enum`, which GHC allows only where every constructor is nullary:
+  // the instance is the declaration order, both ways. `toEnum` ends in the
+  // catch-all GHC's derived one has, since nothing rules the argument in range.
+  for (const decl of datas) {
+    if (!decl.deriving.includes("Enum")) continue;
+    if (decl.constructors.length === 0 || decl.constructors.some((c) => c.arity > 0)) continue;
+    derived++;
+    out.push(`instance Enum ${decl.name} where`);
+    decl.constructors.forEach((con, i) => out.push(`  fromEnum ${con.name} = ${i}`));
+    decl.constructors.forEach((con, i) => out.push(`  toEnum ${i} = ${con.name}`));
+    out.push(`  toEnum enumN = error ${JSON.stringify(`toEnum: bad argument for ${decl.surfaceName ?? decl.name}`)}`);
+    // The class defaults walk to `maxBound :: Int`, which is right for `Int`
+    // and a non-terminating `toEnum` error for a four-constructor enumeration.
+    // GHC's derived instance bounds both at the last (or first) constructor.
+    const first = decl.constructors[0]!.name;
+    const last = decl.constructors[decl.constructors.length - 1]!.name;
+    out.push(`  enumFrom enumX = enumFromTo enumX ${last}`);
+    out.push(`  enumFromThen enumX enumY = enumFromThenTo enumX enumY (if fromEnum enumY >= fromEnum enumX then ${last} else ${first})`);
+  }
   for (const decl of datas) {
     if (!decl.deriving.includes("Show")) continue;
     if (decl.constructors.some((c) => c.arity > 0 && /^[:(]/.test(c.surface?.name ?? c.name))) continue;

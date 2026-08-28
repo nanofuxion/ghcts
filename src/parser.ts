@@ -102,15 +102,6 @@ export function parseModule(
     diagnostics: result.diagnostics,
   };
 }
-/** A token as it should appear in the *source text* of a type kept for
- * `src/elaborate.ts` to re-lex. Everything is already its own spelling except
- * a string literal, whose `text` the lexer has decoded: `Path "users"` would
- * otherwise be handed on as `Path users`, and the lower-case `users` read back
- * as a type variable rather than the symbol it is. */
-function typeTokenText(token: Token): string {
-  return token.kind === "string" ? JSON.stringify(token.text) : token.text;
-}
-
 function applyNamed(name: string, args: Expr[], span: Span): Expr {
   return args.reduce<Expr>(
     (fn, arg) => ({ tag: "app", fn, arg, span }),
@@ -1605,7 +1596,7 @@ class Parser {
           if (this.current().text === open) depth++;
           else if (this.current().text === close) depth--;
           const token = this.take();
-          if (depth) parts.push(typeTokenText(token));
+          if (depth) parts.push(tokenSpelling(token));
         }
         // `@[a]` is a list type; `@(...)` is only grouping, so its brackets
         // are dropped and the list's are kept.
@@ -1613,11 +1604,11 @@ class Parser {
         value = { tag: "typeApp", expr: value, type: text, span: value.span };
         continue;
       }
-      // `@"users"` is a type-level string. The lexer hands back its *decoded*
-      // value, so it has to be re-quoted here or the type parser reads it as a
-      // type variable named `users`.
+      // `@"users"` is a type-level string. `tokenSpelling` re-quotes it: the
+      // lexer hands back the *decoded* value, and `Path users` would read back
+      // as a type variable rather than the symbol it is.
       if (this.current().kind === "ident" || this.current().kind === "string")
-        value = { tag: "typeApp", expr: value, type: typeTokenText(this.take()), span: value.span };
+        value = { tag: "typeApp", expr: value, type: tokenSpelling(this.take()), span: value.span };
     }
     return value;
   }
@@ -2270,7 +2261,7 @@ class Parser {
           token.text === "where")
       )
         return parts.join(" ");
-      parts.push(typeTokenText(this.take()));
+      parts.push(tokenSpelling(this.take()));
     }
     return parts.join(" ");
   }
@@ -2591,6 +2582,16 @@ class Parser {
     let delimiters = 0;
     for (let cursor = this.index; cursor < this.tokens.length; cursor++) {
       const token = this.tokens[cursor];
+      // A `;` or `}` at depth zero ends this statement, written or virtual.
+      // An instance method is re-lexed from tokens whose virtual punctuation
+      // has already been printed as ordinary `{`/`;`/`}` (see
+      // `instanceMethodValues` in `src/dictionary.ts`), so requiring the
+      // virtual flag let the scan run on into the *next* statement and read
+      // its `<-` as this one's. `instance FromJSVal Closed` in miso's
+      // `Miso.Runtime` failed to parse for exactly that reason, and a method
+      // that fails to parse is silently dropped - the instance then took the
+      // class's `Generic` default instead of the body it was given.
+      if (!delimiters && (token.text === ";" || token.text === "}")) return false;
       if (
         token.kind === "symbol" &&
         (token.text === "(" ||
