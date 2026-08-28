@@ -28,6 +28,7 @@ import type {
   StgRhs,
 } from "./stg.js";
 import { UpdateFlag, isUnboxedTupleCon, litArg, mkBinder, varArg } from "./stg.js";
+import { isAlwaysSinkableCon } from "./stg-js/sinker.js";
 
 /** Either a `let` (a real allocation) or a `case` (evaluate now), the two
  * ways CorePrep floats a non-atomic subexpression out of an argument
@@ -35,12 +36,57 @@ import { UpdateFlag, isUnboxedTupleCon, litArg, mkBinder, varArg } from "./stg.j
 type Float = (body: StgExpr) => StgExpr;
 
 class Converter {
+  /** Bindings this pass lifted out of an argument position and up to the top
+   * level - CorePrep's float. See `floatToTop`. */
+  readonly floated: StgBinding[] = [];
+
+  /** Whether a float from here would reach the top level. CorePrep's floats do
+   * not escape a lambda or a `case` alternative, so only a top-level
+   * right-hand side that is not a function produces any. GHC's own output is
+   * what pins this down: `ten = 5 + 5` floats its two `I# 5`s away, while
+   * `big n = n > 10` keeps `I# 10` as a local `let` - and GHC's `big` still
+   * carries the empty `var` that leaves behind. */
+  private toTop = false;
+
   /**
-   * @param topLevel every top-level binder. These are never free variables of
-   * a closure: codegen resolves them to module-level symbols, not payload
-   * slots.
+   * @param topLevel every top-level binder, which `floatToTop` adds to. These
+   * are never free variables of a closure: codegen resolves them to
+   * module-level symbols, not payload slots.
    */
-  constructor(private readonly topLevel: ReadonlySet<Binder>) {}
+  constructor(private readonly topLevel: Set<Binder>) {}
+
+  private under<A>(toTop: boolean, f: () => A): A {
+    const saved = this.toTop;
+    this.toTop = toTop;
+    try {
+      return f();
+    } finally {
+      this.toTop = saved;
+    }
+  }
+
+  /** CorePrep floats a constructor application whose arguments are all
+   * literals to the top level, where `GHC.StgToJS.Sinker` unfloats most of
+   * them again into the place they were used.
+   *
+   * ghcts has no CorePrep, so this floats only the shape the Sinker's
+   * `alwaysSinkable` is certain to take back: nothing new can be left standing
+   * at the top level, and the pair's whole visible effect is that the argument
+   * is emitted as its literal instead of through a `var` that names it.
+   * Widening it would need a pass that can decide what the rest should cost. */
+  floatToTop(binder: Binder, rhs: StgRhs): boolean {
+    if (!this.toTop || !isAlwaysSinkableCon(rhs)) return false;
+    this.floated.push({ tag: "StgNonRec", binder, rhs });
+    // A top-level binder is a module-level symbol, never a closure payload
+    // slot, so every enclosing `mkClosure` has to stop counting it free and
+    // `liveVars` has to stop putting it in a payload - which is what
+    // `exported`, GHC's `isGlobalId`, says. `internal` is the other half of
+    // GHC's name: no module owns it, which is how the Sinker recognises it.
+    this.topLevel.add(binder);
+    binder.exported = true;
+    binder.internal = true;
+    return true;
+  }
 
   /** Peel the leading lambdas, so a right-hand side becomes a function
    * closure rather than a thunk that returns one. */
@@ -51,7 +97,7 @@ class Converter {
       args.push(body.binder);
       body = body.body;
     }
-    const stgBody = this.expr(body);
+    const stgBody = this.under(this.toTop && args.length === 0, () => this.expr(body));
 
     // A constructor application with atomic arguments needs no entry code at
     // all: codegen can allocate it directly. Anything that had to be floated
@@ -162,13 +208,15 @@ class Converter {
   }
 
   alt(alt: CoreAlt): StgAlt {
-    return { con: alt.con, binders: alt.binders, body: this.expr(alt.body) };
+    return { con: alt.con, binders: alt.binders, body: this.under(false, () => this.expr(alt.body)) };
   }
 
-  bind(bind: CoreBind): StgBinding {
-    return bind.tag === "NonRec"
-      ? { tag: "StgNonRec", binder: bind.binder, rhs: this.rhs(bind.rhs) }
-      : { tag: "StgRec", pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs)] as [Binder, StgRhs]) };
+  bind(bind: CoreBind, toTop = false): StgBinding {
+    return this.under(toTop, () =>
+      bind.tag === "NonRec"
+        ? { tag: "StgNonRec", binder: bind.binder, rhs: this.rhs(bind.rhs) }
+        : { tag: "StgRec", pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs)] as [Binder, StgRhs]) },
+    );
   }
 
   /** Make one subexpression atomic, recording how to re-attach it.
@@ -213,6 +261,13 @@ class Converter {
     // string literal - `error "Prelude.head: empty list"` - took eleven
     // seconds to reach STG.
     const value = evaluate ? this.expr(e) : undefined;
+    // CorePrep's top-level float, which is what leaves the Sinker something to
+    // unfloat; when it takes the binding there is nothing left to re-attach.
+    // The Core-level shape test comes first so that `rhs` is walked twice only
+    // for a one-literal constructor - which allocates no binder of its own, so
+    // the unique supply sees the same sequence it always did.
+    const literalCon = e.tag === "Con" && e.args.length === 1 && e.args[0]!.tag === "Lit";
+    if (!evaluate && literalCon && this.floatToTop(binder, this.rhs(e))) return varArg(binder);
     floats.push(
       evaluate
         ? (body) => ({
@@ -338,11 +393,12 @@ export function coreToStg(program: CoreProgram): StgModule {
     else for (const [b] of bind.pairs) topLevel.add(b);
   }
   const converter = new Converter(topLevel);
+  const bindings = program.binds.map((bind) => converter.bind(bind, true));
   return {
     name: program.name,
-    bindings: [
-      ...program.dataCons.map(conWorker),
-      ...program.binds.map((bind) => converter.bind(bind)),
-    ],
+    // The floats go last, as CorePrep's do: nothing already emitted can refer
+    // to a binder that did not exist when it was converted, and the Sinker's
+    // `topSortDecls` is what puts any that survive ahead of their users.
+    bindings: [...program.dataCons.map(conWorker), ...bindings, ...converter.floated],
   };
 }

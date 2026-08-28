@@ -3,16 +3,15 @@
  *
  * `stgToJS` in GHC walks a module's top-level bindings into `LinkableUnit`s
  * and serialises them into a `.o` through GHC.StgToJS.Object. ghcts has no
- * Object.hs, Deps.hs, Sinker.hs or StaticPtr.hs, so this port stops at the
+ * Object.hs, Deps.hs or StaticPtr.hs, so this port stops at the
  * LinkableUnit and adds `renderModule`, which does what the linker would:
  * declare the statics, emit the code, install the info tables, run the static
  * initialisers. Those last two steps are `staticDeclStat`/`staticInitStat`
  * from GHC.StgToJS.Linker.Linker, transcribed here because there is nowhere
  * else for them to live yet.
  *
- * Not modelled, and dropped rather than faked: the sinker pass (so
- * `gsUnfloated` starts empty), `SptEntry`/StaticPointers, ForeignStubs, cost
- * centres, dependency data, and the `-ddump-js` hook.
+ * Not modelled, and dropped rather than faked: `SptEntry`/StaticPointers,
+ * ForeignStubs, cost centres, dependency data, and the `-ddump-js` hook.
  */
 import type { JStat } from "../js/syntax.js";
 import type { Ident } from "../js/ident.js";
@@ -33,6 +32,7 @@ import type { StaticArg, StaticVal } from "./literal.js";
 import type { GenState, GlobalOcc, Module, StaticInfo } from "./monad.js";
 import { emitClosureInfo, emitStatic, emitToplevel, getSettings, globalOccs, resetGroup, runG } from "./monad.js";
 import { R2 } from "./regs.js";
+import { sinkPgm } from "./sinker.js";
 import { resetSlots, updateThunk } from "./stack.js";
 import type { ClosureInfo, StgToJSConfig } from "./types.js";
 import { JSRep } from "./types.js";
@@ -85,8 +85,9 @@ export const moduleExportsSymbol = (m: Module): string => `h$${unitModuleStringZ
  * a binary object file; here it stops at the linkable units.
  */
 export function stgToJS(config: StgToJSConfig, thisMod: Module, stgBinds: StgBinding[]): LinkableUnit[] {
-  // TODO: the sinker (GHC.StgToJS.Sinker) is unported, so nothing is unfloated
-  return runG(config, thisMod, new Map(), (gs) => genUnits(gs, thisMod, stgBinds));
+  // GHC: `let (unfloated, binds) = sinkPgm this_mod binds0`
+  const [unfloated, binds] = sinkPgm(stgBinds);
+  return runG(config, thisMod, unfloated, (gs) => genUnits(gs, thisMod, binds));
 }
 
 /** Generate the ingredients for the linkable units for this module */

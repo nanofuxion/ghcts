@@ -976,6 +976,10 @@ const voidArity = (voidRep: true | undefined): Partial<Binder> => (voidRep ? { a
 const voidRepOf = (p: Pattern): true | undefined =>
   p.tag === "var" || p.tag === "wild" ? p.voidRep : undefined;
 
+/** See `Pattern.notFun` in src/ast.ts. */
+const notFunOf = (p: Pattern): true | undefined =>
+  p.tag === "var" || p.tag === "wild" ? p.notFun : undefined;
+
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
 
@@ -1012,6 +1016,9 @@ function bindingsOf(subjects: Binder[], patterns: Pattern[]): Array<[string, Bin
     // void mark can be carried onto that binder. A wildcard at the state
     // token binds no name but still has to erase its argument register.
     if (voidRepOf(p) && subjects[i]) subjects[i]!.arity = 0;
+    // ... and the same funnel for the one type fact codegen reads, GHC's
+    // `mightBeFunTy (idType i)` (see `Binder.mightBeFun` in src/stg.ts).
+    if (notFunOf(p) && subjects[i]) subjects[i]!.mightBeFun = false;
     for (const name of patternNames(p)) out.push([name, subjects[i]!]);
   });
   return out;

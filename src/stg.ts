@@ -33,8 +33,25 @@ export interface Binder {
   /** How many JS values this binder occupies - see JSRep/varSize. A void
    * binder occupies none and is dropped entirely by codegen. */
   arity?: number;
-  /** Set on a top-level binder that other modules can reference. */
+  /** Set on a top-level binder that other modules can reference. Codegen also
+   * reads it as GHC's `isGlobalId` - see `liveVars` in src/stg-js/utils.ts. */
   exported?: boolean;
+  /** GHC's `isNothing (nameModule_maybe (idName i))`: this name was invented by
+   * the compiler and belongs to no module, so nothing outside can ever spell
+   * it. Only `GHC.StgToJS.Sinker` asks (src/stg-js/sinker.ts), and only about
+   * top-level binders, where `exported` is true of every binder that came from
+   * source and so cannot tell the two apart on its own. */
+  internal?: boolean;
+  /** The answer to GHC's `mightBeFunTy (idType i)`, precomputed.
+   *
+   * A binder carries no type here, and `GHC.Types.RepType.mightBeFunTy` is the
+   * only thing StgToJS asks a type that changes the bytes this compiler emits
+   * (see `genApp` in src/stg-js/expr.ts). So rather than grow a Core type
+   * system, the desugarer answers that one question where it can and leaves it
+   * `undefined` where it cannot. `undefined` therefore means "unknown", and
+   * every consumer must read it the way `mightBeFunTy` is documented to be
+   * read: False only when we are *sure* it is a data type. */
+  mightBeFun?: boolean;
 }
 
 /** GHC's Literal, narrowed to what the JS backend can represent.

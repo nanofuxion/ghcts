@@ -95,7 +95,7 @@ import {
   setSlots,
   updateThunk,
 } from "./stack.js";
-import { hdBlackHoleLNE, hdBlackHoleTrap, hdC } from "./symbols.js";
+import { hdBlackHoleLNE, hdBlackHoleTrap, hdC, hdEntryStr } from "./symbols.js";
 import type { CIStatic, CIType, ClosureInfo, StgToJSConfig } from "./types.js";
 import { JSRep } from "./types.js";
 import type { LiveVars, PrimRep, TypedExpr, UnfloatedMap } from "./utils.js";
@@ -305,9 +305,10 @@ export function genExpr(gs: GenState, ctx: ExprCtx, stg: StgExpr): [JStgStat, Ex
  * The case where args is null is common as it's used to generate the
  * evaluation code for an Id.
  *
- * CONSERVATIVE: of GHC's nine clauses only the let-no-escape one, `proxy#` and
- * the final generic-apply fall-through survive. Each of the six that do not is
- * keyed on something ghcts's Binder cannot carry, and the reason differs:
+ * CONSERVATIVE: of GHC's nine clauses only the let-no-escape one, `proxy#`,
+ * "no args and Id can't be a function" and the final generic-apply
+ * fall-through survive. Each of the five that do not is keyed on something
+ * ghcts's Binder cannot carry, and the reason differs:
  *
  *   - the saturated and oversaturated direct jumps read `idFunRepArity`, which
  *     the frontend does know - but both are additionally guarded by
@@ -318,10 +319,6 @@ export function genExpr(gs: GenState, ctx: ExprCtx, stg: StgExpr): [JStgStat, Ex
  *     against. Carrying arity alone would therefore not move a single byte,
  *     and ghcts has no demand analysis to make the guard true. That is why
  *     `Binder` still has no arity field.
- *   - "no args and Id can't be a function: just enter it" needs
- *     `mightBeFunTy (idType i)`. There is no type on a Binder and no type
- *     reaches desugar, so this one is genuinely out of reach; it is what emits
- *     `h$e(x)` where this port emits `h$r1=x; return h$ap_0_0_fast()`.
  *   - unboxed-tuple / strict-type field return: needs `isStrictType`.
  *   - the unboxable-heap-object check and the "known evaluated" return: both
  *     additionally require `ctxIsEvaluated`, which is `isTaggedSig . idTagSig`
@@ -352,6 +349,21 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
   if (args.length === 0 && i.name === "proxy#") {
     const tops = ctxTarget(ctx).flatMap((t) => t.expr);
     if (tops.length === 1) return [assign_(tops[0], null_), "ExprInline"];
+  }
+
+  // no args and Id can't be a function: just enter it
+  //
+  // GHC's guard is `idFunRepArity i == 0 && not (mightBeFunTy (idType i))`.
+  // `mightBeFun` (src/stg.ts) is the desugarer's answer to the second half,
+  // and it is only ever set False for a lifted data type - which has no
+  // function rep arity - so the first half comes along with it.
+  //
+  // GHC panics on a multi-var argument, having ruled one out by type. This
+  // falls through to the generic apply instead: an under-answered `mightBeFun`
+  // is always allowed, and h$ap_0_0_fast enters exactly as h$e does.
+  if (args.length === 0 && i.mightBeFun === false) {
+    const enterId = genIdArg(gs, i);
+    if (enterId.length === 1) return [returnS(app(hdEntryStr, [enterId[0]!])), "ExprCont"];
   }
 
   // generic apply:

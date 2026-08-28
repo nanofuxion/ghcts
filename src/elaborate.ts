@@ -934,6 +934,9 @@ class Elaborator {
    * ones.  Read back when the data declarations are handed to `desugar`, which
    * is what keeps the constructor's arity and this pass's view of it in step. */
   readonly conDictFields = new Map<string, number>();
+  /** Type constructors declared with `data` and at least one constructor: the
+   * ones `isDataTy` may answer for. A `newtype` is deliberately absent. */
+  readonly dataTypes = new Set<string>();
   /** The binder names a constructor *pattern* gives those fields, so
    * `rewritePattern` can put them back as the pattern's leading arguments. */
   readonly conPatternDicts = new Map<Pattern, string[]>();
@@ -984,6 +987,19 @@ class Elaborator {
   isVoidRep(node: Pattern | Expr): boolean {
     const t = this.binderTypes.get(node);
     return t !== undefined && headCon(t) === "RealWorld";
+  }
+
+  /** Is this binder's type *surely* a data type? See `Pattern.notFun`.
+   *
+   * This is `not (mightBeFunTy ty)` (GHC.Types.RepType), which is documented to
+   * return False only when it is sure, so every shape that is not a saturated
+   * `data` type constructor answers "unknown" here: a type variable, a function,
+   * a list or tuple, an unlifted primitive, a synonym, and a `newtype`, which
+   * `mightBeFunTy` looks *through* before deciding. */
+  isDataTy(node: Pattern | Expr): boolean {
+    const t = this.binderTypes.get(node);
+    const con = t === undefined ? undefined : headCon(t);
+    return con !== undefined && this.dataTypes.has(con);
   }
 
   private recordBinder<T extends Pattern | Expr>(node: T, type: Type): Type {
@@ -2062,6 +2078,7 @@ export function elaborateProgram(
   // --- data constructors -----------------------------------------------
   const datas = declarations.filter((d): d is DataDeclaration => d.tag === "data");
   for (const decl of datas) {
+    if (decl.newtype !== true && decl.constructors.length > 0) elaborator.dataTypes.add(decl.name);
     for (const con of decl.constructors) {
       const vars = new Map<string, Type>();
       const params: TVar[] = [];
@@ -3344,7 +3361,10 @@ function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
     // binder at that type has to say so before types are erased.
     case "var":
     case "wild":
-      return elaborator.isVoidRep(p) ? { ...p, voidRep: true } : p;
+      if (elaborator.isVoidRep(p)) return { ...p, voidRep: true };
+      // ... and a binder at a data type says so for the same reason: this is
+      // the last pass that knows, and `genApp` asks (see `Pattern.notFun`).
+      return elaborator.isDataTy(p) ? { ...p, notFun: true } : p;
     default:
       return p;
   }
