@@ -65,7 +65,7 @@ import type {
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { classMethodNames, renameDeclarations, renameValue, resolveProgram, type Scopes } from "./modules.js";
 import { error } from "./diagnostics.js";
-import { constructorTable, derivedEqMethod, derivedGenericSource, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
+import { constructorTable, derivedEqMethod, derivedGenericSource, derivedOrdMethod, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE, RTS_SEATS } from "./prelude.js";
 import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
@@ -2386,6 +2386,14 @@ export function elaborateProgram(
       deriveInstance("Eq", decl, (vars) => ({
         context: vars.map((type) => ({ cls: "Eq", types: [type] })),
         methods: new Map([["==", derivedEqMethod(decl)]]),
+      }));
+
+    // `deriving Ord`: declaration order of the constructors, then fields left
+    // to right - see `derivedOrdMethod`. Same per-parameter context as `Eq`.
+    if (decl.deriving.includes("Ord"))
+      deriveInstance("Ord", decl, (vars) => ({
+        context: vars.map((type) => ({ cls: "Ord", types: [type] })),
+        methods: new Map([["compare", derivedOrdMethod(decl)]]),
       }));
 
     // `deriving anyclass C` is the *empty* instance: every method comes from

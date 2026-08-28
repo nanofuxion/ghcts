@@ -449,11 +449,22 @@ instance Enum Int where
 instance Eq Char where
   (==) (C a) (C b) = primCharEq a b
 
+instance Enum Char where
+  toEnum = chr
+  fromEnum = ord
+
 instance Eq Bool where
   (==) a b = eqBool a b
 
 instance Show Bool where
   show b = showBool b
+
+-- Declaration order, like every other stock-derived 'Ord': 'False' < 'True'.
+instance Ord Bool where
+  compare False False = EQ
+  compare False True  = LT
+  compare True  False = GT
+  compare True  True  = EQ
 
 instance Eq Ordering where
   (==) a b = eqOrdering a b
@@ -1320,6 +1331,15 @@ instance Show Word64 where
 -- value this used to pass, which could not be a lazy constructor field.
 fromIntegral :: (Integral a, Num b) => a -> b
 fromIntegral x = fromInteger (toInteger x)
+
+-- GHC's own definitions, from \`rem\`. GHC's \`Integral\` implies \`Eq\` through
+-- \`Real => Ord => Eq\`; this hierarchy keeps them separate, so it is named
+-- explicitly here.
+even :: (Integral a, Eq a) => a -> Bool
+even n = rem n 2 == 0
+
+odd :: (Integral a, Eq a) => a -> Bool
+odd n = not (even n)
 
 -- GHC's own default for \`divMod\`: it differs from \`quotRem\` exactly when the
 -- remainder's sign disagrees with the divisor's, in which case the quotient

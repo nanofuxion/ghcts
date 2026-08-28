@@ -577,6 +577,101 @@ intersection a b = M.filterWithKey (\\k _ -> member k b) a
 import Data.Set
 type IntSet = Set Int
 `,
+  // A span of seconds. GHC's own `DiffTime` is a fixed-precision `Pico`; the
+  // only thing this frontend's one consumer (`Data.Time.Format`'s duration
+  // specifiers, below) ever does with one is truncate it to whole seconds, so
+  // a plain `Double` is exact enough for any duration this app ever formats.
+  // The constructor is not exported - `import Data.Time.Clock (DiffTime)` in
+  // GHC's own real module asks for the type only, same as here.
+  "Data.Time.Clock": `module Data.Time.Clock (DiffTime) where
+
+newtype DiffTime = DiffTime Double
+
+instance Num DiffTime where
+  (+) (DiffTime a) (DiffTime b) = DiffTime (a + b)
+  (-) (DiffTime a) (DiffTime b) = DiffTime (a - b)
+  (*) (DiffTime a) (DiffTime b) = DiffTime (a * b)
+  negate (DiffTime a) = DiffTime (negate a)
+  fromInteger n = DiffTime (fromInteger n)
+
+instance Fractional DiffTime where
+  (/) (DiffTime a) (DiffTime b) = DiffTime (a / b)
+  fromRational d = DiffTime (DoubleBox d)
+
+instance RealFrac DiffTime where
+  fracToDoublePrim (DiffTime (DoubleBox d)) = d
+`,
+  // \`formatTime\`, scoped to \`DiffTime\` - the only \`FormatTime\` instance this
+  // app ever formats. Ported directly from the real \`time\` package:
+  // \`Data.Time.Format.Format.Class\`'s \`formatTime\`/\`formatChar\` decide the
+  // \`%\`-syntax (an optional \`0\` pad-character marker, then optional width
+  // digits, then the specifier; \`%%\`, \`%t\`, \`%n\`, and anything this instance
+  // does not know come out as \`%\`, tab, newline, and empty respectively), and
+  // \`Data.Time.Format.Format.Instances\`'s \`instance FormatTime DiffTime\`
+  // supplies each specifier's default width/pad and its value - a truncating
+  // quotient or remainder against the field's second count (\`quotBy\`/\`remBy\`
+  // there, truncating towards zero; \`div\`/\`mod\` here agree with that because
+  // a duration is never negative). \`TimeLocale\` carries no fields because
+  // none of these specifiers read it - GHC's own instance matches the locale
+  // argument against \`_\` in every one of them.
+  "Data.Time.Format": `module Data.Time.Format (TimeLocale, defaultTimeLocale, formatTime) where
+import Data.Time.Clock
+
+data TimeLocale = TimeLocale
+
+defaultTimeLocale :: TimeLocale
+defaultTimeLocale = TimeLocale
+
+formatTime :: TimeLocale -> [Char] -> DiffTime -> [Char]
+formatTime _ template t = go template
+  where
+    total :: Int
+    total = truncate t
+
+    go [] = []
+    go ('%' : cs) = directive cs
+    go (c : cs) = c : go cs
+
+    directive ('0' : cs) = withWidth (Just '0') cs
+    directive cs = withWidth Nothing cs
+
+    withWidth mpad cs = case span isDecDigit cs of
+      (ds, rest) -> case rest of
+        (c : more) -> field mpad (if null ds then Nothing else Just (readDec ds)) c ++ go more
+        [] -> []
+
+    isDecDigit c = c >= '0' && c <= '9'
+    readDec = foldl (\\acc d -> acc * 10 + (fromEnum d - fromEnum '0')) 0
+
+    -- (default width, default pad character, value) for every specifier
+    -- \`DiffTime\` supports; anything else falls through to \`plain\`.
+    field mpad mwidth c = case spec c of
+      Just (idef, cdef, n) ->
+        let width = maybe idef id mwidth
+            padded = mpad /= Nothing || mwidth /= Nothing
+            padChar = maybe cdef id mpad
+        in if padded then padShow padChar width n else show n
+      Nothing -> plain c
+
+    plain c = if c == '%' then "%" else if c == 't' then "\\t" else if c == 'n' then "\\n" else ""
+
+    spec c = case c of
+      'w' -> Just (1, '0', total \`div\` (7 * 86400))
+      'd' -> Just (1, '0', total \`div\` 86400)
+      'D' -> Just (1, '0', (total \`div\` 86400) \`mod\` 7)
+      'h' -> Just (1, '0', total \`div\` 3600)
+      'H' -> Just (2, '0', (total \`div\` 3600) \`mod\` 24)
+      'm' -> Just (1, '0', total \`div\` 60)
+      'M' -> Just (2, '0', (total \`div\` 60) \`mod\` 60)
+      's' -> Just (1, '0', total)
+      'S' -> Just (2, '0', total \`mod\` 60)
+      _   -> Nothing
+
+    padShow padChar width n =
+      let s = show n
+          need = width - length s
+      in if need > 0 then replicate need padChar ++ s else s
+`,
   // containers' \`Seq\` is a finger tree, and its two *pattern synonyms* -
   // \`Empty\` and \`(:<|)\` - are how every consumer takes it apart. This parser
   // has no pattern synonyms, so the sequence is declared with those two
@@ -1028,6 +1123,14 @@ filterList :: (a -> Bool) -> [a] -> [a]
 filterList p xs = case xs of
   [] -> []
   (y : ys) -> if p y then y : filterList p ys else filterList p ys
+
+dropWhile :: (Char -> Bool) -> JSString -> JSString
+dropWhile p s = pack (dropWhileList p (unpack s))
+
+dropWhileList :: (a -> Bool) -> [a] -> [a]
+dropWhileList p xs = case xs of
+  [] -> []
+  (y : ys) -> if p y then dropWhileList p ys else xs
 
 -- GHC's \`Show Text\`/\`Show JSString\`: a text value prints as the \`String\` it
 -- denotes, quotes, escapes and all.

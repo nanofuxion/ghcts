@@ -481,6 +481,75 @@ export function derivedEqMethod(decl: DataDeclaration): ValueDeclaration {
   };
 }
 
+/** The `compare` of a `deriving Ord` instance. GHC's derived order is
+ * declaration order of the constructors, then fields left to right within a
+ * matching constructor. Built the same way as `derivedEqMethod`: a case on
+ * `$a`, and within each arm a nested case on `$b` whose *other* constructors
+ * get a constant `LT`/`GT` decided here (their declaration index is already
+ * known), and whose matching constructor gets a field-by-field `compare`
+ * chain that short-circuits on the first non-`EQ`. */
+export function derivedOrdMethod(decl: DataDeclaration): ValueDeclaration {
+  const span = decl.span;
+  const conPattern = (name: string, names: string[]): Pattern => ({
+    tag: "con",
+    name,
+    args: names.map((n): Pattern => ({ tag: "var", name: n, span })),
+    span,
+  });
+  const wildPattern = (name: string, arity: number): Pattern => ({
+    tag: "con",
+    name,
+    args: Array.from({ length: arity }, (): Pattern => ({ tag: "wild", span })),
+    span,
+  });
+  // Lexicographic `compare` over two equal-length field lists, right to left:
+  // the last pair's result is returned as-is, and every earlier pair only
+  // falls through to the rest on `EQ`.
+  const fieldsCompare = (xs: string[], ys: string[]): Expr =>
+    xs.reduceRight<Expr | undefined>((rest, x, i) => {
+      const here = apply2("compare", variable(x, span), variable(ys[i]!, span), span);
+      if (!rest) return here;
+      return {
+        tag: "case",
+        subject: here,
+        alternatives: [
+          { pattern: { tag: "con", name: "EQ", args: [], span }, body: rest },
+          { pattern: { tag: "var", name: "$ord", span }, body: variable("$ord", span) },
+        ],
+        span,
+      };
+    }, undefined) ?? variable("EQ", span);
+  const alternatives = decl.constructors.map((con, i): CaseAlternative => {
+    const xs = Array.from({ length: con.arity }, (_, k) => `$x${k}`);
+    const innerAlts: CaseAlternative[] = decl.constructors.map((other, j) => {
+      if (j === i) {
+        const ys = Array.from({ length: con.arity }, (_, k) => `$y${k}`);
+        return { pattern: conPattern(con.name, ys), body: fieldsCompare(xs, ys) };
+      }
+      return { pattern: wildPattern(other.name, other.arity), body: variable(j < i ? "GT" : "LT", span) };
+    });
+    return {
+      pattern: conPattern(con.name, xs),
+      body: { tag: "case", subject: variable("$b", span), alternatives: innerAlts, span },
+    };
+  });
+  return {
+    tag: "value",
+    name: "compare",
+    equations: [
+      {
+        patterns: [
+          { tag: "var", name: "$a", span },
+          { tag: "var", name: "$b", span },
+        ],
+        guards: [{ body: { tag: "case", subject: variable("$a", span), alternatives, span } }],
+        whereBindings: [],
+      },
+    ],
+    span,
+  };
+}
+
 /** `deriving Show`, as Haskell source, in GHC's own shape: a nullary
  * constructor is its bare name, a prefix one is `showParen (d > 10)` over the
  * name and each field at precedence 11, and a record one is

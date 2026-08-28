@@ -3954,6 +3954,92 @@ const programs = [
     ].join("\n"),
     expect: 21,
   },
+  {
+    // `references/video`'s `Model.VideoId` is `newtype VideoId = VideoId Int
+    // deriving (Eq, Ord)`, used as a `Map`/`Set` key - a plain `deriving Eq`
+    // stock strategy never derived `Ord` at all before this. A multi-
+    // constructor type checks declaration order beats field order, and `Ord
+    // Bool` (needed by miso's own `newtype Checked = Checked Bool deriving
+    // (Eq, Ord)`) checks `False < True`.
+    name: "deriving Ord: declaration order, then fields, plus the Bool instance it leans on",
+    source: [
+      "module Main where",
+      "data Rank = Bronze | Silver | Gold deriving (Eq, Ord)",
+      "newtype Score = Score Int deriving (Eq, Ord)",
+      "data Pair = Pair Int Int deriving (Eq, Ord)",
+      "",
+      "main :: IO Int",
+      "main = pure",
+      "  ( (if Bronze < Gold then 1 else 0) * 1",
+      "  + (if compare Silver Silver == EQ then 1 else 0) * 10",
+      "  + (if Score 3 < Score 5 then 1 else 0) * 100",
+      "  + (if Pair 1 2 < Pair 1 3 then 1 else 0) * 1000",
+      "  + (if Pair 2 0 > Pair 1 9 then 1 else 0) * 10000",
+      "  + (if compare False True == LT then 1 else 0) * 100000",
+      "  )",
+      "",
+    ].join("\n"),
+    expect: 111111,
+  },
+  {
+    // `references/video`'s `viewFlash` alternates a CSS class with `even`,
+    // and `channelColor` walks a `MisoString` with `fromEnum <$> MS.unpack`
+    // - neither `even`/`odd` nor `Enum Char` existed before this pass.
+    name: "even/odd and Enum Char",
+    source: [
+      "module Main where",
+      "",
+      "main :: IO Int",
+      "main = pure",
+      "  ( (if even (4 :: Int) then 1 else 0) * 10",
+      "  + (if odd (4 :: Int) then 1 else 0)",
+      "  + fromEnum 'A'",
+      "  + fromEnum (toEnum 66 :: Char)",
+      "  )",
+      "",
+    ].join("\n"),
+    expect: 141,
+  },
+  {
+    // `references/video`'s `viewComments` strips a leading '@' with
+    // `MS.dropWhile (== '@')` - `Data.JSString`/`Miso.String` had no
+    // `dropWhile` before this.
+    name: "Data.JSString.dropWhile strips a leading run",
+    source: [
+      "module Main where",
+      "import qualified Data.JSString as J",
+      "",
+      "main :: [Char]",
+      'main = J.unpack (J.dropWhile (== \'@\') (J.pack "@user"))',
+      "",
+    ].join("\n"),
+    expect: "user",
+  },
+  {
+    // `references/video`'s `fmtTime` is `ms (formatTime defaultTimeLocale
+    // fmt (realToFrac secs :: DiffTime))`, with `fmt` either
+    // "%h:%02M:%02S" or "%M:%02S" - neither `Data.Time.Clock` nor
+    // `Data.Time.Format` existed before this pass. Ported from the real
+    // `time` package's `instance FormatTime DiffTime`
+    // (`Data.Time.Format.Format.Instances`): total hours unpadded, minutes
+    // and seconds zero-padded to 2 digits when a width is given.
+    name: "Data.Time.Format.formatTime on a DiffTime, YouTube-duration style",
+    source: [
+      "module Main where",
+      "import Data.Time.Clock (DiffTime)",
+      "import Data.Time.Format (defaultTimeLocale, formatTime)",
+      "",
+      "fmtTime :: Double -> [Char]",
+      "fmtTime secs = formatTime defaultTimeLocale fmt (realToFrac secs :: DiffTime)",
+      "  where",
+      "    fmt = if secs >= 3600 then \"%h:%02M:%02S\" else \"%M:%02S\"",
+      "",
+      "main :: [Char]",
+      "main = fmtTime 3725 ++ \" \" ++ fmtTime 65 ++ \" \" ++ fmtTime 5",
+      "",
+    ].join("\n"),
+    expect: "1:02:05 1:05 0:05",
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
