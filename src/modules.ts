@@ -488,6 +488,10 @@ class Renamer {
         args: pattern.args.map((a) => this.pattern(a, shadow)),
       };
     if (pattern.tag === "as") return { ...pattern, pattern: this.pattern(pattern.pattern, shadow) };
+    // A pattern signature names types in the module's scope, exactly as a
+    // local `::` line does - see `binding` below.
+    if ((pattern.tag === "wild" || pattern.tag === "var") && pattern.signature !== undefined)
+      return { ...pattern, signature: renameTypeText(pattern.signature, this.scopes.types) };
     if (pattern.tag === "record") {
       // The *label* is the record selector's name, and it moved with the
       // constructor; the variable a `{..}` binds keeps the surface spelling.

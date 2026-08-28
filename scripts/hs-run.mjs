@@ -19,8 +19,8 @@
  * one-constructor type over a primitive field; a `[Char]` is walked into a JS
  * string, which is the one thing `putStrLn` would otherwise be for.
  */
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import { walk } from "../dist/compiler.js";
 import { renderRts } from "../dist/stg-js/rts.js";
 import { renderStaticRts } from "../dist/stg-js/rts-static.js";
@@ -3224,13 +3224,139 @@ const programs = [
     ].join("\n"),
     expect: "TrueTrue",
   },
+  {
+    // `@T` picks a quantified variable by position, so the signature's variable
+    // list has to be the one the *source* wrote. `Eq c => Box c p -> [Char]`
+    // used to list `c` twice (once from the type, once from the context) and
+    // `quantify` kept the last index, so `@Int` landed on a gen nothing used
+    // and `Eq c` stayed on an unsolved variable. `c` is phantom here, so the
+    // application is the only thing that can decide it: without the fix this
+    // does not compile at all.
+    name: "type application: `@T` binds the variable the context named",
+    source: [
+      "module Main where",
+      "data Box c p = MkBox p",
+      "onlyEq :: Eq c => Box c p -> [Char]",
+      "onlyEq (MkBox _) = \"eq\"",
+      "class Tag c where tag :: Box c p -> [Char]",
+      "instance Tag Int where tag _ = \"int\"",
+      "instance Tag Bool where tag _ = \"bool\"",
+      "main = onlyEq @Int (MkBox 'x') ++ tag @Bool (MkBox 'x') ++ tag @Int (MkBox 'x')",
+      "",
+    ].join("\n"),
+    expect: "eqboolint",
+  },
+  {
+    // The parser emits one `LocalBinding` per equation, so a multi-clause
+    // `where` function used to lose every clause but the last: `go Nothing`
+    // was dead code and `f Nothing` fell into the `Just` clause's
+    // pattern-match failure. Silent, and wrong-answer rather than an error.
+    name: "local bindings: a `where` function keeps all its equations",
+    source: [
+      "module Main where",
+      "f :: Maybe Char -> [Char]",
+      "f m = go m",
+      "  where",
+      "    go Nothing = \"ab\"",
+      "    go (Just c) = [c, c]",
+      "main = f Nothing ++ f (Just 'z')",
+      "",
+    ].join("\n"),
+    expect: "abzz",
+  },
+  {
+    // ... and the clauses share one type, so an overloaded `pure` in the first
+    // is resolved by the second pinning the list. Inferred per clause, the
+    // first one's `Applicative` had nothing to solve it at.
+    name: "local bindings: a `where` function's equations share one type",
+    source: [
+      "module Main where",
+      "f :: Maybe Char -> [Char]",
+      "f m = go m",
+      "  where",
+      "    go Nothing = pure 'a'",
+      "    go (Just c) = [c, c]",
+      "main = f Nothing ++ f (Just 'z')",
+      "",
+    ].join("\n"),
+    expect: "azz",
+  },
+  {
+    // `kidsViews` enters `go`'s scope as a bare variable and only becomes a
+    // list once `reverse kidsViews` is inferred. Generalisation used to work
+    // from a snapshot of the enclosing scope's *variables*, taken before that
+    // happened, so `ordered` was generalised over its element type and
+    // `consume (map snd ordered)` wanted `ToObj` at a variable that no later
+    // use could pin down. miso's `setField "nextSibling"` is this exact shape.
+    name: "local bindings: a `let` does not generalise the scope's own type",
+    source: [
+      "module Main where",
+      "class ToObj a where toObj :: a -> [Char]",
+      "instance ToObj Char where toObj c = [c]",
+      "build :: [Char]",
+      "build = go (foldl buildKid [] ['x', 'y'])",
+      "  where",
+      "    buildKid acc k = (k, 'z') : acc",
+      "    go kidsViews =",
+      "      let ordered = reverse kidsViews",
+      "      in consume (map snd ordered)",
+      "      where",
+      "        consume xs = concatMap toObj xs",
+      "main = build",
+      "",
+    ].join("\n"),
+    expect: "zz",
+  },
+  {
+    // The monomorphism restriction. `maxAttempts = 20` owes only `Num a`, and
+    // that constraint arrives as a *literal* use, which the generalisation
+    // filter did not look at - so `a` was quantified and `n < maxAttempts` and
+    // `show maxAttempts` each got their own copy, leaving the `Show` at a
+    // variable nothing pinned. miso's `sendReadyUntilAcked` is this verbatim.
+    name: "local bindings: a numeric literal binding stays monomorphic",
+    source: [
+      "module Main where",
+      "f :: [Char]",
+      "f = go (0 :: Int)",
+      "  where",
+      "    maxAttempts = 20",
+      "    go n = if n < maxAttempts then go (n + 1) else show maxAttempts",
+      "main = f",
+      "",
+    ].join("\n"),
+    expect: "20",
+  },
+  {
+    // A pattern signature's variables scope over the alternative's body, so
+    // `parse "x" :: m` names the `m` the pattern matched. The annotation used
+    // to be parsed and thrown away, leaving `m` fresh and both classes wanted
+    // at a variable nothing could solve - miso's `componentListener` decodes
+    // its model through exactly this.
+    name: "pattern signature: its type variables scope over the body",
+    source: [
+      "module Main where",
+      "class Parse a where parse :: [Char] -> a",
+      "class Render a where render :: a -> [Char]",
+      "instance Parse Int where parse _ = 7",
+      "instance Render Int where render n = show n",
+      "data Comp m = MkComp m",
+      "run :: Comp Int -> [Char]",
+      "run c = case c of",
+      "  (_ :: Comp m) -> render (parse \"x\" :: m)",
+      "main = run (MkComp 1)",
+      "",
+    ].join("\n"),
+    expect: "7",
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
-/** A file on the command line brings its whole directory with it, so a
- * multi-module program on disk compiles the same way the inline cases do. */
+/** A *directory* on the command line is the multi-module program; a file is
+ * only itself. Pulling in the named file's whole directory - what this used to
+ * do - silently merged every scratch `module Main` sitting beside it into one
+ * program, so three unrelated files each reported the same wrong answer. */
 const fromDisk = file
-  ? (await walk(dirname(resolve(file)))).map((path) => ({
+  ? (statSync(resolve(file)).isDirectory() ? await walk(resolve(file)) : [resolve(file)]).map((path) => ({
       file: path,
       source: readFileSync(path, "utf8"),
     }))

@@ -683,9 +683,24 @@ class Desugarer {
    * group is `Rec` only when a right-hand side actually mentions the group. */
   localGroup(bindings: readonly LocalBinding[], scope: Scope): [CoreBind[], Scope] {
     if (bindings.length === 0) return [[], scope];
-    const binders = bindings.map((b) => mkBinder(b.name));
-    const inner = extend(scope, bindings.map((b, i) => [b.name, binders[i]!] as [string, Binder]));
-    const rhss = bindings.map((binding) => {
+    // The parser emits one `LocalBinding` per *clause*, so a multi-equation
+    // `where` function arrives as several entries sharing a name. Grouping them
+    // back together is what makes the equations one function: without it the
+    // last clause won the scope and the earlier ones were dead code, so
+    // `withMaybe Nothing = pure jsNull` never ran and every call fell into the
+    // `Just` clause's pattern-match failure.
+    const clauses = new Map<string, LocalBinding[]>();
+    for (const b of bindings) {
+      const list = clauses.get(b.name);
+      if (list) list.push(b);
+      else clauses.set(b.name, [b]);
+    }
+    const names = [...clauses.keys()];
+    const binders = names.map((n) => mkBinder(n));
+    const inner = extend(scope, names.map((n, i) => [n, binders[i]!] as [string, Binder]));
+    const rhss = names.map((name) => {
+      const group = clauses.get(name)!;
+      const binding = group[0]!;
       const params = binding.patterns.map((p) => mkBinder(patternName(p) ?? "arg", voidArity(voidRepOf(p))));
       const bodyScope = extend(
         inner,
@@ -694,15 +709,15 @@ class Desugarer {
           return name ? [[name, params[j]!] as [string, Binder]] : [];
         }),
       );
-      const row: MatchRow = {
-        patterns: binding.patterns,
-        guards: binding.guards ?? [{ body: binding.value }],
-        whereBindings: binding.whereBindings ?? [],
-      };
+      const rows: MatchRow[] = group.map((b) => ({
+        patterns: b.patterns,
+        guards: b.guards ?? [{ body: b.value }],
+        whereBindings: b.whereBindings ?? [],
+      }));
       const body =
-        binding.patterns.every((p) => !isRefutable(p))
-          ? this.guardedBody(row, bodyScope, () => raise())
-          : this.match(params, [row], inner, raise());
+        group.length === 1 && binding.patterns.every((p) => !isRefutable(p))
+          ? this.guardedBody(rows[0]!, bodyScope, () => raise())
+          : this.match(params, rows, inner, raise());
       return mkLams(params, body);
     });
     const groupSet = new Set(binders);

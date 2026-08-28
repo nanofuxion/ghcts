@@ -841,15 +841,32 @@ class Elaborator {
   private patternGivens: Given[] = [];
   private nextPatternDict = 0;
   private current?: Binding;
+  /** What to blame when no binding is under check. Building an instance's
+   * dictionary resolves its superclass and default-method constraints outside
+   * any binding body, so `current` is unset there and every failure used to
+   * land with no attribution at all. */
+  where?: string;
+
+  /** Type variables a pattern signature brought into scope. A stack, for the
+   * same reason `patternGivens` is one. */
+  private patternTyvars: Array<[string, Type]> = [];
+
+  /** The type variables a written type may name here: the enclosing binding's
+   * `forall`, plus whatever an enclosing pattern signature bound. */
+  private tyvarScope(): Map<string, Type> {
+    return new Map<string, Type>([...(this.current?.tyvars ?? []), ...this.patternTyvars]);
+  }
 
   /** Run `f` with whatever constructor patterns it matches in scope, and drop
    * them again afterwards. */
   private scoped<T>(f: () => T): T {
     const depth = this.patternGivens.length;
+    const tyvarDepth = this.patternTyvars.length;
     try {
       return f();
     } finally {
       this.patternGivens.length = depth;
+      this.patternTyvars.length = tyvarDepth;
     }
   }
 
@@ -876,18 +893,40 @@ class Elaborator {
     // so a span alone cannot say which module a failure came from. The binding
     // under check can - its name is `Module_name` after `renameDeclarations` -
     // and that is what makes a hundred reports groupable by cause.
-    const where = this.current ? ` (in \`${this.current.name}\`)` : "";
+    const where = this.current ? ` (in \`${this.current.name}\`)` : this.where ? ` (in \`${this.where}\`)` : "";
     this.diagnostics.push(error("GHCTS-DICT", message + where, this.file, span.line, span.column));
   }
 
   // ------------------------------------------------------------ patterns --
 
+  /** A pattern type signature, checked and - the point of it - *scoping*.
+   *
+   * `SomeComponent _key _props (comp_ :: Component context props model action)`
+   * binds `props`, `model` and `action` for the alternative's body, so the
+   * `fromJSON m :: Result model` inside it names the type the pattern just
+   * unpacked instead of inventing a fresh one. Without the binding that
+   * annotation's variable was solvable by nothing and every `FromJSON` under
+   * it was ambiguous. The variables are ordinary unification variables, not
+   * skolems: this elaborator cannot abstract a `case` alternative over
+   * dictionaries, so a rigid one would have nothing to be rigid against. */
+  private annotatePattern(p: Pattern, type: Type): Type {
+    const signature = p.tag === "wild" || p.tag === "var" ? p.signature : undefined;
+    if (signature === undefined) return type;
+    const vars = this.tyvarScope();
+    const before = new Set(vars.keys());
+    const written = parseSignature(signature, vars);
+    for (const [name, t] of vars) if (!before.has(name)) this.patternTyvars.push([name, t]);
+    if (!unify(type, written.type))
+      this.report(`pattern does not have the ascribed type \`${showType(written.type)}\``, p.span);
+    return type;
+  }
+
   inferPattern(p: Pattern, env: Env): Type {
     switch (p.tag) {
       case "wild":
-        return this.recordBinder(p, freshVar());
+        return this.annotatePattern(p, this.recordBinder(p, freshVar()));
       case "var": {
-        const t = this.recordBinder(p, freshVar());
+        const t = this.annotatePattern(p, this.recordBinder(p, freshVar()));
         env.set(p.name, { tag: "mono", type: t });
         return t;
       }
@@ -1000,7 +1039,7 @@ class Elaborator {
         // One variable map for the whole chain, so `@f @f` names one variable,
         // and seeded with the enclosing instance's skolems so `@f` inside
         // `instance (C f, C g) => C (f :+: g)` is *that* `f`.
-        const vars = new Map(this.current?.tyvars ?? []);
+        const vars = this.tyvarScope();
         const types = written.map((t) => parseType(t, vars));
         // Anything but a plain name - a constructor is instantiated here too,
         // since `this.constructors` schemes quantify in declaration order -
@@ -1010,7 +1049,7 @@ class Elaborator {
         return this.inferVar(head, env, types);
       }
       case "annot": {
-        const written = parseSignature(e.type, new Map(this.current?.tyvars ?? []));
+        const written = parseSignature(e.type, this.tyvarScope());
         const t = this.infer(e.expr, env);
         if (!unify(t, written.type))
           this.report(`expression does not have the ascribed type \`${showType(written.type)}\``, e.span);
@@ -1129,22 +1168,51 @@ class Elaborator {
   private inferLocals(bindings: readonly LocalBinding[], env: Env): Env {
     if (bindings.length === 0) return env;
     const inner = new Map(env);
-    // Only these entries can hold a free type variable: a `poly` scheme has
-    // had its own quantified over. A variable one of them mentions belongs to
-    // something still being inferred, so it is not this group's to generalise.
+    // Variables an already-generalised *member* of this `where` kept.
     const monomorphic = new Set<TVar>();
-    for (const entry of env.values())
-      if (entry.tag === "mono" || entry.tag === "group") for (const v of typeVars(entry.type)) monomorphic.add(v);
-    const types = new Map<LocalBinding, Type>();
+    /** Variables belonging to something outside this `where`, which is
+     * therefore still being inferred and not this group's to generalise.
+     *
+     * Recomputed at each generalisation rather than snapshotted once, because
+     * a variable in the enclosing scope gets *refined* while the group's
+     * bodies are inferred: `kidsViews <- foldM ...` enters the scope as a bare
+     * `t`, and only `reverse kidsViews` makes it `[a]`. A snapshot holds `t`
+     * and says nothing about `a`, so `let ordered = reverse kidsViews` was
+     * generalised over the element type and every use of `ordered` got its
+     * own - which is how miso's `setField` ended up wanted at a variable
+     * nothing could ever solve. Only `mono`/`group` entries can hold a free
+     * variable at all; a `poly` scheme has had its own quantified over. */
+    const outerVars = (): Set<TVar> => {
+      const out = new Set<TVar>();
+      for (const entry of env.values())
+        if (entry.tag === "mono" || entry.tag === "group") for (const v of typeVars(entry.type)) out.add(v);
+      return out;
+    };
+    // One entry per *name*, not per clause: the parser emits a `LocalBinding`
+    // per equation, and the equations of one function share a single type.
+    // Inferring them separately left every clause but the last with a type
+    // nothing constrained - which is why `withMaybe Nothing = pure jsNull`
+    // reported an ambiguous `Applicative` while the `Just` clause pinned `IO`.
+    const clauses = new Map<string, LocalBinding[]>();
+    for (const b of bindings) {
+      const list = clauses.get(b.name);
+      if (list) list.push(b);
+      else clauses.set(b.name, [b]);
+    }
+    const names = [...clauses.keys()];
+    const types = new Map<string, Type>();
     const groups = dependencyGroups(
-      bindings.map((b) => b.name),
-      bindings.map((b) => referencedNames(localAsDeclaration(b))),
+      names,
+      names.map((n) => new Set(clauses.get(n)!.flatMap((b) => [...referencedNames(localAsDeclaration(b))]))),
     );
     for (const group of groups) {
-      const members = group.map((i) => bindings[i]!);
-      for (const b of members) {
+      const members = group.map((i) => clauses.get(names[i]!)!);
+      for (const clause of members) {
+        // A `name :: type` line and the equations it governs are separate
+        // `LocalBinding`s, so the signature can sit on any clause of the group.
+        const b = clause.find((c) => c.signature !== undefined) ?? clause[0]!;
         const t = freshVar();
-        types.set(b, t);
+        types.set(b.name, t);
         inner.set(b.name, { tag: "mono", type: t });
         // A local signature is *checked*, not skolemised: a rigid variable
         // would need the binding to abstract over dictionaries, which a
@@ -1155,15 +1223,15 @@ class Elaborator {
         // A signature with a context is ignored: honouring it would promise
         // dictionaries nothing binds.
         if (b.signature === undefined) continue;
-        const written = parseSignature(b.signature, new Map(this.current?.tyvars ?? []));
+        const written = parseSignature(b.signature, this.tyvarScope());
         if (written.context.length) continue;
         if (!unify(t, written.type))
           this.report(`\`${b.name}\` does not have its declared type \`${showType(written.type)}\``, b.span);
       }
-      for (const binding of members)
+      for (const binding of members.flat())
         this.scoped(() => {
           const scope = new Map(inner);
-          let result = types.get(binding)!;
+          let result = types.get(binding.name)!;
           for (const pattern of binding.patterns) {
             const argType = this.inferPattern(pattern, scope);
             const next = freshVar();
@@ -1173,12 +1241,18 @@ class Elaborator {
           this.inferGuards(binding.guards ?? [{ body: binding.value }], binding.whereBindings ?? [], result, scope, binding.span);
         });
       const constrained = new Set<TVar>();
-      for (const use of this.current?.uses ?? [])
-        if (use.kind === "apply")
-          for (const c of use.constraints) for (const t of c.types) for (const v of typeVars(t)) constrained.add(v);
-      for (const b of members) {
-        const type = types.get(b)!;
-        const gens = typeVars(type).filter((v) => !monomorphic.has(v) && !constrained.has(v));
+      // A *literal*'s class counts too. `maxAttempts = 20` wants `Num a` and
+      // nothing else, and generalising over `a` gave `attempts < maxAttempts`
+      // and `show maxAttempts` each their own copy - so the `Show` had no type
+      // to be solved at. This is the monomorphism restriction, arrived at from
+      // the same direction as every other constraint here.
+      for (const c of wantedOf(this.current?.uses ?? []))
+        for (const t of c.types) for (const v of typeVars(t)) constrained.add(v);
+      const outer = outerVars();
+      for (const clause of members) {
+        const b = clause[0]!;
+        const type = types.get(b.name)!;
+        const gens = typeVars(type).filter((v) => !monomorphic.has(v) && !outer.has(v) && !constrained.has(v));
         if (gens.length) inner.set(b.name, { tag: "poly", scheme: quantify(gens, type, []), emit: b.name });
         // What stayed monomorphic is monomorphic for every later group too.
         for (const v of typeVars(type)) if (!gens.includes(v)) monomorphic.add(v);
@@ -1245,9 +1319,7 @@ class Elaborator {
 
   /** Every constraint the binding still owes, in occurrence order. */
   private wanted(binding: Binding): Constraint[] {
-    return binding.uses.flatMap((use) =>
-      use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : [],
-    );
+    return wantedOf(binding.uses);
   }
 
   /** Functional-dependency improvement, GHC's `GHC/Tc/Instance/FunDeps.hs`.
@@ -1543,6 +1615,9 @@ class Elaborator {
   /** The dictionaries a use needs, in the order its callee expects them. */
   dictionariesFor(use: Use, binding: Binding): Expr[] {
     const span = spanOf(use.node);
+    // Selection runs after inference, so `current` is long cleared; without
+    // this every unsolved use-site constraint reported with no binding named.
+    this.where = binding.name;
     // A dictionary unpacked by an enclosing constructor pattern comes first: it
     // is the more local given, and for an existential type it is the only one.
     const givens = use.locals ? [...use.locals, ...binding.givens] : binding.givens;
@@ -2247,6 +2322,9 @@ export function elaborateProgram(
     signature?: { context: Constraint[]; type: Type },
     declared?: { context: Constraint[]; type: Type },
     tyvars: ReadonlyMap<string, Type> = new Map(),
+    /** The signature's variables in the order they were *written* - see
+     * `schemeVars`. */
+    declaredOrder: ReadonlyMap<string, Type> = new Map(),
   ): void => {
     // `do`, records and record patterns are expanded here, at the one point
     // every value - top level, instance method and class default - passes.
@@ -2255,13 +2333,7 @@ export function elaborateProgram(
       name,
       decl,
       signature,
-      declaredScheme: declared
-        ? quantify(
-            [...typeVars(declared.type), ...declared.context.flatMap((c) => c.types.flatMap((t) => typeVars(t)))],
-            declared.type,
-            declared.context,
-          )
-        : undefined,
+      declaredScheme: declared ? quantify(schemeVars(declaredOrder, declared), declared.type, declared.context) : undefined,
       tyvars,
       givens: [],
       patternGivens: [],
@@ -2285,12 +2357,14 @@ export function elaborateProgram(
     // its `KnownSymbol p` given is about. Without it the annotation invented a
     // fresh variable and the given matched nothing.
     const named = new Map<string, Type>();
+    const order = new Map<string, Type>();
     addBinding(
       decl.name,
       decl,
       signature ? skolemise(parseSignature(signature, named)) : undefined,
-      signature ? parseSignature(signature, new Map()) : undefined,
+      signature ? parseSignature(signature, order) : undefined,
       skolemNames(named),
+      order,
     );
   }
   for (const decl of declarations) {
@@ -2635,6 +2709,36 @@ function skolemise(signature: { context: Constraint[]; type: Type }): { context:
 /** The same substitution `skolemise` performs, read off by name. Both spell a
  * skolem `%${v.id}`, so a scope's variables and the signature they were parsed
  * with stay the same types without threading a substitution through. */
+/** The variables a written signature quantifies, in the order a `@T` counts
+ * positions in.
+ *
+ * `parseSignature` fills its map as it reads - the context first, then the
+ * body - which is exactly GHC's left-to-right implicit `forall`. Taking that
+ * order also *de-duplicates*, and that is the real fix: the list used to be
+ * `typeVars(type) ++ contextVars`, so `f :: Eq c => Box c p -> r` listed `c`
+ * twice. `quantify` indexes by the last occurrence, so `c` became gen 2, `p`
+ * gen 1 and gen 0 was unreachable - and `f @Int` therefore bound *nothing*,
+ * leaving `Eq c` on an unsolved variable. Every `unmountComponent @context` in
+ * miso's runtime failed that way. */
+function schemeVars(order: ReadonlyMap<string, Type>, declared: { context: Constraint[]; type: Type }): TVar[] {
+  const out: TVar[] = [];
+  const add = (v: TVar): void => { if (!out.includes(v)) out.push(v); };
+  for (const t of order.values()) { const p = prune(t); if (p.tag === "var") add(p.v); }
+  // A synonym expanded inside the body can contribute a variable the map never
+  // saw, so the written order is a prefix, not the whole list.
+  for (const v of typeVars(declared.type)) add(v);
+  for (const c of declared.context) for (const t of c.types) for (const v of typeVars(t)) add(v);
+  return out;
+}
+
+/** The constraints a set of uses owes, in occurrence order. A literal owes one
+ * too - `20` owes `Num a` - which is why this is not just `use.constraints`. */
+function wantedOf(uses: readonly Use[]): Constraint[] {
+  return uses.flatMap((use) =>
+    use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : [],
+  );
+}
+
 function skolemNames(vars: ReadonlyMap<string, Type>): Map<string, Type> {
   const out = new Map<string, Type>();
   for (const [name, t] of vars) {
@@ -2847,6 +2951,8 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
   // method is handed - is this binding applied to its own parameters.
   const self = applyAll(variable(dictValue(instance.cls, instance.emitCon), instance.span), args);
   const at = new Map<TVar, Type>(info.variables.map((v, i) => [v, instance.targets[i] ?? varType(v)]));
+  const head = `instance ${showConstraint(instance.cls, instance.targets)}`;
+  elaborator.where = `${head}, superclass`;
   const supers = info.superclasses.map(
     (parent) =>
       elaborator.resolve(parent.cls, parent.types.map((t) => applySubst(t, at)), instance.params, instance.span) ??
@@ -2872,6 +2978,7 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
     // the class variables keeps `Generic a rep` and `GToJSON rep` sharing one
     // `rep` within this instance while giving each instance its own.
     const fresh = new Map(at);
+    elaborator.where = `${head}, default ${method.name}`;
     const extra = (method.defaultContext ?? []).map((c) => {
       const at_ = c.types.map((t) => freshen(t, fresh));
       elaborator.improveOne({ cls: c.cls, types: at_ }, instance.params, instance.span);
@@ -2879,6 +2986,7 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
     });
     return applyAll(variable(defaultImpl(instance.cls, method.name), instance.span), [self, ...extra]);
   });
+  elaborator.where = undefined;
   return valueDecl(
     dictValue(instance.cls, instance.emitCon),
     instance.params.map((p): Pattern => ({ tag: "var", name: p.name, span: instance.span })),

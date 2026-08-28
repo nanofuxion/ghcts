@@ -2092,8 +2092,15 @@ class Parser {
     if (token.text === "(") {
       if (this.accept(")"))
         return { tag: "con", name: "()", args: [], span: token.span };
-      const left = this.pattern();
-      if (this.acceptTypeSignature()) this.typeAnnotation();
+      let left = this.pattern();
+      // `(comp_ :: Component context props model action)` is not decoration:
+      // the variables it writes scope over the body, and a later
+      // `fromJSON m :: Result model` names *that* `model`. Kept for `wild` and
+      // `var`, the two shapes a signature can usefully bind through.
+      if (this.acceptTypeSignature()) {
+        const annotation = this.typeAnnotation();
+        if (left.tag === "wild" || left.tag === "var") left = { ...left, signature: annotation };
+      }
       if (
         this.current().kind === "ident" &&
         this.current().text.endsWith(".") &&
