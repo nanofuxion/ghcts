@@ -158,18 +158,23 @@ const nativeBigInt = (js) => js.match(/\bBigInt\b|(?<![\w$.])\d[\d_]*n\b/);
  * only way to observe an `IO ()`: its value carries nothing, so the proof that
  * it ran has to come from the effect it had. Property order in the object
  * literal is what sequences the two. */
-function run(emitted, symbol, probe, threaded, wrapped) {
+function run(emitted, symbol, probe, threaded, wrapped, bundled) {
   const enter = threaded
     ? `h$runThreaded(${symbol})`
     : wrapped
       ? `h$runWrapped(${symbol})`
       : `h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; })`;
-  // Indirect eval so the RTS's top-level `var h$...` land on globalThis.
-  const entry = (0, eval)(
-    `${rts}\n${bootstrap}\n${emitted}\n(function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
-      ` return { value: ${enter}, probed: ${probe ?? "undefined"},` +
-      ` force: h$forceClosure }; })`,
-  );
+  const body =
+    `${rts}\n${bootstrap}\n${emitted}\n;var h$testEntry = (function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
+    ` return { value: ${enter}, probed: ${probe ?? "undefined"},` +
+    ` force: h$forceClosure }; });`;
+  // Indirect eval so the RTS's top-level `var h$...` land on globalThis - which
+  // is what a plain script gets. `bundled` puts the whole thing in a function
+  // scope instead, which is what every bundler does to a linked all.js: rspeedy
+  // and webpack wrap each module, so an RTS symbol reached through
+  // `globalThis['h$...']` rather than by name reads back `undefined` there and
+  // nowhere else. That divergence is invisible under a plain eval.
+  const entry = (0, eval)(bundled ? `(function(){ ${body} return h$testEntry; })()` : `${body} h$testEntry`);
   const { value, probed, force } = entry();
   if (probe !== undefined) return probed;
   // `Int`, `Char` and `Bool` arrive as plain JS values: the backend unboxes a
@@ -1003,6 +1008,47 @@ const programs = [
     ].join("\n"),
     probe: "globalThis.$hsCb",
     expect: 77,
+  },
+  {
+    // The same proof for a *synchronous* callback, run in a function scope.
+    //
+    // A sync callback is the one place a program reaches back into the RTS by
+    // name from a foreign import - `h$runSync` is what runs the action to
+    // completion before the JavaScript function returns. Reaching it as
+    // `globalThis['h$runSync']` works in a script and nowhere else: rspeedy,
+    // webpack and `bun build` each wrap a linked all.js in a module, at which
+    // point every `var h$...` is function-scoped and the lookup is `undefined`.
+    // On the device that was `TypeError: not a function`, once per delivered
+    // message, with no other diagnostic. `bundled` reproduces the wrapping, so
+    // this case fails on a globalThis lookup and passes on a lexical one.
+    name: "syncCallback1 still finds the RTS when the bundle is in a module scope",
+    threaded: true,
+    bundled: true,
+    source: [
+      "module Main where",
+      "import GHC.JS.Prim",
+      "import GHC.JS.Foreign.Callback",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsSync = x; return 0; })" record :: JSValPrim -> IntPrim',
+      'foreign import javascript unsafe "((c) => { c(88); return 0; })" invoke :: CallbackPrim -> IntPrim',
+      "recordIO :: JSVal -> IO ()",
+      "recordIO (JSVal x) = IO (\\s -> recordStep s x)",
+      "recordStep :: RealWorld -> JSValPrim -> IOResult ()",
+      "recordStep s x = case record x of",
+      "  _ -> IOResult s ()",
+      "fire :: Callback a -> IO ()",
+      "fire (Callback c) = IO (\\s -> fireStep s c)",
+      "fireStep :: RealWorld -> CallbackPrim -> IOResult ()",
+      "fireStep s c = case invoke c of",
+      "  _ -> IOResult s ()",
+      "main :: IO ()",
+      "main = do",
+      "  cb <- syncCallback1 ThrowWouldBlock recordIO",
+      "  fire cb",
+      "  pure ()",
+      "",
+    ].join("\n"),
+    probe: "globalThis.$hsSync",
+    expect: 88,
   },
   {
     // `Ord` is defined by mutual defaults - `compare` from `(<=)` and `(<=)`
@@ -3746,7 +3792,7 @@ for (const program of cases) {
     continue;
   }
   try {
-    const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded, compiled.wrapped);
+    const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded, compiled.wrapped, program.bundled);
     if (program.throws !== undefined) {
       console.log(`  FAIL  ${program.name}: expected a \`${program.throws}\` exception, got ${JSON.stringify(result)}`);
       failures++;
