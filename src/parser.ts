@@ -1112,15 +1112,37 @@ class Parser {
     // functional dependencies, and only what precedes it names parameters.
     const bar = afterContext.findIndex((token) => token.text === "|");
     const rest = bar < 0 ? afterContext : afterContext.slice(0, bar);
-    const uppercase = rest.filter(
+    // The class name is the *first* uppercase identifier, not the last: a
+    // kind-annotated parameter such as `class GToFields (f :: Type -> Type)`
+    // puts `Type` after it, and taking the last one named the class `Type`
+    // with no parameters at all.
+    const classIndex = rest.findIndex(
       (token) => token.kind === "ident" && /^[A-Z]/.test(token.text),
     );
-    const name = uppercase.at(-1)?.text ?? "<anonymous class>";
-    const classIndex = rest.findIndex((token) => token.text === name);
-    const parameters = rest
-      .slice(classIndex + 1)
-      .filter((token) => token.kind === "ident" && /^[a-z]/.test(token.text))
-      .map((token) => token.text);
+    const name = classIndex < 0 ? "<anonymous class>" : rest[classIndex]!.text;
+    // Each parameter is one lowercase identifier, but a kind signature adds
+    // more after `::` that name kinds rather than parameters - so within a
+    // parenthesised group only the first identifier is the parameter.
+    const parameters: string[] = [];
+    let depth = 0;
+    let takenInGroup = false;
+    for (const token of rest.slice(classIndex + 1)) {
+      if (token.text === "(") {
+        depth++;
+        takenInGroup = false;
+        continue;
+      }
+      if (token.text === ")") {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (token.kind !== "ident" || !/^[a-z]/.test(token.text)) continue;
+      if (depth > 0) {
+        if (takenInGroup) continue;
+        takenInGroup = true;
+      }
+      parameters.push(token.text);
+    }
     const fundeps =
       bar < 0
         ? []
