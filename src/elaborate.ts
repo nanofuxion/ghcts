@@ -258,6 +258,14 @@ function splitTop(tokens: readonly string[], separator: string): string[][] {
  * Filled once per `elaborateProgram`, like `nextTVar`. */
 let synonyms = new Map<string, { parameters: string[]; target: string }>();
 
+/** Constraints met while expanding a type synonym whose right-hand side has a
+ * context of its own - miso's `type Lens' s a = forall f. Functor f => ...`.
+ * They belong to whatever signature mentioned the synonym, so the expansion
+ * parks them here and `parseSignature` picks them up. Parsing the right-hand
+ * side as one type instead stopped at the `=>` and yielded the *constraint*
+ * as the type, so `toVL :: ... -> Lens' r f` had result type `Functor f`. */
+let expandedContext: Constraint[] = [];
+
 class TypeParser {
   private index = 0;
   constructor(
@@ -354,7 +362,7 @@ class TypeParser {
       this.index++;
       const bound = new Map<string, Type>();
       for (const parameter of synonym.parameters) bound.set(parameter, this.atom());
-      let value = new TypeParser(TypeParser.tokens(synonym.target), bound, this.depth + 1).fun();
+      let value = expandTarget(synonym.target, bound, this.depth + 1);
       // A partially applied synonym is still an application: `type Handler a =
       // a -> ()` used as `Handler Int Extra` keeps consuming arguments.
       while (this.more()) value = tapp(value, this.atom());
@@ -388,6 +396,16 @@ class TypeParser {
       if (this.tokens[this.index] === ")") {
         this.index++;
         return tcon("()");
+      }
+      // `(,)` is the pair *constructor*, the way `[]` is the list one, and
+      // `instance Bifunctor (,)` is how base writes it. Falling through to the
+      // element parser read the comma as a type named `,`, so the instance head
+      // and the `(a, c)` in its own method body were different types.
+      if (this.tokens[this.index] === ",") {
+        let commas = 0;
+        while (this.tokens[this.index] === ",") (commas++, this.index++);
+        if (this.tokens[this.index] === ")") this.index++;
+        return tcon(`(${",".repeat(commas)})`);
       }
       const items = [this.fun()];
       while (this.tokens[this.index] === ",") {
@@ -425,7 +443,7 @@ class TypeParser {
     // position too - `Both Count` has to reach `(Int, Int)`, not `(Count, Count)`.
     const synonym = synonyms.get(token);
     if (synonym && synonym.parameters.length === 0 && this.depth < 16) {
-      return new TypeParser(TypeParser.tokens(synonym.target), new Map(), this.depth + 1).fun();
+      return expandTarget(synonym.target, new Map(), this.depth + 1);
     }
     return tcon(token);
   }
@@ -435,6 +453,20 @@ class TypeParser {
 /** `M.Map` -> `Map`, `Data.Text.Text` -> `Text`. */
 const unqualify = (name: string): string =>
   /^[A-Z][A-Za-z0-9_']*(\.[A-Z][A-Za-z0-9_']*)+$/.test(name) ? name.slice(name.lastIndexOf(".") + 1) : name;
+
+/** A synonym's right-hand side, with any context it carries lifted out to the
+ * signature being parsed. */
+function expandTarget(target: string, bound: Map<string, Type>, depth: number): Type {
+  const parts = splitTop(TypeParser.tokens(target), "=>");
+  for (const part of parts.slice(0, -1)) {
+    const stripped = part[0] === "(" && part.at(-1) === ")" ? part.slice(1, -1) : part;
+    for (const item of splitTop(stripped, ",")) {
+      if (item.length < 2) continue;
+      expandedContext.push({ cls: unqualify(item[0]!), types: new TypeParser(item.slice(1), bound, depth).argList() });
+    }
+  }
+  return new TypeParser(parts.at(-1)!, bound, depth).fun();
+}
 
 function parseSignature(source: string, vars: Map<string, Type>): { context: Constraint[]; type: Type } {
   const tokens = TypeParser.tokens(source);
@@ -448,7 +480,14 @@ function parseSignature(source: string, vars: Map<string, Type>): { context: Con
       context.push({ cls: unqualify(item[0]!), types: new TypeParser(item.slice(1), vars).argList() });
     }
   }
-  return resolveGenericRep(context, new TypeParser(body, vars).fun());
+  // A synonym expanded anywhere in the body contributes its own context; the
+  // save/restore keeps a nested `parseSignature` from stealing it.
+  const outer = expandedContext;
+  expandedContext = [];
+  const type = new TypeParser(body, vars).fun();
+  context.push(...expandedContext);
+  expandedContext = outer;
+  return resolveGenericRep(context, type);
 }
 
 /** `Rep a`, GHC's associated type family, read as the class parameter its
@@ -516,6 +555,8 @@ const parseType = (source: string, vars: Map<string, Type>): Type => parseSignat
 
 interface ClassMethod {
   name: string;
+  /** The name the declaring module wrote, for matching an instance's binder. */
+  surfaceName: string;
   /** The declared signature, with the class variable still free. */
   type: Type;
   /** `$dm<name>`, when the class body supplies a default. */
@@ -920,7 +961,7 @@ class Elaborator {
         const fnType = this.infer(e.fn, env);
         const argType = this.infer(e.arg, env);
         const result = freshVar();
-        if (!unify(fnType, tfun(argType, result))) this.report("type mismatch in application", e.span);
+        if (!unify(fnType, tfun(argType, result))) this.report(`type mismatch in application: \`${showType(fnType)}\` applied to \`${showType(argType)}\``, e.span);
         return result;
       }
       case "lambda": {
@@ -999,7 +1040,8 @@ class Elaborator {
       const inner = new Map(env);
       if (!unify(scrutinee, this.inferPattern(alt.pattern, inner))) this.report("pattern does not match the scrutinee type", span);
       this.inferQualifiers(alt.qualifiers, inner, span);
-      if (!unify(result, this.infer(alt.body, inner))) this.report("case alternatives have different types", span);
+      const body = this.infer(alt.body, inner);
+      if (!unify(result, body)) this.report(`case alternatives have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
     }
   }
 
@@ -1042,7 +1084,13 @@ class Elaborator {
       // guard's qualifiers and its body, and for nothing after it.
       const inner = new Map(scope);
       this.inferQualifiers(guard.qualifiers, inner, span);
-      if (!unify(result, this.infer(guard.body, inner))) this.report("guarded bodies have different types", span);
+      // The two types are in the message on purpose. "different types" alone
+      // says nothing a reader can act on, and every fix in this file's
+      // vicinity - `(,)` read as a type named `,`, a synonym's context handed
+      // back as its type, a `String` pattern pinning a `MisoString` scrutinee -
+      // was found by reading the pair.
+      const body = this.infer(guard.body, inner);
+      if (!unify(result, body)) this.report(`guarded bodies have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
     }
   }
 
@@ -1741,6 +1789,7 @@ export function elaborateProgram(
       const declared = defaultSignatures.get(member.name);
       methods.push({
         name: member.name,
+        surfaceName: member.surfaceName ?? member.name,
         type: deFamily(parseType(member.type, vars)),
         hasDefault: own.has(member.name),
         ...(declared ? { defaultContext: declared.context, defaultType: declared.type } : {}),
@@ -1818,8 +1867,14 @@ export function elaborateProgram(
     // really is a method of *this* class counts, so a top-level binding that
     // happens to share a method's name cannot capture the definition.
     const isMethod = new Set(info.methods.map((m) => m.name));
+    // An instance's method binder is resolved against the *class*, not the
+    // value namespace: `import Miso.String (ToMisoString)` brings in the class
+    // without `toMisoString`, and `instance ToMisoString Value where
+    // toMisoString = ...` is still legal. So when the scope has no answer, the
+    // name the class was declared under is one.
+    const bySurface = new Map(info.methods.map((m) => [m.surfaceName, m.name]));
     for (const value of instanceMethodValues(decl, file)) {
-      const flat = instanceScope?.values.get(value.name);
+      const flat = instanceScope?.values.get(value.name) ?? bySurface.get(value.name);
       const name = flat !== undefined && isMethod.has(flat) ? flat : value.name;
       methods.set(name, instanceScope ? renameValue(value, instanceScope, name, resolved.fields) : { ...value, name });
     }

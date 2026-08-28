@@ -2,47 +2,36 @@
 /**
  * How far is the new pipeline from compiling miso's counter?
  *
- * Resolves the counter against the real references/miso/src, elaborates the
- * whole closure, and histograms what comes back. The point is to work from a
- * current count rather than from memory: this is the list of things standing
- * between ghcts's own codegen and the RTS it already reproduces.
+ * Loads the counter through `loadProgram` - the same entry `build` uses - so
+ * the measurement sees exactly the source roots, the CPP defines and the
+ * reachability closure the real build sees. Anything less measures a program
+ * nobody compiles: reading the roots by hand once undercounted by hundreds,
+ * and dropping the defines made every `#ifdef GHCJS_NEW` in miso's FFI take
+ * its #else branch, so names that do exist looked missing.
  *
  *   node scripts/miso-gap.mjs           # histogram
  *   node scripts/miso-gap.mjs --sample  # with example messages per bucket
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
-import { parseModule } from "../dist/parser.js";
+import { readFileSync } from "node:fs";
+import { loadProgram } from "../dist/build.js";
 import { elaborateProgram } from "../dist/elaborate.js";
 
-const COUNTER = "references/miso-lynx/examples/counter/Main.hs";
-const ROOTS = ["references/miso-lynx/examples/counter", "references/miso/src", "references/miso/ffi/js"];
+const PROJECT = "references/miso-lynx/examples";
+const config = JSON.parse(readFileSync(`${PROJECT}/ghcts.json`, "utf8"));
 
-function walk(dir, out = []) {
-  for (const e of readdirSync(dir)) {
-    const p = join(dir, e);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (p.endsWith(".hs")) out.push(p);
-  }
-  return out;
-}
-
-const modules = new Map();
-for (const root of ROOTS) {
-  for (const file of walk(root)) {
-    const parsed = parseModule(readFileSync(file, "utf8"), relative(".", file));
-    if (parsed.module?.ast) modules.set(parsed.module.ast.name, parsed.module.ast);
-  }
-}
+const { modules, diagnostics } = await loadProgram(PROJECT, config);
 console.log(`${modules.size} modules parsed`);
 
-const result = elaborateProgram(modules, "Main", COUNTER);
-const errors = (result.diagnostics ?? []).filter((d) => d.severity === "error");
+const result = elaborateProgram(modules, config.entry.module, `${PROJECT}/counter/Main.hs`);
+const errors = [...diagnostics, ...(result.diagnostics ?? [])].filter((d) => d.severity === "error");
 console.log(`${errors.length} errors\n`);
 
-/** Bucket by the shape of the message, not its particulars. */
+/** Bucket by the shape of the message, not its particulars. A type-mismatch
+ * message carries the two types it could not unify - which is what makes it
+ * actionable - so the bucket is what comes before the colon. */
 const bucket = (m) =>
-  m.replace(/`[^`]*`/g, "`_`")
+  m.replace(/:.*$/s, "")
+   .replace(/`[^`]*`/g, "`_`")
    .replace(/'[^']*'/g, "'_'")
    .replace(/\b[A-Z][A-Za-z0-9_.]*\b/g, "T")
    .replace(/\d+/g, "N")

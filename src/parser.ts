@@ -38,6 +38,9 @@ const operators: Record<string, { prec: number; assoc: Assoc }> = {
   "<*>": { prec: 3, assoc: "left" },
   "<*": { prec: 3, assoc: "left" },
   "*>": { prec: 3, assoc: "left" },
+  // `infixl 3` in base. Left to the fallback it tied with `.:`, so
+  // `o .: "keyCode" <|> o .: "which"` parsed as `((o .: "keyCode") <|> o) .: "which"`.
+  "<|>": { prec: 2, assoc: "left" },
   "&": { prec: 1, assoc: "left" },
   "||": { prec: 1, assoc: "right" },
   "&&": { prec: 2, assoc: "right" },
@@ -77,12 +80,20 @@ export function parseModule(
   defines: ReadonlySet<string> = new Set(),
 ): { module?: ParsedModule; diagnostics: Diagnostic[] } {
   const result = lex(source, file, defines);
-  const parser = new Parser(
-    applyLayout(result.tokens),
-    file,
-    result.diagnostics,
-  );
-  const ast = parser.module();
+  const tokens = applyLayout(result.tokens);
+  let parser = new Parser(tokens, file, result.diagnostics);
+  let ast = parser.module();
+  // A pattern binding is split into selectors as it is read, so `let C {..} = e`
+  // has to know C's fields *then* - and a `data` declaration below it in the
+  // file has not been read yet (miso's `let ComponentState {..} = ...` is 350
+  // lines above the record). Parse the module again, seeded with the fields the
+  // first pass found, but only when the first pass actually hit that case.
+  if (parser.wildcardBindingUnresolved) {
+    const fields = parser.recordFieldsByCon;
+    result.diagnostics.length = 0;
+    parser = new Parser(tokens, file, result.diagnostics, fields);
+    ast = parser.module();
+  }
   expandTemplateHaskell(ast);
   return {
     module: result.diagnostics.some((d) => d.severity === "error")
@@ -446,10 +457,23 @@ class Parser {
   /** Declarations a single top-level declaration expanded into - the selectors
    * of a pattern binding - drained by the module loop after each one. */
   private readonly queued: Declaration[] = [];
+  /** Record fields per constructor, for the module being parsed. A pattern
+   * *binding* is split into selectors here, before any cross-module resolution
+   * has happened, so `let C {..} = e` can only name what it binds from a
+   * declaration this module has already read. That covers the wildcard
+   * pattern bindings that exist (miso's `let ComponentState {..} = ...` sits
+   * in the module that declares it); a wildcard over an imported constructor
+   * still binds nothing, which is what it did for every constructor before. */
+  readonly recordFieldsByCon = new Map<string, readonly string[]>();
+  /** Set when a `{..}` pattern binding named a constructor this pass had not
+   * read yet, so `parseModule` knows a second pass would bind more. */
+  wildcardBindingUnresolved = false;
   constructor(
     private readonly tokens: Token[],
     private readonly file: string,
     private readonly diagnostics: Diagnostic[],
+    /** Record fields carried over from a first parse of this same module. */
+    private readonly seededFields: ReadonlyMap<string, readonly string[]> = new Map(),
   ) {}
   private current() {
     return this.tokens[this.index] ?? this.tokens[this.tokens.length - 1];
@@ -1028,6 +1052,7 @@ class Parser {
         }
       }
       constructors.push({ name: constructor, arity, fields, fieldTypes });
+      if (fields) this.recordFieldsByCon.set(constructor, fields);
     } while (this.accept("|"));
     // The three GHC deriving strategies build three different instances, so
     // they are kept apart: `stock` (and a strategy-less clause) is the one the
@@ -2350,9 +2375,18 @@ class Parser {
       case "con":
         for (const arg of p.args) this.patternBinders(arg, into);
         return;
-      case "record":
+      case "record": {
         for (const field of p.fields) this.patternBinders(field.pattern, into);
+        // `C {..}` also binds every field the pattern did not write, under the
+        // field's own name.
+        if (p.wildcard) {
+          const written = new Set(p.fields.map((f) => f.name));
+          const known = this.recordFieldsByCon.get(p.name) ?? this.seededFields.get(p.name);
+          if (known === undefined) this.wildcardBindingUnresolved = true;
+          for (const field of known ?? []) if (!written.has(field)) into.push(field);
+        }
         return;
+      }
       default:
         return;
     }

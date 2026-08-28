@@ -102,11 +102,18 @@ class Sugar {
   decl(decl: ValueDeclaration): ValueDeclaration {
     return {
       ...decl,
-      equations: decl.equations.map((equation) => ({
-        patterns: equation.patterns.map((p) => this.pattern(p)),
-        guards: equation.guards.map((g) => this.guard(g)),
-        whereBindings: equation.whereBindings.map((b) => this.local(b)),
-      })),
+      equations: decl.equations.map((equation) => {
+        // The tests gate every guard of the equation, so a literal that does
+        // not match falls through to the next equation rather than to the next
+        // guard - which is what a failed *pattern* match does.
+        const tests: GuardQualifier[] = [];
+        const patterns = equation.patterns.map((p) => this.pattern(this.liftStrings(p, tests)));
+        return {
+          patterns,
+          guards: equation.guards.map((g) => ({ ...this.guard(g), qualifiers: [...tests, ...(this.qualifiers(g.qualifiers) ?? [])] })),
+          whereBindings: equation.whereBindings.map((b) => this.local(b)),
+        };
+      }),
     };
   }
 
@@ -137,13 +144,48 @@ class Sugar {
   }
 
   private alt(a: CaseAlternative): CaseAlternative {
+    const tests: GuardQualifier[] = [];
+    const pattern = this.pattern(this.liftStrings(a.pattern, tests));
     return {
       ...a,
-      pattern: this.pattern(a.pattern),
-      qualifiers: this.qualifiers(a.qualifiers),
+      pattern,
+      qualifiers: [...tests, ...(this.qualifiers(a.qualifiers) ?? [])],
       body: this.expr(a.body),
     };
   }
+
+  /** OverloadedStrings in *pattern* position. GHC reads `"LT"` as an overloaded
+   * literal pattern and desugars it to `x == fromString "LT"`; read as the list
+   * of characters it denotes, the scrutinee is pinned to `String`, which is
+   * wrong wherever the literal is a `MisoString` - miso writes
+   * `withText ... $ \s -> case s of "LT" -> ...` a dozen times.
+   *
+   * Every string sub-pattern becomes a fresh binder plus one guard, so a nested
+   * literal (`Just "ab"`) is handled the same way as a top-level one, and a
+   * failing test falls through to the next equation exactly as a failed match
+   * would. At `String` the test is list equality, which is what it means. */
+  private liftStrings(p: Pattern, into: GuardQualifier[]): Pattern {
+    switch (p.tag) {
+      case "string": {
+        const name = `$str${this.stringTests++}`;
+        into.push({
+          tag: "bool",
+          condition: apply2("==", variable(name, p.span), { tag: "app", fn: variable("fromString", p.span), arg: { tag: "string", value: p.value, span: p.span }, span: p.span }, p.span),
+        });
+        return { tag: "var", name, span: p.span };
+      }
+      case "as":
+        return { ...p, pattern: this.liftStrings(p.pattern, into) };
+      case "con":
+        return { ...p, args: p.args.map((arg) => this.liftStrings(arg, into)) };
+      case "record":
+        return { ...p, fields: p.fields.map((f) => ({ ...f, pattern: this.liftStrings(f.pattern, into) })) };
+      default:
+        return p;
+    }
+  }
+
+  private stringTests = 0;
 
   /** `Con { a = p }` and `Con {..}` become the ordinary positional pattern;
    * a wildcard binds each unmentioned field to a variable of its own name,

@@ -2612,6 +2612,244 @@ const programs = [
     // 10 + (10+20+30) + (9+7+5+3+1) + 0 + (1+2)
     expect: 98,
   },
+  {
+    // The reader instances for `(->) r`. `Miso.Lens`'s `preview`, `preuse` and
+    // `(^?)` are all `asks . preview`, which instantiates the inner call at
+    // `m ~ (->) r`; without `Functor`/`Applicative`/`Monad`/`MonadReader` for
+    // the function type every one of them was an unsolved wanted.
+    name: "(->) r is a Functor, an Applicative, a Monad and a MonadReader",
+    source: [
+      "module Main where",
+      "import Control.Monad.Reader (ask, asks)",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ fmap (+ 1) (* 2) 5",
+      "  , ((+) <$> (* 3) <*> (+ 10)) 1",
+      "  , ((* 2) >>= (\\d r -> d + r)) 4",
+      "  , ask 7",
+      "  , asks (+ 1) 100",
+      "  ])",
+      "",
+    ].join("\n"),
+    // 11 + (3 + 11) + (8 + 4) + 7 + 101
+    expect: 145,
+  },
+  {
+    // `type Lens' s a = forall f. Functor f => ...`: expanding the synonym
+    // stopped at the `=>` and handed back the *constraint* as the type, so
+    // `Miso.Lens.toVL`'s result was `Functor f`. The context belongs to
+    // whatever signature mentioned the synonym.
+    name: "a type synonym whose body carries a forall and a context",
+    source: [
+      "module Main where",
+      "import Data.Kind (Type)",
+      "import Data.Functor.Identity (Identity(..), runIdentity)",
+      "",
+      "type Lens' s a = forall (f :: Type -> Type). Functor f => (a -> f a) -> s -> f s",
+      "",
+      "_fst :: Lens' (Int, Int) Int",
+      "_fst f (a, b) = fmap (\\a' -> (a', b)) (f a)",
+      "",
+      "main :: IO Int",
+      "main = pure (fst (runIdentity (_fst (\\x -> Identity (x + 1)) (7, 9))))",
+      "",
+    ].join("\n"),
+    expect: 8,
+  },
+  {
+    // `(,)` is the pair *constructor*, the way `[]` is the list one. Read as an
+    // ordinary parenthesised type it became a type named `,`, so the head of
+    // base's `instance Bifunctor (,)` and the `(a, c)` in its own method body
+    // were two different types.
+    name: "(,) names the pair type constructor in an instance head",
+    source: [
+      "module Main where",
+      "import Data.Bifunctor (bimap, first, second)",
+      "main :: IO Int",
+      "main = pure (fst (bimap (+ 1) (* 2) (3, 4)) + snd (bimap (+ 1) (* 2) (3, 4))",
+      "  + fst (first (+ 5) (1, 2)) + snd (second (* 3) (1, 2)))",
+      "",
+    ].join("\n"),
+    // (4 + 8) + 6 + 6
+    expect: 24,
+  },
+  {
+    // A pattern binding is split into one selector per name it binds, and for
+    // `C {..}` those names come from C's declaration - which may sit *below*
+    // the binding in the file, as miso's `data ComponentState` does. Reading
+    // the fields only from what had been parsed so far bound nothing, and every
+    // use fell through to the top-level selector of the same name.
+    name: "RecordWildCards in a pattern binding, record declared later",
+    source: [
+      "{-# LANGUAGE RecordWildCards #-}",
+      "module Main where",
+      "use :: R -> Int",
+      "use r = go",
+      "  where",
+      "    R {..} = r",
+      "    go = _f _a",
+      "",
+      "data R = R { _a :: Int, _f :: Int -> Int }",
+      "",
+      "main :: IO Int",
+      "main = pure (use (R 20 (+ 2)))",
+      "",
+    ].join("\n"),
+    expect: 22,
+  },
+  {
+    // `Data.JSString` is the text-shaped API: `concatMap` walks the characters
+    // of a JSString, as `Data.Text.concatMap` does. Typed over a list instead,
+    // every caller inferred a `String` argument.
+    name: "Data.JSString.concatMap walks a JSString, not a list",
+    source: [
+      "module Main where",
+      "import qualified Data.JSString as J",
+      "main :: IO Int",
+      "main = pure (J.length (J.concatMap (\\c -> if c == 'a' then J.pack \"xy\" else J.singleton c) (J.pack \"banana\")))",
+      "",
+    ].join("\n"),
+    // b a n a n a -> b xy n xy n xy
+    expect: 9,
+  },
+  {
+    // OverloadedStrings in *pattern* position: GHC reads `"LT"` as an
+    // overloaded literal and desugars it to `x == fromString "LT"`. Expanded
+    // into the list of characters it denotes, the scrutinee was pinned to
+    // `String`, so every `case s of "LT" -> ...` over a `MisoString` - miso
+    // writes a dozen - was a type error. A `String` scrutinee still works, and
+    // a nested literal is lifted the same way as a top-level one.
+    name: "a string literal pattern matches a MisoString, not only a String",
+    source: [
+      "module Main where",
+      "import qualified Data.JSString as J",
+      "",
+      "classify :: J.JSString -> Int",
+      "classify \"LT\" = 1",
+      "classify \"GT\" = 2",
+      "classify _    = 3",
+      "",
+      "nested :: Maybe J.JSString -> Int",
+      "nested (Just \"ab\") = 10",
+      "nested _           = 20",
+      "",
+      "main :: IO Int",
+      "main = pure (classify (J.pack \"GT\") + nested (Just (J.pack \"ab\")) + classify (J.pack \"zz\")",
+      "  + (case J.pack \"LT\" of { \"LT\" -> 100; _ -> 0 })",
+      "  + (case \"hi\" of { \"ho\" -> 0; \"hi\" -> 1000; _ -> 1 }))",
+      "",
+    ].join("\n"),
+    // 2 + 10 + 3 + 100 + 1000
+    expect: 1115,
+  },
+  {
+    // An instance's method binder is resolved against the *class*, not the
+    // value namespace: `import Miso.String (ToMisoString)` brings in the class
+    // without `toMisoString`, and the instance below is still legal Haskell.
+    // Read as an ordinary binding the name was unknown, so the instance came
+    // out with no method at all. `r@R { .. }` is the second half: `@` is an
+    // as-pattern, and reading it as the operator being defined made
+    // `fmap f r@R { body = b } = ...` a definition of `@`.
+    name: "an instance binds a method it did not import, through an as-pattern",
+    sources: {
+      Lib: [
+        "module Lib (Boxed(..), Widen) where",
+        "class Widen a where",
+        "  widen :: a -> Int",
+        "data Boxed a = Boxed { tag :: Int, body :: a }",
+        "",
+      ].join("\n"),
+      Instances: [
+        // The class is imported by name only, so `widen` is *not* in scope here.
+        "module Instances () where",
+        "import Lib (Boxed(..), Widen)",
+        "",
+        "instance Widen (Boxed Int) where",
+        "  widen b@Boxed { body = x } = tag b + x",
+        "",
+        "instance Functor Boxed where",
+        "  fmap f r@Boxed { body } = r { body = f body }",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Lib (Boxed(..), Widen(..))",
+        "import Instances ()",
+        "",
+        "main :: IO Int",
+        "main = pure (widen (fmap (+ 1) (Boxed 10 31)))",
+        "",
+      ].join("\n"),
+    },
+    expect: 42,
+  },
+  {
+    // `<|>` is `infixl 3` in base. Left to the parser's fallback fixity it tied
+    // with `.:`, so miso's `o .: "keyCode" <|> o .: "which"` associated as
+    // `((o .: "keyCode") <|> o) .: "which"`.
+    name: "<|> binds looser than an undeclared operator",
+    source: [
+      "module Main where",
+      "import Control.Applicative ((<|>))",
+      "",
+      "(.!) :: [(Int, Int)] -> Int -> Maybe Int",
+      "kvs .! k = lookup k kvs",
+      "",
+      "main :: IO Int",
+      "main = pure (maybe 0 id (table .! 9 <|> table .! 2 <|> table .! 1))",
+      "  where table = [(1, 100), (2, 42)]",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // `properFraction` splits into the integer part towards zero and the signed
+    // remainder; miso's `ToMisoString Value` prints a whole `Number` as an
+    // `Int` by pattern-matching `(i, 0.0) <- properFraction n`.
+    name: "properFraction keeps the sign of the remainder",
+    source: [
+      "module Main where",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ case properFraction (3.75 :: Double) of (i, f) -> i * 10 + round (f * 100)",
+      "  , case properFraction (negate 3.75 :: Double) of (i, f) -> i * 10 + round (f * 100)",
+      "  , case properFraction (7.0 :: Double) of (i, f) -> if f == 0.0 then i else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    // (30 + 75) + (-30 + -75) + 7
+    expect: 7,
+  },
+  {
+    // Two names GHCJS has that this library did not. `mkJSException` wraps a
+    // rejected promise's value - miso's `await` throws its result - and with no
+    // `Exception` class here the throwable shape is `SomeException`, which is
+    // already the JavaScript value that was thrown. `GHC.Fingerprint`'s
+    // `Fingerprint` is this compiler's `StaticKey`: the same 128 bits under a
+    // different field split, and the same 32-hex-digit `Show` as GHC's.
+    name: "mkJSException builds a SomeException, and Fingerprint is StaticKey",
+    source: [
+      "module Main where",
+      "import GHC.JS.Prim (jsNull, mkJSException)",
+      "import GHC.Fingerprint (Fingerprint)",
+      "import GHC.StaticPtr (StaticKey(StaticKey))",
+      "import Control.Exception (SomeException)",
+      "",
+      "wrapped :: SomeException -> Int",
+      "wrapped _ = 1",
+      "",
+      "same :: Fingerprint -> StaticKey",
+      "same k = k",
+      "",
+      "main :: IO Int",
+      "main = do",
+      "  e <- mkJSException jsNull",
+      "  pure (wrapped e + length (show (same (StaticKey 1 2 3 4))) + length (show e))",
+      "",
+    ].join("\n"),
+    // 1 + 32 hex digits + `null`
+    expect: 37,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

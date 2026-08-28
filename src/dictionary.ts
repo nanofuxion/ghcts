@@ -68,7 +68,10 @@ export function selectInstance(table: DictionaryTable, className: string, target
   return matches.length === 1 ? { instance: matches[0].instance, className, target: expected, substitutions: matches[0].substitutions } : undefined;
 }
 
-function symbolic(token: string | undefined): boolean { return !!token && /^[!#$%&*+./<=>?@\\^|~:-]+$/.test(token) && !['=', '::', '=>', '->'].includes(token); }
+// `@` is not an operator on an equation's left-hand side, it is an as-pattern:
+// `fmap f r@R { body = b } = ...` was read as a definition of `@`, so the
+// instance had no `fmap` at all. No Haskell operator can be named `@` or `..`.
+function symbolic(token: string | undefined): boolean { return !!token && /^[!#$%&*+./<=>?@\\^|~:-]+$/.test(token) && !['=', '::', '=>', '->', '@', '..'].includes(token); }
 
 /** Class bodies chiefly carry signatures, while preserving type-family lines
  * separately.  This keeps method identity stable before constraints and

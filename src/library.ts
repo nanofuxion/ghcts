@@ -931,8 +931,12 @@ replicate (I n) (JSString s) = JSString (jsStringReplicate n s)
 concat :: [JSString] -> JSString
 concat xs = foldlList append empty xs
 
-concatMap :: (a -> JSString) -> [a] -> JSString
-concatMap f xs = concat (mapList f xs)
+-- \\\`Data.JSString\\\` is the text-shaped API, not the list one: this maps over the
+-- *characters of a JSString*, as \\\`Data.Text.concatMap\\\` does. Typing it over a
+-- list instead made every caller - \\\`Miso.Types.htmlEncode\\\`,
+-- \\\`Miso.JSON.escapeJSONString\\\` - infer a \\\`String\\\` argument.
+concatMap :: (Char -> JSString) -> JSString -> JSString
+concatMap f s = concat (mapList f (unpack s))
 
 intercalate :: JSString -> [JSString] -> JSString
 intercalate sep xs = case xs of
@@ -956,7 +960,7 @@ lines :: JSString -> [JSString]
 lines s = splitOn (pack "\\n") s
 
 unlines :: [JSString] -> JSString
-unlines xs = concatMap (\\x -> append x (pack "\\n")) xs
+unlines xs = concat (mapList (\\x -> append x (pack "\\n")) xs)
 
 foldl' :: (a -> Char -> a) -> a -> JSString -> a
 foldl' f z s = foldlList f z (unpack s)
@@ -1335,7 +1339,28 @@ class IsStatic p where
 instance IsStatic StaticPtr where
   fromStaticPtr p = p
 `,
+  // GHC's key is `Fingerprint Word64 Word64`; this frontend's is
+  // `StaticKey Int Int Int Int` (src/prelude.ts says why), and they are the
+  // same 128 bits with the same `Show`. Naming it here is what lets miso's
+  // `instance ToJSVal Fingerprint` land on the key the compiler actually makes.
+  // Only the type: a `Fingerprint w1 w2` written against GHC's two `Word64`
+  // halves still fails, loudly, which is the honest answer while there is no
+  // `Word64`.
+  "GHC.Fingerprint": `module GHC.Fingerprint (Fingerprint) where
+
+type Fingerprint = StaticKey
+`,
   "GHC.JS.Prim": `module GHC.JS.Prim where
+import Control.Exception (SomeException(..))
+
+-- GHCJS wraps a rejected promise's value in \\\`JSException\\\`. There is no
+-- \\\`Exception\\\` class here, so the one throwable shape is
+-- \\\`SomeException\\\` - which is already \\\`the JavaScript value that was
+-- thrown\\\`, exactly what a \\\`JSException\\\` carries.
+type JSException = SomeException
+
+mkJSException :: JSVal -> IO JSException
+mkJSException (JSVal v) = pure (SomeException v)
 
 -- GHC's own shape: \\\`data JSVal = JSVal JSVal#\\\`. A raw JavaScript value is not
 -- a heap object, so the box is what makes it storable and passable; every
@@ -1936,6 +1961,12 @@ putStrict s = seq s (put s)
 
 class Monad m => MonadReader r m | m -> r where
   ask :: m r
+
+-- The function reader. mtl ships it, and \\\`Miso.Lens\\\` leans on it: \\\`preview\\\`,
+-- \\\`preuse\\\` and \\\`(^?)\\\` are all written as \\\`asks . preview\\\`, which instantiates
+-- the inner \\\`preview\\\` at \\\`m ~ (->) r\\\`.
+instance MonadReader r ((->) r) where
+  ask = \\r -> r
 
 asks :: MonadReader r m => (r -> a) -> m a
 asks f = ask >>= (\\r -> pure (f r))

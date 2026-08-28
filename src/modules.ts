@@ -375,7 +375,7 @@ export function renameDeclarations(
         context: decl.context.map(ty),
         associatedTypes: decl.associatedTypes.map(assoc),
         members: decl.members.map((m) =>
-          m.tag === "signature" ? { ...m, name: flatOf(m.name), type: ty(m.type) } : m,
+          m.tag === "signature" ? { ...m, name: flatOf(m.name), surfaceName: m.name, type: ty(m.type) } : m,
         ),
       };
     if (decl.tag === "instance")

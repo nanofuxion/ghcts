@@ -43,7 +43,7 @@ export interface ForeignDeclaration { tag: 'foreign'; name: string; javascript: 
 /** `isDefault` marks GHC's DefaultSignatures form, `default f :: ty` in a class
  * body: the type of the class's *default implementation* of `f`, which may be
  * more constrained than `f`'s own. */
-export interface SignatureDeclaration { tag: 'signature'; name: string; type: string; isDefault?: true; span: Span; }
+export interface SignatureDeclaration { tag: 'signature'; name: string; /** The name as the declaring module wrote it. An instance may bind a class method it has not imported - the method binder of an instance is resolved against the class, not the value namespace - so the instance's written name has to be matchable against this. */ surfaceName?: string; type: string; isDefault?: true; span: Span; }
 export interface TypeAliasDeclaration { tag: 'typeAlias'; name: string; parameters: string[]; target: string; /** Empty only to keep declaration visitors exhaustive until Core gains aliases. */ equations: []; span: Span; }
 /** Class/instance headers and members are preserved instead of being skipped.
  * Dictionary construction is a later typed-Core phase, but interface and

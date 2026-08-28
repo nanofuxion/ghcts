@@ -491,6 +491,19 @@ instance Foldable Maybe where
 instance Semigroup a => Semigroup (Maybe a) where
   (<>) a b = maybeAppend (<>) a b
 
+-- The reader instances. \`(->) r\` is a functor in its result, so \`fmap\` is
+-- composition and \`<*>\` is the S combinator; miso's lens code and
+-- \`Miso.Runtime\` both go through them.
+instance Functor ((->) r) where
+  fmap f g = \\x -> f (g x)
+
+instance Applicative ((->) r) where
+  pure x = \\r -> x
+  (<*>) f g = \\r -> f r (g r)
+
+instance Monad ((->) r) where
+  (>>=) m k = \\r -> k (m r) r
+
 instance Functor (Either e) where
   fmap f m = eitherMap f m
 
@@ -800,6 +813,14 @@ roundHalfTieDown n r = if primDoubleEq r (primDoubleNeg 0.5) then evenOr n (prim
 
 evenOr :: IntPrim -> IntPrim -> IntPrim
 evenOr n alternative = if primIntEq (primIntRem n 2) 0 then n else alternative
+
+-- \\\`properFraction x\\\` is \\\`(truncate x, x - fromIntegral (truncate x))\\\`: the
+-- integer part towards zero and the *signed* remainder, so the two add back to
+-- \\\`x\\\` for a negative argument as well.
+properFraction :: (RealFrac a, Num b) => a -> (b, a)
+properFraction x = case fracToDoublePrim x of
+  d -> case primDoubleToInt d of
+    n -> (fromInteger n, fromRational (primDoubleSub d (primIntToDouble n)))
 
 truncate :: (RealFrac a, Num b) => a -> b
 truncate x = case fracToDoublePrim x of
