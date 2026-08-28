@@ -563,6 +563,16 @@ interface ClassMethod {
   surfaceName: string;
   /** The declared signature, with the class variable still free. */
   type: Type;
+  /** The method's *own* context, over and above the class's:
+   * `traverse :: Applicative f => (a -> f b) -> t a -> f (t b)` constrains an
+   * `f` the class knows nothing about. It is not part of the dictionary - the
+   * field holds a function that takes it - so it appears after the class
+   * constraint in the method's scheme, and after the instance context in the
+   * signature synthesised for each instance's implementation. Dropping it (as
+   * this did) left an instance body wanting `Applicative` at a rigid variable
+   * with no given to discharge it, which is why `Traversable` could not be a
+   * class here. */
+  ownContext: Constraint[];
   /** `$dm<name>`, when the class body supplies a default. */
   hasDefault: boolean;
   /** GHC's DefaultSignatures `default f :: ty`: the *extra* constraints the
@@ -1805,10 +1815,16 @@ export function elaborateProgram(
     for (const member of decl.members) {
       if (member.tag !== "signature" || member.isDefault === true) continue;
       const declared = defaultSignatures.get(member.name);
+      const signature = parseSignature(member.type, vars);
       methods.push({
         name: member.name,
         surfaceName: member.surfaceName ?? member.name,
-        type: deFamily(parseType(member.type, vars)),
+        type: deFamily(signature.type),
+        // A constraint already mentioning only the class's own variables is the
+        // class constraint over again, not an extra dictionary parameter.
+        ownContext: signature.context
+          .filter((c) => c.types.some((t) => typeVars(t).some((v) => !variables.includes(v))))
+          .map((c) => ({ cls: c.cls, types: c.types.map(deFamily) })),
         hasDefault: own.has(member.name),
         ...(declared ? { defaultContext: declared.context, defaultType: declared.type } : {}),
       });
@@ -1830,10 +1846,14 @@ export function elaborateProgram(
   // zero at every call site.
   for (const info of elaborator.classes.values()) {
     for (const method of info.methods) {
-      const ordered = [...info.variables, ...typeVars(method.type).filter((v) => !info.variables.includes(v))];
+      const extra = [method.type, ...method.ownContext.flatMap((c) => c.types)].flatMap((t) => typeVars(t));
+      const ordered = [...info.variables, ...extra.filter((v) => !info.variables.includes(v))];
       env.set(method.name, {
         tag: "poly",
-        scheme: quantify(ordered, method.type, [{ cls: info.name, types: info.variables.map(varType) }]),
+        scheme: quantify(ordered, method.type, [
+          { cls: info.name, types: info.variables.map(varType) },
+          ...method.ownContext,
+        ]),
         emit: method.name,
       });
     }
@@ -2133,8 +2153,15 @@ export function elaborateProgram(
       }
       // The instance context becomes the method's givens, so a method of
       // `instance Eq a => Eq [a]` takes the same `$d0` the dictionary does.
+      const own = method.ownContext.map((c) => ({
+        cls: c.cls,
+        types: c.types.map((t) => substituteVars(t, info.variables, instance.targets)),
+      }));
       const at = skolemise({
-        context: instance.context,
+        // Instance context first, then the method's own: the same order the
+        // call site applies them in, since selecting the field discharges the
+        // class constraint and leaves the method's own to be applied on top.
+        context: [...instance.context, ...own],
         type: substituteVars(method.type, info.variables, instance.targets),
       });
       const implName = methodImpl(instance.cls, instance.emitCon, method.name);
@@ -2158,6 +2185,9 @@ export function elaborateProgram(
           context: [
             { cls: info.name, types: skolems },
             ...(method.defaultContext ?? []).map((c) => ({ cls: c.cls, types: c.types.map(at) })),
+            // Last, because `instanceDeclaration` supplies the two above when
+            // it builds the dictionary and only the call site can supply this.
+            ...method.ownContext.map((c) => ({ cls: c.cls, types: c.types.map(at) })),
           ],
           type: at(method.defaultType ?? method.type),
         }),

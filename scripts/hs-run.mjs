@@ -2923,6 +2923,55 @@ const programs = [
     ].join("\n"),
     expect: 1,
   },
+  {
+    // `Traversable` is a class now: `traverse` carries an `Applicative`
+    // constraint over an `f` the class never mentions, which used to be
+    // dropped on the floor - the instance body was then left wanting
+    // `Applicative` at a rigid variable with no given to discharge it.
+    name: "Traversable is a class whose method carries its own constraint",
+    source: [
+      "module Main where",
+      "import qualified Data.Map as M",
+      "",
+      "data Pair a = Pair a a",
+      "instance Functor Pair where fmap f (Pair a b) = Pair (f a) (f b)",
+      "instance Foldable Pair where foldr f z (Pair a b) = f a (f b z)",
+      "instance Traversable Pair where traverse f (Pair a b) = liftA2 Pair (f a) (f b)",
+      "",
+      "main :: IO Int",
+      "main = do",
+      "  Pair x y <- traverse (\\n -> pure (n * 2)) (Pair 3 4)",
+      "  ns <- traverse (\\n -> pure (n + 1)) [1, 2, 3]",
+      // A `Map` is traversed in key order, and the shape has to survive it.
+      "  m <- traverse (\\n -> pure (n * 10)) (M.fromList [(1, 1), (2, 2), (3, 3)])",
+      "  pure (x + y + sum ns + sum (M.elems m) + M.size m)",
+      "",
+    ].join("\n"),
+    // (6 + 8) + (2 + 3 + 4) + (10 + 20 + 30) + 3
+    expect: 86,
+  },
+  {
+    // `Applicative`, not `Monad`: the effect below has no `>>=` at all, so the
+    // constraint `traverse` carries has to be exactly the one it declared.
+    name: "traverse works under an Applicative that is not a Monad",
+    source: [
+      "module Main where",
+      "",
+      "newtype Count a = Count Int",
+      "instance Functor Count where fmap f (Count n) = Count n",
+      "instance Applicative Count where",
+      "  pure x = Count 0",
+      "  (<*>) (Count a) (Count b) = Count (a + b)",
+      "",
+      "runCount :: Count [Int] -> Int",
+      "runCount (Count n) = n",
+      "",
+      "main :: IO Int",
+      "main = pure (runCount (traverse (\\n -> Count n) [1, 2, 3, 4]))",
+      "",
+    ].join("\n"),
+    expect: 10,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

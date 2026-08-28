@@ -467,6 +467,18 @@ entryKeyLE :: Ord k => k -> (k, a) -> Bool
 entryKeyLE k p = case p of
   (k2, _) -> k2 <= k
 
+-- Rebuilt with the same shape and the same sizes, so no rebalancing is needed;
+-- the effects run in key order, left subtree then value then right, as
+-- containers' own \`traverse\` does.
+traverseMap :: Applicative f => (a -> f b) -> Map k a -> f (Map k b)
+traverseMap f m = case m of
+  Tip -> pure Tip
+  Bin n k x l r -> liftA2 (\\l2 p -> rebuildMap n k l2 p) (traverseMap f l) (liftA2 (\\y r2 -> (y, r2)) (f x) (traverseMap f r))
+
+rebuildMap :: Int -> k -> Map k b -> (b, Map k b) -> Map k b
+rebuildMap n k l2 p = case p of
+  (y, r2) -> Bin n k y l2 r2
+
 instance Ord k => Semigroup (Map k a) where
   (<>) a b = union a b
 
@@ -478,6 +490,9 @@ instance Functor (Map k) where
 
 instance Foldable (Map k) where
   foldr f z m = foldrWithKey (\\_ x acc -> f x acc) z m
+
+instance Traversable (Map k) where
+  traverse f m = traverseMap f m
 
 instance (Eq k, Eq a) => Eq (Map k a) where
   (==) a b = toList a == toList b
@@ -1236,6 +1251,14 @@ data ErrorMessage = ErrorMessage
 
 class KnownSymbol s where
   symbolVal :: proxy s -> String
+`,
+  // OverloadedLabels. `#cccccc` is `fromLabel @"cccccc"`, so the label is a
+  // `KnownSymbol` and nothing else: the class exists to be instantiated at a
+  // result type, and miso instantiates it twice, at `Color` and `MisoString`.
+  "GHC.OverloadedLabels": `module GHC.OverloadedLabels where
+
+class IsLabel x a where
+  fromLabel :: a
 `,
   // GHC.Generics, as far as a compiler with no type families can express it.
   //

@@ -21,10 +21,9 @@
  *     spaces; separate equations of one method are rejoined there, but a body
  *     wanting `case`/`where` still lives in a top-level helper instead.
  *
- * A class method may not carry a constraint of its own: `src/elaborate.ts`
- * reads a method signature with `parseType`, which drops the context. That is
- * why `Foldable` here has no `foldMap`, and why `traverse`/`mapM` are ordinary
- * list functions rather than `Traversable` methods.
+ * `Foldable` here has no `foldMap`: it would need a `Monoid` constraint of its
+ * own, which is now expressible (see `ClassMethod.ownContext`) but would leave
+ * every existing instance without the method the class then requires.
  *
  * `IO` is GHC's `State# RealWorld -> (# State# RealWorld, a #)`, exactly: the
  * token is a void type the backend erases and the result is an unboxed tuple
@@ -215,6 +214,19 @@ class Foldable t where
   foldr :: (a -> b -> b) -> b -> t a -> b
   toList :: t a -> [a]
   toList xs = foldr (\\x ys -> x : ys) [] xs
+
+-- \`traverse\` constrains an \`f\` the class never mentions, which is exactly
+-- what a method's own context is for: the dictionary field holds a function
+-- of the \`Applicative\` dictionary, supplied by the call site rather than by
+-- the instance.
+class Foldable t => Traversable t where
+  traverse :: Applicative f => (a -> f b) -> t a -> f (t b)
+  sequenceA :: Applicative f => t (f a) -> f (t a)
+  mapM :: Monad m => (a -> m b) -> t a -> m (t b)
+  sequence :: Monad m => t (m a) -> m (t a)
+  sequenceA xs = traverse (\\x -> x) xs
+  mapM f xs = traverse f xs
+  sequence xs = traverse (\\x -> x) xs
 
 -- ------------------------------------------------------------- instances ---
 
@@ -463,6 +475,9 @@ instance Alternative [] where
 -- written as a \`do\` block drops a non-matching element rather than raising.
 instance MonadFail [] where
   fail s = []
+
+instance Traversable [] where
+  traverse f xs = traverseList f xs
 
 instance Foldable [] where
   foldr f z xs = foldrList f z xs
@@ -1287,24 +1302,13 @@ sequence_ xs = foldr (\\m k -> m >> k) (pure ()) xs
 traverse_ :: (Foldable t, Monad m) => (a -> m b) -> t a -> m ()
 traverse_ f xs = mapM_ f xs
 
--- \`Traversable\` cannot be a class here (\`traverse\` carries its own
--- \`Applicative\` constraint), so these are the list instances written out.
-mapM :: Monad m => (a -> m b) -> [a] -> m [b]
-mapM f xs = case xs of
+traverseList :: Applicative f => (a -> f b) -> [a] -> f [b]
+traverseList f xs = case xs of
   [] -> pure []
-  (y : ys) -> f y >>= (\\r -> mapM f ys >>= (\\rs -> pure (r : rs)))
+  (y : ys) -> liftA2 (\\r rs -> r : rs) (f y) (traverseList f ys)
 
-traverse :: Monad m => (a -> m b) -> [a] -> m [b]
-traverse f xs = mapM f xs
-
-forM :: Monad m => [a] -> (a -> m b) -> m [b]
+forM :: (Traversable t, Monad m) => t a -> (a -> m b) -> m (t b)
 forM xs f = mapM f xs
-
-sequence :: Monad m => [m a] -> m [a]
-sequence xs = mapM id xs
-
-sequenceA :: Monad m => [m a] -> m [a]
-sequenceA xs = mapM id xs
 
 replicateM :: Monad m => Int -> m a -> m [a]
 replicateM n m = if n <= 0 then pure [] else m >>= (\\x -> replicateM (n - 1) m >>= (\\xs -> pure (x : xs)))
