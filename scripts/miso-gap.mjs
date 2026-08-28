@@ -16,7 +16,7 @@ import { parseModule } from "../dist/parser.js";
 import { elaborateProgram } from "../dist/elaborate.js";
 
 const COUNTER = "references/miso-lynx/examples/counter/Main.hs";
-const ROOTS = ["references/miso-lynx/examples/counter", "references/miso/src"];
+const ROOTS = ["references/miso-lynx/examples/counter", "references/miso/src", "references/miso/ffi/js"];
 
 function walk(dir, out = []) {
   for (const e of readdirSync(dir)) {
