@@ -102,6 +102,15 @@ export function parseModule(
     diagnostics: result.diagnostics,
   };
 }
+/** A token as it should appear in the *source text* of a type kept for
+ * `src/elaborate.ts` to re-lex. Everything is already its own spelling except
+ * a string literal, whose `text` the lexer has decoded: `Path "users"` would
+ * otherwise be handed on as `Path users`, and the lower-case `users` read back
+ * as a type variable rather than the symbol it is. */
+function typeTokenText(token: Token): string {
+  return token.kind === "string" ? JSON.stringify(token.text) : token.text;
+}
+
 function applyNamed(name: string, args: Expr[], span: Span): Expr {
   return args.reduce<Expr>(
     (fn, arg) => ({ tag: "app", fn, arg, span }),
@@ -921,12 +930,20 @@ class Parser {
       // Only lower-case identifiers in the declaration head are ordinary
       // type parameters.  Kind annotations are retained by the lossless
       // token stream for a later kind phase, but do not become parameters.
-      if (
-        headerDepth === 0 &&
-        token.kind === "ident" &&
-        /^[a-z]/.test(token.text)
-      )
-        parameters.push(token.text);
+      //
+      // A *kinded* binder is written parenthesised - `(path :: Symbol)` - and
+      // the variable it binds is as much a parameter as a bare one. Counting
+      // only the bare spelling gave `newtype Path (path :: Symbol)` arity 0,
+      // so `Path "users"` in a signature and the `Path` an instance was
+      // derived for were different types, and the arity showed up as
+      // "guarded bodies have different types" a phase later.
+      const binder =
+        headerDepth === 0
+          ? token
+          : headerDepth === 1 && this.tokens[this.index - 1]?.text === "(" && this.tokens[this.index + 1]?.text === "::"
+            ? token
+            : undefined;
+      if (binder && binder.kind === "ident" && /^[a-z]/.test(binder.text)) parameters.push(binder.text);
       if (token.kind === "symbol" && (token.text === "(" || token.text === "["))
         headerDepth++;
       if (token.kind === "symbol" && (token.text === ")" || token.text === "]"))
@@ -1588,7 +1605,7 @@ class Parser {
           if (this.current().text === open) depth++;
           else if (this.current().text === close) depth--;
           const token = this.take();
-          if (depth) parts.push(token.text);
+          if (depth) parts.push(typeTokenText(token));
         }
         // `@[a]` is a list type; `@(...)` is only grouping, so its brackets
         // are dropped and the list's are kept.
@@ -1596,8 +1613,11 @@ class Parser {
         value = { tag: "typeApp", expr: value, type: text, span: value.span };
         continue;
       }
-      if (this.current().kind === "ident")
-        value = { tag: "typeApp", expr: value, type: this.take().text, span: value.span };
+      // `@"users"` is a type-level string. The lexer hands back its *decoded*
+      // value, so it has to be re-quoted here or the type parser reads it as a
+      // type variable named `users`.
+      if (this.current().kind === "ident" || this.current().kind === "string")
+        value = { tag: "typeApp", expr: value, type: typeTokenText(this.take()), span: value.span };
     }
     return value;
   }
@@ -2250,7 +2270,7 @@ class Parser {
           token.text === "where")
       )
         return parts.join(" ");
-      parts.push(this.take().text);
+      parts.push(typeTokenText(this.take()));
     }
     return parts.join(" ");
   }

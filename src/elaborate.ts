@@ -233,7 +233,11 @@ function quantify(vars: TVar[], type: Type, constraints: Constraint[]): Scheme {
 // A lone `.` is matched only so that `forall a b . t` can be recognised and
 // dropped; the identifier rule already swallows the commoner `forall a b. t`
 // spelling into the token `b.`.
-const TYPE_TOKEN = /->|=>|::|:[!#$%&*+./<=>?@\\^|~:-]+|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]|\./g;
+// A `"..."` alternative comes first so a type-level string literal survives as
+// one token. Without it `Path "users"` tokenised as `Path` `users`, and the
+// lower-case `users` became a fresh type *variable*, so every `Path` literal
+// was the same type and `symbolVal` had nothing to read.
+const TYPE_TOKEN = /"(?:[^"\\]|\\.)*"|->|=>|::|:[!#$%&*+./<=>?@\\^|~:-]+|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]|\./g;
 
 /** A type constructor written infix. `::` is a kind ascription, not one. */
 const isTypeOperator = (token: string | undefined): boolean => token !== undefined && token !== "::" && /^:/.test(token);
@@ -1258,6 +1262,20 @@ class Elaborator {
     // Likewise `DoublePrim`: a fractional literal at the machine type stays a
     // raw `LitDouble`, so there is no `Fractional` dictionary to name.
     if (con === "DoublePrim" && cls === "Fractional") return undefined;
+    // `KnownSymbol "users"`. A type-level string literal is `tcon("\"users\"")`
+    // - quotes included, so it can never collide with a written type - and its
+    // dictionary is *the literal itself*: one field, `symbolVal`, ignoring its
+    // proxy and returning the characters. Building it here rather than as a
+    // generated instance is what makes the set of solvable symbols exactly the
+    // set that appears in the program, with nothing to enumerate beforehand:
+    // by the time a `KnownSymbol` is wanted, the type it is wanted at has
+    // already been unified with the literal that a signature, a type
+    // application or a `deriving Generic` metadata type wrote.
+    if (cls === "KnownSymbol" && con !== undefined && con.startsWith('"'))
+      return apply(
+        variable(dictCon(cls), span),
+        { tag: "lambda", parameter: "$sym", body: { tag: "string", value: JSON.parse(con) as string, span }, span },
+      );
     // A constrained instance is a function from dictionaries to a dictionary,
     // so selecting it is recursive. The depth bound is what turns a
     // non-terminating instance chain into a diagnostic instead of a hang.
@@ -2080,11 +2098,19 @@ export function elaborateProgram(
     const signature = signatures.get(decl.name);
     // Parsed twice on purpose: the two copies must not share type variables,
     // since one is skolemised and the other is generalised.
+    //
+    // The skolemised copy's variables are kept by name, which is
+    // ScopedTypeVariables: a `forall p .` in the signature puts `p` in scope
+    // for the body, so `symbolVal (Proxy :: Proxy p)` names the *rigid* `p`
+    // its `KnownSymbol p` given is about. Without it the annotation invented a
+    // fresh variable and the given matched nothing.
+    const named = new Map<string, Type>();
     addBinding(
       decl.name,
       decl,
-      signature ? skolemise(parseSignature(signature, new Map())) : undefined,
+      signature ? skolemise(parseSignature(signature, named)) : undefined,
       signature ? parseSignature(signature, new Map()) : undefined,
+      skolemNames(named),
     );
   }
   for (const decl of declarations) {

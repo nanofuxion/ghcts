@@ -1208,6 +1208,35 @@ instance Monoid (Proxy t) where
 asProxyTypeOf :: a -> proxy a -> a
 asProxyTypeOf x p = x
 `,
+  // Type-level strings.
+  //
+  // `KnownSymbol` is a real class with a real method, and the *only* thing
+  // unusual about it is where its instances come from: nobody writes one.
+  // Every symbol a program can ask for is a literal that appears in a type
+  // somewhere - `Path "users"`, `Proxy @"q"` - so `src/elaborate.ts` reads
+  // the literal straight off the type it is solving at and builds the
+  // dictionary there (see `resolve`). That set is finite and static, which is
+  // why no instance declaration is needed and why one could not be written:
+  // `"users"` is a type this module has never heard of.
+  //
+  // `Symbol` itself is a *kind*, and there are no kinds here, so it is a
+  // nullary synonym that exists to be named in `(path :: Symbol)` - where the
+  // ascription is skipped - and in an import list. `ErrorMessage`/`TypeError`
+  // are the custom-type-error vocabulary; they only ever appear inside an
+  // instance context, which an unknown class is dropped from, so they are
+  // names to import and nothing more.
+  "GHC.TypeLits": `module GHC.TypeLits where
+
+import Data.Proxy
+
+type Symbol = ()
+type TypeError e = ()
+
+data ErrorMessage = ErrorMessage
+
+class KnownSymbol s where
+  symbolVal :: proxy s -> String
+`,
   // GHC.Generics, as far as a compiler with no type families can express it.
   //
   // The representation types are ordinary Haskell and nothing else would do:

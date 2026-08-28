@@ -2850,6 +2850,79 @@ const programs = [
     // 1 + 32 hex digits + `null`
     expect: 37,
   },
+  {
+    // A *kinded* binder is still a binder. `newtype Path (path :: Symbol)`
+    // counted zero parameters, so the type an instance was declared at and the
+    // type a signature wrote were different arities - which surfaced a phase
+    // later as "guarded bodies have different types" in miso's `Miso.Router`.
+    name: "a kinded type-variable binder is a parameter",
+    source: [
+      "module Main where",
+      "import GHC.TypeLits (Symbol)",
+      "",
+      "newtype Tagged (tag :: Symbol) = Tagged Int",
+      "",
+      "class Sized a where size :: a -> Int",
+      "instance Sized (Tagged t) where size (Tagged n) = n",
+      "",
+      "main :: IO Int",
+      "main = pure (size (Tagged 42 :: Tagged Bool))",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // `KnownSymbol` has no instance declarations anywhere: the dictionary is
+    // built from the literal the constraint is solved *at*. All three spellings
+    // miso's `Miso.Router` uses have to reach the same literal - `Proxy @s`
+    // under an instance head, `Proxy @p` and `Proxy :: Proxy p` under a
+    // `forall` in a signature, the last of which is ScopedTypeVariables.
+    name: "symbolVal reads a type-level string literal",
+    source: [
+      "module Main where",
+      "import Data.Proxy",
+      "import GHC.TypeLits",
+      "",
+      "newtype Path (path :: Symbol) = Path Int",
+      "",
+      "class Named a where nameOf :: a -> String",
+      "instance KnownSymbol s => Named (Path s) where",
+      "  nameOf p = symbolVal (Proxy @s)",
+      "",
+      "viaAt :: forall p . KnownSymbol p => Path p -> String",
+      "viaAt _ = symbolVal (Proxy @p)",
+      "",
+      "viaAnnot :: forall p . KnownSymbol p => Path p -> String",
+      "viaAnnot _ = symbolVal (Proxy :: Proxy p)",
+      "",
+      "main :: IO Int",
+      "main = pure (length (nameOf (Path 1 :: Path \"abc\")) * 100",
+      "           + length (viaAt (Path 2 :: Path \"de\")) * 10",
+      "           + length (viaAnnot (Path 3 :: Path \"f\")))",
+      "",
+    ].join("\n"),
+    // The three literals are three, two and one character long.
+    expect: 321,
+  },
+  {
+    // The characters, not just the length: a literal that differs only in case
+    // and content proves the dictionary carries *this* symbol and not the last
+    // one solved for.
+    name: "distinct symbol literals give distinct strings",
+    source: [
+      "module Main where",
+      "import Data.Proxy",
+      "import GHC.TypeLits",
+      "",
+      "name :: forall s . KnownSymbol s => Proxy s -> String",
+      "name = symbolVal",
+      "",
+      "main :: IO Int",
+      "main = pure (if name (Proxy @\"users\") ++ \"/\" ++ name (Proxy @\"Id\") == \"users/Id\" then 1 else 0)",
+      "",
+    ].join("\n"),
+    expect: 1,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
