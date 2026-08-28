@@ -72,6 +72,12 @@ export interface DataCon {
   typeName: string;
 }
 
+/** An unboxed tuple, spelled `(#,#)` as GHC spells it. It is not a heap
+ * object: its fields live in registers, so it is never allocated, never
+ * entered and never tagged - the backend keys off exactly this name prefix
+ * (`stg-js/utils.ts`), and the front half of the pipeline has to agree. */
+export const isUnboxedTupleCon = (con: DataCon): boolean => con.name.startsWith("(#");
+
 /** StgArg - atomic by construction. */
 export type StgArg = { tag: "StgVarArg"; id: Binder } | { tag: "StgLitArg"; lit: Literal };
 

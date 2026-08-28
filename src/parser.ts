@@ -5,6 +5,7 @@ import type {
   DoStatement,
   Expr,
   Guard,
+  GuardQualifier,
   ImportDeclaration,
   ListQualifier,
   LocalBinding,
@@ -342,22 +343,22 @@ function expandQualifierQuotes(qualifier: ListQualifier): ListQualifier {
     ? { ...qualifier, condition: expandExprQuotes(qualifier.condition) }
     : { ...qualifier, source: expandExprQuotes(qualifier.source) };
 }
+function expandQualifiersQuotes(qualifiers: GuardQualifier[] | undefined): GuardQualifier[] | undefined {
+  return qualifiers?.map((q) =>
+    q.tag === "bool" ? { ...q, condition: expandExprQuotes(q.condition) } : { ...q, source: expandExprQuotes(q.source) },
+  );
+}
 function expandAlternativeQuotes(alternative: CaseAlternative): CaseAlternative {
   return {
     ...alternative,
-    guard: alternative.guard && expandExprQuotes(alternative.guard),
-    patternGuards: alternative.patternGuards?.map((guard) => ({
-      pattern: guard.pattern,
-      source: expandExprQuotes(guard.source),
-    })),
+    qualifiers: expandQualifiersQuotes(alternative.qualifiers),
     body: expandExprQuotes(alternative.body),
   };
 }
 function expandGuardQuotes(guard: Guard): Guard {
   return {
     ...guard,
-    condition: guard.condition && expandExprQuotes(guard.condition),
-    source: guard.source && expandExprQuotes(guard.source),
+    qualifiers: expandQualifiersQuotes(guard.qualifiers),
     body: expandExprQuotes(guard.body),
   };
 }
@@ -846,9 +847,9 @@ class Parser {
       const guarded = this.accept("|");
       if (guarded) {
         do {
-          const guard = this.guard();
+          const qualifiers = this.guard();
           this.expect("=");
-          guards.push({ ...guard, body: this.expression() });
+          guards.push({ qualifiers, body: this.expression() });
           this.skipLines();
         } while (this.accept("|"));
       } else {
@@ -2026,6 +2027,7 @@ class Parser {
     // Literals first: a string pattern may *contain* punctuation, and `"("` is
     // a pattern matching one character, not an open parenthesis.
     if (token.kind === "int") return { tag: "int", value: Number(token.text), span: token.span };
+    if (token.kind === "float") return { tag: "double", value: Number(token.text), span: token.span };
     if (token.kind === "char") return { tag: "char", value: token.text, span: token.span };
     if (token.kind === "string") return { tag: "string", value: token.text, span: token.span };
     if (token.text === "!") return this.pattern();
@@ -2457,9 +2459,9 @@ class Parser {
       const guards: import("./ast.js").Guard[] = [];
       if (this.accept("|")) {
         do {
-          const guard = this.guard();
+          const qualifiers = this.guard();
           this.expect("=");
-          guards.push({ ...guard, body: this.expression() });
+          guards.push({ qualifiers, body: this.expression() });
           this.skipLines();
         } while (this.accept("|"));
       } else {
@@ -2483,28 +2485,20 @@ class Parser {
     this.acceptLayoutClose();
     return bindings;
   }
-  private guard(): Omit<import("./ast.js").Guard, "body"> {
-    if (this.hasPatternGuard()) {
-      const pattern = this.pattern();
-      this.expect("<-");
-      return { pattern, source: this.expression() };
-    }
-    let condition = this.expression();
-    while (this.accept(",")) {
-      const right = this.expression();
-      condition = {
-        tag: "app",
-        fn: {
-          tag: "app",
-          fn: { tag: "var", name: "&&", span: condition.span },
-          arg: condition,
-          span: condition.span,
-        },
-        arg: right,
-        span: right.span,
-      };
-    }
-    return { condition };
+  /** The qualifiers of one `|` guard: comma-separated, evaluated left to
+   * right, each a boolean or a `p <- e` whose bindings are in scope for every
+   * qualifier to its right and for the body.  `Right x <- a, Just y <- f x` is
+   * two of them, and reading only the first loses `x`. */
+  private guard(): import("./ast.js").GuardQualifier[] {
+    const qualifiers: import("./ast.js").GuardQualifier[] = [];
+    do {
+      if (this.hasPatternGuard()) {
+        const pattern = this.pattern();
+        this.expect("<-");
+        qualifiers.push({ tag: "pattern", pattern, source: this.expression() });
+      } else qualifiers.push({ tag: "bool", condition: this.expression() });
+    } while (this.accept(","));
+    return qualifiers;
   }
   private hasPatternGuard() {
     let delimiters = 0;
@@ -2590,17 +2584,13 @@ class Parser {
           args: [pattern, this.pattern()],
           span: pattern.span,
         };
-      const addGuardedBody = (
-        guard?: Expr,
-        patternGuards?: Array<{ pattern: import("./ast.js").Pattern; source: Expr }>,
-      ) => {
+      const addGuardedBody = (qualifiers?: import("./ast.js").GuardQualifier[]) => {
         this.expect("->");
         const result = this.expression();
         const bindings = this.accept("where") ? this.localBindings() : [];
         alternatives.push({
           pattern,
-          guard,
-          patternGuards,
+          qualifiers,
           body: bindings.length
             ? { tag: "let", bindings, body: result, span: result.span }
             : result,
@@ -2608,28 +2598,8 @@ class Parser {
         this.skipLines();
       };
       if (this.accept("|")) {
-        if (this.hasPatternGuard()) {
-          const patternGuards: Array<{
-            pattern: import("./ast.js").Pattern;
-            source: Expr;
-          }> = [];
-          while (true) {
-            const guarded = this.pattern();
-            this.expect("<-");
-            patternGuards.push({ pattern: guarded, source: this.expression() });
-            if (!this.accept("|")) {
-              addGuardedBody(undefined, patternGuards);
-              break;
-            }
-            if (!this.hasPatternGuard()) {
-              addGuardedBody(this.expression(), patternGuards);
-              break;
-            }
-          }
-        } else {
-          addGuardedBody(this.expression());
-          while (this.accept("|")) addGuardedBody(this.expression());
-        }
+        do addGuardedBody(this.guard());
+        while (this.accept("|"));
       } else addGuardedBody(undefined);
     }
     this.acceptLayoutClose();

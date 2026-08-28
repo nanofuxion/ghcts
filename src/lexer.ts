@@ -29,6 +29,54 @@ export function preprocess(source: string, defines: ReadonlySet<string> = new Se
   }
   return output.join('\n');
 }
+/** One escape code, Haskell Report 2.6, matched longest-first: `\\SOH` is a
+ * single escape, which is exactly why `\\SO` followed by a literal `H` has to be
+ * written `\\SO\\&H`. `\\&` is the empty escape that makes that spelling work.
+ * `index` points just past the backslash. */
+const ASCII_ESCAPES: readonly string[] = [
+  "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL",
+  "BS", "HT", "LF", "VT", "FF", "CR", "SO", "SI",
+  "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB",
+  "CAN", "EM", "SUB", "ESC", "FS", "GS", "RS", "US",
+  "SP",
+];
+const SIMPLE_ESCAPES: Readonly<Record<string, string>> = {
+  a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
+  "\\": "\\", '"': '"', "'": "'",
+};
+function readEscape(source: string, index: number): { value: string; next: number } {
+  const head = source[index] ?? "";
+  if (head === "&") return { value: "", next: index + 1 };
+  const simple = SIMPLE_ESCAPES[head];
+  if (simple !== undefined) return { value: simple, next: index + 1 };
+  if (head === "^") {
+    // `\^A` is 1, `\^@` is 0, and the run continues through `\^_` at 31.
+    const c = source.charCodeAt(index + 1);
+    return { value: String.fromCodePoint(c - 64), next: index + 2 };
+  }
+  const radix = (prefix: string, digits: RegExp, base: number): { value: string; next: number } | undefined => {
+    if (head !== prefix) return undefined;
+    let end = index + 1;
+    while (end < source.length && digits.test(source[end]!)) end++;
+    return { value: String.fromCodePoint(parseInt(source.slice(index + 1, end), base)), next: end };
+  };
+  const hex = radix("x", /[0-9a-fA-F]/, 16) ?? radix("o", /[0-7]/, 8);
+  if (hex) return hex;
+  if (/\d/.test(head)) {
+    let end = index;
+    while (end < source.length && /\d/.test(source[end]!)) end++;
+    return { value: String.fromCodePoint(Number(source.slice(index, end))), next: end };
+  }
+  // Longest match wins, so `DEL` and `SOH` are found before `D`/`SO` could be.
+  for (const name of ["DEL", ...ASCII_ESCAPES].sort((a, b) => b.length - a.length))
+    if (source.startsWith(name, index))
+      return {
+        value: String.fromCodePoint(name === "DEL" ? 127 : ASCII_ESCAPES.indexOf(name)),
+        next: index + name.length,
+      };
+  return { value: head, next: index + 1 };
+}
+
 export function lex(source: string, file: string, defines: ReadonlySet<string> = new Set()): { tokens: Token[]; diagnostics: Diagnostic[] } {
   source = preprocess(source, defines);
   const tokens: Token[] = []; const diagnostics: Diagnostic[] = []; let index = 0; let line = 1; let column = 1;
@@ -113,7 +161,7 @@ export function lex(source: string, file: string, defines: ReadonlySet<string> =
     // codepoint as an identifier lets later name resolution issue a useful
     // diagnostic rather than making lexing the first (and noisy) failure.
     if (ch.charCodeAt(0) >= 0x80) { const codepoint = source.codePointAt(index)!; const width = codepoint > 0xffff ? 2 : 1; index += width; column += width; emit('ident', source.slice(start, index), start, startLine, startColumn); continue; }
-    if (ch === '"') { index++; column++; let value = ''; let closed = false; while (index < source.length) { const c = source[index++]; column++; if (c === '"') { closed = true; break; } if (c === '\\' && index < source.length) { const escaped = source[index]; if (escaped === 'n') { index++; column++; value += '\n'; } else if (escaped === 't') { index++; column++; value += '\t'; } else if (escaped === 'r') { index++; column++; value += '\r'; } else if (/\d/.test(escaped)) { const digits = index; while (/\d/.test(source[index])) { index++; column++; } value += String.fromCodePoint(Number(source.slice(digits, index))); } else { index++; column++; value += escaped; } } else { if (c === '\n') { line++; column = 1; } value += c; } } if (!closed) diagnostics.push(error('E_LEX', 'Unterminated string literal', file, startLine, startColumn)); else emit('string', value, start, startLine, startColumn); continue; }
+    if (ch === '"') { index++; column++; let value = ''; let closed = false; while (index < source.length) { const c = source[index++]; column++; if (c === '"') { closed = true; break; } if (c === '\\' && index < source.length) { const escape = readEscape(source, index); column += escape.next - index; index = escape.next; value += escape.value; } else { if (c === '\n') { line++; column = 1; } value += c; } } if (!closed) diagnostics.push(error('E_LEX', 'Unterminated string literal', file, startLine, startColumn)); else emit('string', value, start, startLine, startColumn); continue; }
     if (ch === "'") {
       // Template Haskell type names (`''Model`) are two ticks, not a character.
       if (source[index + 1] === "'" && /[A-Za-z_]/.test(source[index + 2] ?? '')) {
@@ -125,7 +173,7 @@ export function lex(source: string, file: string, defines: ReadonlySet<string> =
       // A leading quote promotes a data constructor at the type level
       // (`'Text`, `'Just`); it is not an unterminated character literal.
       if (/[A-Za-z_]/.test(source[index + 1] ?? '') && source[index + 2] !== "'") { index++; column++; emit('symbol', "'", start, startLine, startColumn); continue; }
-      index++; column++; let value = ''; if (source[index] === '\\') { index++; column++; const escaped = source[index++]; column++; value = escaped === 'n' ? '\n' : escaped; } else if (index < source.length) { value = source[index++]; column++; } if (source[index] !== "'") diagnostics.push(error('E_LEX', 'Unterminated character literal', file, startLine, startColumn)); else { index++; column++; emit('char', value, start, startLine, startColumn); } continue;
+      index++; column++; let value = ''; if (source[index] === '\\') { index++; column++; const escape = readEscape(source, index); column += escape.next - index; index = escape.next; value = escape.value; } else if (index < source.length) { value = source[index++]; column++; } if (source[index] !== "'") diagnostics.push(error('E_LEX', 'Unterminated character literal', file, startLine, startColumn)); else { index++; column++; emit('char', value, start, startLine, startColumn); } continue;
     }
     if (ch === '[') {
       let look = index + 1;

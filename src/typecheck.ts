@@ -1,4 +1,5 @@
 import type {
+  GuardQualifier,
   Expr,
   ForeignDeclaration,
   Module,
@@ -1284,8 +1285,7 @@ class Inferencer {
       );
       const scoped = this.bindings(equation.whereBindings, bodyEnvironment);
       for (const guard of equation.guards) {
-        if (guard.condition)
-          this.unify(this.expr(guard.condition, scoped), bool);
+        this.guardQualifiers(guard.qualifiers, scoped);
         this.unify(resultType, this.expr(guard.body, scoped));
       }
     }
@@ -1297,6 +1297,15 @@ class Inferencer {
     environment.set(declaration.name, generalize(environment, result, this));
     return result;
   }
+  /** `| p <- e, cond`, left to right in one scope: a pattern's binders are in
+   * scope for every qualifier after it. */
+  guardQualifiers(qualifiers: readonly GuardQualifier[] | undefined, local: Environment): void {
+    for (const q of qualifiers ?? []) {
+      if (q.tag === "bool") this.unify(this.expr(q.condition, local), bool);
+      else this.pattern(q.pattern, this.expr(q.source, local), local);
+    }
+  }
+
   expr(expression: Expr, environment: Environment): Type {
     switch (expression.tag) {
       // This checker has no reader for a written signature; the ascription is
@@ -1388,12 +1397,7 @@ class Inferencer {
         for (const alternative of expression.alternatives) {
           const local = new Map(environment);
           this.pattern(alternative.pattern, parameter, local);
-          for (const patternGuard of alternative.patternGuards ?? []) {
-            const source = this.expr(patternGuard.source, local);
-            this.pattern(patternGuard.pattern, source, local);
-          }
-          if (alternative.guard)
-            this.unify(this.expr(alternative.guard, local), bool);
+          this.guardQualifiers(alternative.qualifiers, local);
           this.unify(result, this.expr(alternative.body, local));
         }
         return fn(parameter, this.apply(result));
@@ -1438,12 +1442,7 @@ class Inferencer {
         for (const alternative of expression.alternatives) {
           const local = new Map(environment);
           this.pattern(alternative.pattern, subject, local);
-          for (const patternGuard of alternative.patternGuards ?? []) {
-            const source = this.expr(patternGuard.source, local);
-            this.pattern(patternGuard.pattern, source, local);
-          }
-          if (alternative.guard)
-            this.unify(this.expr(alternative.guard, local), bool);
+          this.guardQualifiers(alternative.qualifiers, local);
           this.unify(result, this.expr(alternative.body, local));
         }
         return this.apply(result);
@@ -1480,8 +1479,7 @@ class Inferencer {
       const scoped = this.bindings(binding.whereBindings ?? [], bodyEnvironment);
       let result = this.fresh();
       for (const guard of binding.guards ?? [{ body: binding.value }]) {
-        if (guard.condition)
-          this.unify(this.expr(guard.condition, scoped), bool);
+        this.guardQualifiers(guard.qualifiers, scoped);
         this.unify(result, this.expr(guard.body ?? binding.value, scoped));
       }
       for (const parameter of [...parameterTypes].reverse())
@@ -1514,6 +1512,9 @@ class Inferencer {
         return;
       case "int":
         this.unify(expected, int);
+        return;
+      case "double":
+        this.unify(expected, { tag: "con", name: "Double" });
         return;
       case "string":
         this.unify(expected, string);

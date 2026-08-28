@@ -2201,6 +2201,197 @@ const programs = [
     expect: 761,
   },
   {
+    // GeneralizedNewtypeDeriving moves the constructor through a list argument
+    // with `map`, which is exactly the coercion GHC's `coerce` walks past.
+    // miso's `newtype Key = Key MisoString deriving newtype (Show, ToJSON)`
+    // needs it: `showList`'s argument is `[a]`, and without this the whole
+    // derivation was rejected over that one method.
+    name: "deriving newtype through a list argument",
+    source: [
+      "module Main where",
+      "newtype Tag = Tag [Char] deriving newtype Show",
+      "main = concat [show (Tag \"hi\"), \"|\", showList [Tag \"a\", Tag \"b\"] \"\"]",
+      "",
+    ].join("\n"),
+    expect: '"hi"|["a","b"]',
+  },
+  {
+    // GHC's `showFloat`: fixed notation from 0.1 up to 10^7 and scientific
+    // outside it, always with a digit either side of the point, over the
+    // shortest digits that read back as the same value. A `Float`'s shortest
+    // digits are shorter than the double holding it would suggest.
+    name: "Show Double and Show Float, formatted as GHC formats them",
+    source: [
+      "module Main where",
+      "main = concat",
+      '  [ show (1 :: Double)',
+      '  , "|", show (0.1 :: Double)',
+      '  , "|", show (0.01 :: Double)',
+      '  , "|", show (1234567 :: Double)',
+      '  , "|", show (12345678 :: Double)',
+      '  , "|", show (0 :: Double)',
+      '  , "|", show (12345.678 :: Double)',
+      '  , "|", show (0.1 :: Float)',
+      '  , "|", showsPrec 7 (negate 1.5 :: Double) ""',
+      '  , "|", show (Just (negate 1.5 :: Double))',
+      "  ]",
+      "",
+    ].join("\n"),
+    expect: "1.0|0.1|1.0e-2|1234567.0|1.2345678e7|0.0|12345.678|0.1|(-1.5)|Just (-1.5)",
+  },
+  {
+    // `deriving Show` in GHC's own shape: a nullary constructor bare, a prefix
+    // one parenthesised at precedence 11 with each field at 11, a record one
+    // as `C {f = v, g = w}` with its *surface* field names - miso's `URI` and
+    // `ParseError` both derive it, and both live in modules whose names are
+    // now part of the constructor's renamed spelling.
+    name: "deriving Show: prefix, record, nullary and nested",
+    sources: {
+      Shapes: [
+        "module Shapes (Wrap(..), Point(..), Flag(..)) where",
+        "data Wrap a = Wrap a | Pair a Int deriving Show",
+        "data Point = Point { px :: Int, py :: Int } deriving Show",
+        "data Flag = On | Off deriving Show",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Shapes",
+        "main = concat",
+        '  [ show (Wrap (3 :: Int))',
+        '  , "|", show (Wrap (Pair (1 :: Int) 2))',
+        '  , "|", show (Point 1 (negate 2))',
+        '  , "|", show [On, Off]',
+        '  , "|", showsPrec 11 (Wrap (5 :: Int)) ""',
+        '  , "|", show (Wrap (negate 5 :: Int))',
+        "  ]",
+        "",
+      ].join("\n"),
+    },
+    expect:
+      "Wrap 3" +
+      "|Wrap (Pair 1 2)" +
+      "|Point {px = 1, py = -2}" +
+      "|[On,Off]" +
+      "|(Wrap 5)" +
+      "|Wrap (-5)",
+  },
+  {
+    // GHC.Show's escaping table, ported case for case. The two `\&` cases are
+    // the whole reason it has to be exact: `['\1234','5']` must not print as
+    // `"\12345"`, and `['\SO','H']` must not print as `"\SOH"`, because either
+    // would read back as a different string.
+    name: "Show for Char, String and tuples, escaped as GHC escapes",
+    source: [
+      "module Main where",
+      "main = concat",
+      '  [ show "a\\tb\\\\c"',
+      "  , \"|\", show '\\''",
+      "  , \"|\", show [chr 1234, '5']",
+      "  , \"|\", show [chr 14, 'H']",
+      "  , \"|\", show (chr 127)",
+      '  , "|", show (1 :: Int, 2 :: Int)',
+      '  , "|", show [1, 2 :: Int]',
+      '  , "|", show (negate 1 :: Int)',
+      "  ]",
+      "",
+    ].join("\n"),
+    expect:
+      '"a\\tb\\\\c"' +
+      "|'\\''" +
+      '|"\\1234\\&5"' +
+      '|"\\SO\\&H"' +
+      "|'\\DEL'" +
+      "|(1,2)" +
+      "|[1,2]" +
+      "|-1",
+  },
+  {
+    // A JSON number is a `Double`, so miso writes `\case 1 -> ...` at that
+    // type seven times over. An integer literal pattern at `Double` matches
+    // the box's field against the double of that whole number; matching it as
+    // an `Int` instead never fires, and reporting it unsupported stopped
+    // `Miso.Native.Element.List.Event` and `Miso.JSON` dead.
+    name: "an integer literal pattern at Double, and a fractional one",
+    source: [
+      "module Main where",
+      "grade :: Double -> Int",
+      "grade 0 = 10",
+      "grade 1 = 20",
+      "grade 2.5 = 30",
+      "grade _ = 40",
+      "pick :: Float -> Int",
+      "pick 3 = 7",
+      "pick _ = 8",
+      "main :: IO Int",
+      "main = pure (grade 0 * 100000 + grade 1 * 10000 + grade 2.5 * 100 + grade 9 * 10 + pick 3)",
+      "",
+    ].join("\n"),
+    expect: 1000000 + 200000 + 3000 + 400 + 7,
+  },
+  {
+    // `Miso.JSON.decode` chains two of them - `Right x <- p s, Success v <-
+    // fromJSON x` - so the second qualifier reads the first's binding, and a
+    // guard whose match fails falls through to the next guard, not to the
+    // pattern-match failure. `Miso.Runtime` writes one in a case alternative.
+    name: "pattern guards: a chain, its bindings, and its fall-through",
+    source: [
+      "module Main where",
+      "data R a = Ok a | Bad",
+      "step :: Int -> R Int",
+      "step n = if n > 0 then Ok (n + 1) else Bad",
+      "pick :: Int -> Int",
+      "pick n",
+      "  | Ok x <- step n, Ok y <- step x, y > 3 = x * 10 + y",
+      "  | Ok x <- step n = x",
+      "  | otherwise = 7",
+      "alt :: Int -> Int",
+      "alt n = case step n of",
+      "  Ok x | Ok y <- step x -> y",
+      "  _ -> 0",
+      "main :: IO Int",
+      "main = pure (pick 5 * 10000 + pick 1 * 100 + pick 0 + alt 2)",
+      "",
+    ].join("\n"),
+    expect: 670211,
+  },
+  {
+    // Type *names* are module-scoped too. miso's `Miso.JSON.Types` declares
+    // `type Object = Map MisoString Value` while `Miso.DSL` declares an
+    // unrelated `newtype Object`; with one global type namespace the declared
+    // type won and every signature written at the synonym became the newtype.
+    // Arity cannot tell a nullary synonym from a data type, so nothing short
+    // of scoping the name separates these two.
+    name: "a type synonym and a data type of the same name in two modules",
+    sources: {
+      Alias: [
+        "module Alias (Obj, mk) where",
+        "type Obj = [Int]",
+        "mk :: Int -> Obj",
+        "mk n = [n, n]",
+        "",
+      ].join("\n"),
+      Wrap: [
+        "module Wrap (Obj(..)) where",
+        "newtype Obj = Obj Int",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Alias (Obj, mk)",
+        "import qualified Wrap as W",
+        "total :: Obj -> Int",
+        "total xs = sum xs",
+        "unwrap :: W.Obj -> Int",
+        "unwrap w = case w of W.Obj n -> n",
+        "main :: IO Int",
+        "main = pure (total (mk 5) * 10 + unwrap (W.Obj 3))",
+        "",
+      ].join("\n"),
+    },
+    expect: 103,
+  },
+  {
     // Pointer identity, which `Miso.Runtime.dirtyCheck` asks for before it
     // falls back to `Eq`: two stable names of the same heap object compare
     // equal.
@@ -2234,6 +2425,192 @@ const programs = [
       "",
     ].join("\n"),
     expect: 42,
+  },
+  {
+    // `Control.Category` declares `id` and `(.)` as methods, and miso writes
+    // `import Prelude hiding ((.))` beside `import Control.Category ((.))` so
+    // that `.` composes lenses. With class methods global, the method would
+    // have captured every `.` in the program; scoped, a module that does not
+    // import the class keeps the Prelude's.
+    name: "Control.Category: `.` is the class method only where it is imported",
+    sources: {
+      Pair: [
+        "module Pair (L(..), get, comp) where",
+        "import Control.Category (Category(..))",
+        "import Prelude hiding ((.))",
+        "data L b a = L (a -> b)",
+        "instance Category L where",
+        "  id = L (\\x -> x)",
+        "  (.) (L f) (L g) = L (\\x -> g (f x))",
+        "get :: L b a -> a -> b",
+        "get (L f) = f",
+        "comp :: L Int Int",
+        "comp = L (\\x -> x + 1) . L (\\x -> x * 3)",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Pair (L(..), get, comp)",
+        // No `Control.Category` import here: `.` is still the Prelude's.
+        "plus :: Int -> Int",
+        "plus = (+ 1) . (* 3)",
+        "main :: IO Int",
+        "main = pure (get comp 2 * 100 + plus 2)",
+        "",
+      ].join("\n"),
+    },
+    expect: 907,
+  },
+  {
+    // `import M (T)` names the type and nothing else; only `T(..)` carries its
+    // constructors. miso's `Miso.CSS` imports `Miso.Types (Attribute)` next to
+    // its own `Styles`, and the wildcard reading made `Miso.Types`' `Styles`
+    // shadow it.
+    name: "an import list without `(..)` does not bring the constructors",
+    sources: {
+      Theirs: [
+        "module Theirs (T(..)) where",
+        "data T = Same Int Int",
+        "",
+      ].join("\n"),
+      Ours: [
+        "module Ours (S(..)) where",
+        "data S = Same Int",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Ours (S(..))",
+        // Later than the one that really exports `Same`: whichever import
+        // let it through last wins the scope, so a `Same` leaking out of
+        // `Theirs (T)` here would be the two-field one.
+        "import Theirs (T)",
+        "size :: S -> Int",
+        "size (Same n) = n",
+        "main :: IO Int",
+        "main = pure (size (Same 42))",
+        "",
+      ].join("\n"),
+    },
+    expect: 42,
+  },
+  {
+    // `C {..}` fills each unwritten field from the variable of that name in
+    // scope. Record fields are module-scoped, so the field's label and the
+    // variable it reads are spelled differently by the time `src/sugar.ts`
+    // sees them: filling from the label picks up the record *selector*, which
+    // type-checks nowhere miso writes one - `Miso.Event.Decoder` builds every
+    // decoder this way.
+    name: "a record wildcard reads the local variable, not the selector",
+    sources: {
+      Shape: [
+        "module Shape (D(..), make) where",
+        "data D = D { wide :: Int, tall :: Int }",
+        "make :: Int -> Int -> D",
+        // `wide` is written out and `tall` comes from the parameter of that
+        // name, which shadows the selector.
+        "make wide tall = D { wide = wide * 10, .. }",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Shape (D(..), make)",
+        "area :: D -> Int",
+        "area D {..} = wide + tall",
+        "main :: IO Int",
+        "main = pure (area (make 4 2))",
+        "",
+      ].join("\n"),
+    },
+    expect: 42,
+  },
+  {
+    // `Miso.Reload` stores the whole runtime behind a `StablePtr`, hands it to
+    // JavaScript, and reads it back after the reload. The pointer is the JS
+    // backend's own slot index, so what comes back has to be the very closure
+    // that went in - unforced, since `deRefStablePtr` is not a `seq`.
+    name: "Foreign.StablePtr round-trips a closure through JavaScript",
+    source: [
+      "module Main where",
+      "import Foreign.StablePtr (newStablePtr, deRefStablePtr, freeStablePtr)",
+      "main :: IO Int",
+      "main = do",
+      "  p <- newStablePtr (20 + 22 :: Int)",
+      "  q <- newStablePtr (1 :: Int)",
+      "  freeStablePtr q",
+      "  n <- deRefStablePtr p",
+      "  pure n",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // The sized integers wrap, which is the whole of what makes them different
+    // from `Int`: `Miso.JSON` writes a `ToJSON`/`FromJSON` pair for each, and
+    // one that silently widened would round-trip values GHC does not.
+    // 200 :: Word8 stays 200, but 100 + 200 is 44; 100 + 100 :: Int8 is -56;
+    // and 2^31 - 1 + 1 :: Int32 is the same overflow `Int` itself has.
+    name: "Data.Int and Data.Word wrap at their own widths",
+    source: [
+      "module Main where",
+      "import Data.Int (Int8, Int32)",
+      "import Data.Word (Word8, Word)",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if (100 + 200 :: Word8) == 44 then 1 else 0",
+      "  , if (100 + 100 :: Int8) == negate 56 then 2 else 0",
+      "  , if (2147483647 + 1 :: Int32) == negate 2147483648 then 4 else 0",
+      "  , if (0 - 1 :: Word) > 2147483647 then 8 else 0",
+      "  , if (65536 * 65536 :: Word) == 0 then 16 else 0",
+      "  , if (200 :: Word8) > 100 then 32 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 63,
+  },
+  {
+    // `Float` is single precision, and the only thing that says so on a backend
+    // where every number is a JS double is the `Math.fround` each `Float*Op`
+    // ends with. 0.1 + 0.2 at single precision is exactly the float nearest
+    // 0.30000001192092896, which is NOT the double 0.1 + 0.2; and 16777216 + 1
+    // does not fit a float's 24-bit significand, so it stays 16777216.
+    name: "Float is single precision, not Double under another name",
+    source: [
+      "module Main where",
+      "big :: Float",
+      "big = 16777216",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if big + 1 == big then 1 else 0",
+      "  , if (16777216 + 1 :: Double) /= 16777216 then 2 else 0",
+      "  , if realToFrac (0.1 + 0.2 :: Float) /= (0.1 + 0.2 :: Double) then 4 else 0",
+      "  , if realToFrac (1.5 :: Float) == (1.5 :: Double) then 8 else 0",
+      "  , if (1 / 4 :: Float) == 0.25 then 16 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 31,
+  },
+  {
+    // `[x ..]`, `[x .. y]`, `[x, y ..]` and `[x, y .. z]` reach the elaborator
+    // as `enumFrom` and friends, and none of the four had a definition -
+    // `Miso.Lens`'s `at` for lists indexes with `zip [0 ..] xs`, which needs
+    // the first one to be lazy in its tail.
+    name: "the enumFrom family, and [x ..] is lazy in its tail",
+    source: [
+      "module Main where",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ sum [1 .. 4]",
+      "  , sum (map fst (zip [10, 20 ..] \"abc\"))",
+      "  , sum [9, 7 .. 1]",
+      "  , length [1 .. 0]",
+      "  , sum (map fst (zip [1 ..] \"xy\"))",
+      "  ])",
+      "",
+    ].join("\n"),
+    // 10 + (10+20+30) + (9+7+5+3+1) + 0 + (1+2)
+    expect: 98,
   },
 ];
 

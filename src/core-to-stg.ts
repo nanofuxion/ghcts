@@ -27,7 +27,7 @@ import type {
   StgModule,
   StgRhs,
 } from "./stg.js";
-import { UpdateFlag, litArg, mkBinder, varArg } from "./stg.js";
+import { UpdateFlag, isUnboxedTupleCon, litArg, mkBinder, varArg } from "./stg.js";
 
 /** Either a `let` (a real allocation) or a `case` (evaluate now), the two
  * ways CorePrep floats a non-atomic subexpression out of an argument
@@ -57,6 +57,12 @@ class Converter {
     // all: codegen can allocate it directly. Anything that had to be floated
     // stays a thunk, since an StgRhsCon has nowhere to put the bindings.
     if (args.length === 0 && stgBody.tag === "StgConApp") {
+      // An unboxed tuple has no heap representation, so there is nothing to
+      // bind here; reaching this means a caller put one in a lazy position
+      // (an argument or a constructor field), which is exactly what GHC's
+      // levity rules forbid. Failing loudly beats allocating a closure the
+      // backend will never be able to enter.
+      if (isUnboxedTupleCon(stgBody.con)) throw new Error("coreToStg: unboxed tuple in a lazy position");
       return { tag: "StgRhsCon", con: stgBody.con, args: stgBody.args };
     }
     return this.mkClosure(args, stgBody);
@@ -197,7 +203,11 @@ class Converter {
     if (e.tag === "Lit") return litArg(e.lit);
     if (e.tag === "Var") return varArg(e.binder);
     const binder = mkBinder("t");
-    const evaluate = strict || e.tag === "Op";
+    // A lambda is already a value, so a strict position needs no `case` around
+    // it - only the allocation. That matters for `catch#`, whose action and
+    // handler are both lambdas: forcing them would push a return frame per
+    // argument that the closure immediately returns into.
+    const evaluate = (strict && e.tag !== "Lam") || e.tag === "Op";
     // Only one of the two translations is used, and each one walks `e` again.
     // Building both made a nested constructor cost 2^depth: a 25-character
     // string literal - `error "Prelude.head: empty list"` - took eleven
@@ -242,6 +252,12 @@ function flatten(e: CoreExpr): [CoreExpr, CoreExpr[]] {
  * means a primitive comparison; only DEFAULT means nothing to test. */
 function altTypeOf(alts: readonly CoreAlt[], scrutinee: CoreExpr): AltType {
   for (const alt of alts) {
+    // An unboxed tuple returns its fields in registers, so there is no tag to
+    // dispatch on - only slots to unpack. `arity` counts the fields that
+    // survive erasure, which for `(# State# RealWorld, a #)` is the one.
+    if (alt.con.tag === "DataAlt" && isUnboxedTupleCon(alt.con.con)) {
+      return { tag: "MultiValAlt", arity: alt.binders.reduce((n, b) => n + (b.arity ?? 1), 0) };
+    }
     if (alt.con.tag === "DataAlt") return { tag: "AlgAlt", typeName: alt.con.con.typeName };
     if (alt.con.tag === "LitAlt") return { tag: "PrimAlt" };
   }
@@ -259,7 +275,10 @@ const altTypeOfExpr = (e: CoreExpr): AltType =>
 function freeVarsOf(expr: StgExpr): Set<Binder> {
   const free = new Set<Binder>();
   const arg = (a: StgArg, scope: Set<Binder>): void => {
-    if (a.tag === "StgVarArg" && !scope.has(a.id)) free.add(a.id);
+    // A void variable - the state token - has no runtime value, so it cannot
+    // be a closure's payload slot: capturing it would reserve a field the
+    // backend then never writes.
+    if (a.tag === "StgVarArg" && a.id.arity !== 0 && !scope.has(a.id)) free.add(a.id);
   };
   const rhsVars = (r: StgRhs, scope: Set<Binder>): void => {
     if (r.tag === "StgRhsCon") {

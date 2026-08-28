@@ -53,6 +53,7 @@ import type {
   Declaration,
   Expr,
   Guard,
+  GuardQualifier,
   InstanceDeclaration,
   LocalBinding,
   Module,
@@ -62,9 +63,9 @@ import type {
   ValueDeclaration,
 } from "./ast.js";
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
-import { renameDeclarations, renameValue, resolveProgram, type Scope } from "./modules.js";
+import { classMethodNames, renameDeclarations, renameValue, resolveProgram, type Scopes } from "./modules.js";
 import { error } from "./diagnostics.js";
-import { constructorTable, derivedEqMethod, derivedGenericSource, expandSugar, fieldSelectors } from "./sugar.js";
+import { constructorTable, derivedEqMethod, derivedGenericSource, derivedShowSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
 import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
@@ -118,6 +119,7 @@ const tlist = (a: Type): Type => tapp(tcon("[]"), a);
 const tInt = tcon("Int");
 const tBool = tcon("Bool");
 const tChar = tcon("Char");
+const tDouble = tcon("Double");
 const tString = tlist(tChar);
 
 let nextTVar = 0;
@@ -740,7 +742,9 @@ interface Binding {
   tyvars: ReadonlyMap<string, Type>;
   givens: Given[];
   uses: Use[];
-  intPatterns: Array<{ pattern: Extract<Pattern, { tag: "int" }>; type: Type }>;
+  /** Every numeric literal pattern, with the type it was matched at.  The
+   * representation is settled only once the binding is fully inferred. */
+  intPatterns: Array<{ pattern: Extract<Pattern, { tag: "int" | "double" }>; type: Type }>;
   monoType: Type;
   emitted?: Scheme;
 }
@@ -756,7 +760,26 @@ class Elaborator {
   readonly constructors = new Map<string, Scheme>();
   readonly bindings = new Map<string, Binding>();
   readonly boxedInt = new Set<Extract<Pattern, { tag: "int" }>>();
+  /** Numeric literal patterns whose type turned out to be `Double`/`Float`,
+   * with the box the match goes through. */
+  readonly doubleLit = new Map<Extract<Pattern, { tag: "int" | "double" }>, "Double" | "Float">();
+  /** Every binder this pass gave a type to, so `isVoidRep` can ask afterwards
+   * whether that type turned out to be the state token. Inference is the only
+   * place a type exists, and the answer is only final once unification has
+   * finished, so the *type* is recorded here and pruned at rewrite time. */
+  private readonly binderTypes = new Map<Pattern | Expr, Type>();
   private current?: Binding;
+
+  /** Is this binder's type the erased state token? See `Pattern.voidRep`. */
+  isVoidRep(node: Pattern | Expr): boolean {
+    const t = this.binderTypes.get(node);
+    return t !== undefined && headCon(t) === "RealWorld";
+  }
+
+  private recordBinder<T extends Pattern | Expr>(node: T, type: Type): Type {
+    this.binderTypes.set(node, type);
+    return type;
+  }
 
   constructor(private readonly file: string) {}
 
@@ -774,9 +797,9 @@ class Elaborator {
   inferPattern(p: Pattern, env: Env): Type {
     switch (p.tag) {
       case "wild":
-        return freshVar();
+        return this.recordBinder(p, freshVar());
       case "var": {
-        const t = freshVar();
+        const t = this.recordBinder(p, freshVar());
         env.set(p.name, { tag: "mono", type: t });
         return t;
       }
@@ -785,6 +808,7 @@ class Elaborator {
         env.set(p.name, { tag: "mono", type: t });
         return t;
       }
+      case "double":
       case "int": {
         const t = freshVar();
         this.current?.intPatterns.push({ pattern: p, type: t });
@@ -901,7 +925,7 @@ class Elaborator {
       }
       case "lambda": {
         const inner = new Map(env);
-        const param = freshVar();
+        const param = this.recordBinder(e, freshVar());
         inner.set(e.parameter, { tag: "mono", type: param });
         return tfun(param, this.infer(e.body, inner));
       }
@@ -974,8 +998,7 @@ class Elaborator {
     for (const alt of alts) {
       const inner = new Map(env);
       if (!unify(scrutinee, this.inferPattern(alt.pattern, inner))) this.report("pattern does not match the scrutinee type", span);
-      if (alt.guard && !unify(this.infer(alt.guard, inner), tBool)) this.report("guard is not a Bool", span);
-      if (alt.patternGuards?.length) this.report("pattern guards are not supported", span);
+      this.inferQualifiers(alt.qualifiers, inner, span);
       if (!unify(result, this.infer(alt.body, inner))) this.report("case alternatives have different types", span);
     }
   }
@@ -1001,12 +1024,25 @@ class Elaborator {
     return inner;
   }
 
+  /** `| p <- e, cond`: the qualifiers are checked left to right in one scope,
+   * so a pattern's binders are available to everything after it. */
+  private inferQualifiers(qualifiers: readonly GuardQualifier[] | undefined, scope: Env, span: Span): void {
+    for (const q of qualifiers ?? []) {
+      if (q.tag === "bool") {
+        if (!unify(this.infer(q.condition, scope), tBool)) this.report("guard is not a Bool", span);
+      } else if (!unify(this.infer(q.source, scope), this.inferPattern(q.pattern, scope)))
+        this.report("pattern guard does not match the type of its source", span);
+    }
+  }
+
   private inferGuards(guards: readonly Guard[], where: readonly LocalBinding[], result: Type, env: Env, span: Span): void {
     const scope = this.inferLocals(where, env);
     for (const guard of guards) {
-      if (guard.condition && !unify(this.infer(guard.condition, scope), tBool)) this.report("guard is not a Bool", span);
-      if (guard.pattern) this.report("pattern guards are not supported", span);
-      if (!unify(result, this.infer(guard.body, scope))) this.report("guarded bodies have different types", span);
+      // Each guard gets its own copy: a `p <- e` binds for the rest of *this*
+      // guard's qualifiers and its body, and for nothing after it.
+      const inner = new Map(scope);
+      this.inferQualifiers(guard.qualifiers, inner, span);
+      if (!unify(result, this.infer(guard.body, inner))) this.report("guarded bodies have different types", span);
     }
   }
 
@@ -1233,15 +1269,38 @@ class Elaborator {
    * match on `I 0` while a pattern on an unboxed scrutinee stays raw. */
   private solveIntPatterns(binding: Binding): void {
     for (const { pattern, type } of binding.intPatterns) {
+      const fractional = pattern.tag === "double";
       const t = prune(type);
-      if (t.tag === "var") unify(t, tInt);
+      if (t.tag === "var") unify(t, fractional ? tDouble : tInt);
       const con = headCon(type);
+      // `Double` and `Float` are one-field boxes over a JS number, so a
+      // numeric literal pattern at either is the same shape as `Int`'s - the
+      // box, then the raw literal. miso writes `\case 1 -> ...` on a JSON
+      // number, which is a `Double`, seven times over.
+      if (con === "Double" || con === "Float") {
+        this.doubleLit.set(pattern, con);
+        continue;
+      }
+      if (con === "DoublePrim" || con === "FloatPrim") continue;
+      if (fractional) {
+        this.report(`fractional pattern at type \`${con ?? "?"}\`: only Double and Float are supported`, pattern.span);
+        continue;
+      }
       if (con === "IntPrim") continue;
       if (con === "Int") {
         this.boxedInt.add(pattern);
         continue;
       }
-      this.report(`integer pattern at type \`${con ?? "?"}\`: literal patterns are only supported at Int`, pattern.span);
+      // `\case 1 -> ...` on a JSON number is an integer literal at `Double`,
+      // which miso writes seven times. `Double` is a one-field box over a
+      // `Double#`, so the match is the same shape as `Int`'s - only the
+      // literal's own representation differs, and an integer literal at
+      // `Double` is exactly the double of that whole number.
+      if (con === "Double" || con === "Float") {
+        this.doubleLit.set(pattern, con);
+        continue;
+      }
+      this.report(`integer pattern at type \`${con ?? "?"}\`: literal patterns are only supported at Int, Double and Float`, pattern.span);
     }
   }
 
@@ -1390,9 +1449,18 @@ function newtypeMethod(
   const names = args.map((_, i) => `$n${i}`);
   // How each argument reaches the wrapped type: `no` passes it through
   // untouched, `here` unwraps it, `under` unwraps what it returns.
-  const how = args.map((t): "no" | "here" | "under" | "bad" => {
+  /** `[a]` with the class variable as the element: a list is the one type
+   * constructor this pass can move a coercion through honestly, because `map`
+   * is exactly that coercion. `Show`'s `showList` and miso's `toJSONList` are
+   * both this shape, and both are what GHC's `coerce` walks straight past. */
+  const listOfVar = (t: Type): boolean => {
+    const p = prune(t);
+    return p.tag === "app" && prune(p.fn).tag === "con" && (prune(p.fn) as { tag: "con"; name: string }).name === "[]" && coercible(p.arg);
+  };
+  const how = args.map((t): "no" | "here" | "under" | "list" | "bad" => {
     if (coercible(t)) return "here";
     if (!mentions(t)) return "no";
+    if (listOfVar(t)) return "list";
     const { args: inner, result: innerResult } = splitFun(t);
     return inner.length > 0 && !inner.some(mentions) && coercible(innerResult) ? "under" : "bad";
   });
@@ -1406,6 +1474,11 @@ function newtypeMethod(
     variable(method.name, span),
     names.map((name, i): Expr => {
       if (how[i] === "here") return unwrapExpr(variable(name, span), name);
+      if (how[i] === "list")
+        return applyAll(variable("map", span), [
+          { tag: "lambda", parameter: `${name}$e`, body: unwrapExpr(variable(`${name}$e`, span), `${name}$e`), span },
+          variable(name, span),
+        ]);
       if (how[i] !== "under") return variable(name, span);
       // `\x -> unwrap (k x)`: the argument is a function into the newtype, and
       // the inner call needs one into the wrapped type.
@@ -1473,12 +1546,15 @@ export function elaborateProgram(
   // Instance and class declarations keep their members as unparsed source, so
   // the scope they were written in has to survive until those members are
   // parsed, further down.
-  const scopeOf = new Map<Declaration, Scope>();
+  const scopeOf = new Map<Declaration, Scopes>();
   const declarations: Declaration[] = [...prelude.module.ast.declarations];
   for (const module of resolved.order) {
-    const scope = resolved.scopes.get(module.name)!;
-    for (const decl of renameDeclarations(module, scope, module.name === root, !libraryModuleNames.has(module.name))) {
-      scopeOf.set(decl, scope);
+    const scopes: Scopes = {
+      values: resolved.scopes.get(module.name)!,
+      types: resolved.typeScopes.get(module.name)!,
+    };
+    for (const decl of renameDeclarations(module, scopes, module.name === root, !libraryModuleNames.has(module.name), resolved.fields)) {
+      scopeOf.set(decl, scopes);
       declarations.push(decl);
     }
   }
@@ -1486,12 +1562,31 @@ export function elaborateProgram(
   // else; see `derivedGenericSource`. It joins the pile *after* the modules so
   // a hand-written `Generic` instance for the same type is seen first, and
   // wins the overlap comparison by being identical.
-  const derivedSource = derivedGenericSource(declarations.filter((d): d is DataDeclaration => d.tag === "data"));
-  if (derivedSource) {
-    const parsed = parseModule(derivedSource, "GHCTS/Derived.hs");
+  const derivedDatas = declarations.filter((d): d is DataDeclaration => d.tag === "data");
+  // `deriving Show` is generated as Haskell too, and needs no scope at all:
+  // it names the flat constructors it was built from and the Prelude's own
+  // `showsPrec`/`showString`/`showParen`, which are never renamed.
+  const showSource = derivedShowSource(derivedDatas);
+  if (showSource) {
+    const parsed = parseModule(showSource, "GHCTS/DerivedShow.hs");
     if (parsed.module && !parsed.diagnostics.some((d) => d.severity === "error"))
       declarations.push(...parsed.module.ast.declarations);
     else elaborator.diagnostics.push(...parsed.diagnostics);
+  }
+  const derivedSource = derivedGenericSource(derivedDatas);
+  if (derivedSource) {
+    const parsed = parseModule(derivedSource, "GHCTS/Derived.hs");
+    if (parsed.module && !parsed.diagnostics.some((d) => d.severity === "error")) {
+      // It writes `from`/`to`/`datatypeName` as `GHC.Generics` sees them, so it
+      // is scoped as if it were inside that module - class methods are
+      // module-scoped, and these instances have to name the same ones.
+      const generics = resolved.scopes.get("GHC.Generics");
+      const genericTypes = resolved.typeScopes.get("GHC.Generics");
+      for (const decl of parsed.module.ast.declarations) {
+        if (generics && genericTypes) scopeOf.set(decl, { values: generics, types: genericTypes });
+        declarations.push(decl);
+      }
+    } else elaborator.diagnostics.push(...parsed.diagnostics);
   }
   const env: Env = new Map();
 
@@ -1614,11 +1709,19 @@ export function elaborateProgram(
       fundeps.push({ from: decl.parameters.map((_, j) => j), to: [decl.parameters.length + i] });
     const own = new Map<string, ValueDeclaration>();
     const classScope = scopeOf.get(decl);
+    // A method body names the method it defines as it was *written*; the
+    // signature above it has already been rewritten to the module-scoped name.
+    const methodNames = new Set(classMethodNames(decl));
+    const asMethod = (written: string, scope: Scopes | undefined): string => {
+      const flat = scope?.values.get(written);
+      return flat !== undefined && methodNames.has(flat) ? flat : written;
+    };
     for (const value of instanceMethodValues(
       { tag: "instance", head: decl.name, associatedTypes: [], members: [], rawMembers: decl.rawMembers, span: decl.span },
       file,
     )) {
-      own.set(value.name, classScope ? renameValue(value, classScope) : value);
+      const name = asMethod(value.name, classScope);
+      own.set(name, classScope ? renameValue(value, classScope, name, resolved.fields) : { ...value, name });
     }
     const methods: ClassMethod[] = [];
     // Parsed against the same variable map as the methods, so the `a` of
@@ -1710,8 +1813,16 @@ export function elaborateProgram(
     }
     const methods = new Map<string, ValueDeclaration>();
     const instanceScope = scopeOf.get(decl);
-    for (const value of instanceMethodValues(decl, file))
-      methods.set(value.name, instanceScope ? renameValue(value, instanceScope) : value);
+    // The instance writes the method under the name its own module sees it by;
+    // the class knows it by its module-scoped name.  Only a scope answer that
+    // really is a method of *this* class counts, so a top-level binding that
+    // happens to share a method's name cannot capture the definition.
+    const isMethod = new Set(info.methods.map((m) => m.name));
+    for (const value of instanceMethodValues(decl, file)) {
+      const flat = instanceScope?.values.get(value.name);
+      const name = flat !== undefined && isMethod.has(flat) ? flat : value.name;
+      methods.set(name, instanceScope ? renameValue(value, instanceScope, name, resolved.fields) : { ...value, name });
+    }
     // Two instances at the same head are not an error here the way they are in
     // GHC: `Data.Text.Text`, `Data.Text.Lazy.Text` and `MisoString` are all the
     // one `JSString`, so a library that writes an instance for each has written
@@ -2132,6 +2243,19 @@ const PRIMITIVE_TYPES: Record<string, string> = {
   primDoubleLog: "DoublePrim -> DoublePrim",
   primDoubleExp: "DoublePrim -> DoublePrim",
   primDoublePower: "DoublePrim -> DoublePrim -> DoublePrim",
+  primFloatAdd: "FloatPrim -> FloatPrim -> FloatPrim",
+  primFloatSub: "FloatPrim -> FloatPrim -> FloatPrim",
+  primFloatMul: "FloatPrim -> FloatPrim -> FloatPrim",
+  primFloatDiv: "FloatPrim -> FloatPrim -> FloatPrim",
+  primFloatNeg: "FloatPrim -> FloatPrim",
+  primFloatAbs: "FloatPrim -> FloatPrim",
+  primFloatEq: "FloatPrim -> FloatPrim -> Bool",
+  primFloatLt: "FloatPrim -> FloatPrim -> Bool",
+  primFloatLe: "FloatPrim -> FloatPrim -> Bool",
+  primFloatGt: "FloatPrim -> FloatPrim -> Bool",
+  primFloatGe: "FloatPrim -> FloatPrim -> Bool",
+  primFloatToDouble: "FloatPrim -> DoublePrim",
+  primDoubleToFloat: "DoublePrim -> FloatPrim",
   primIntToDouble: "IntPrim -> DoublePrim",
   primDoubleToInt: "DoublePrim -> IntPrim",
   // `MutVarPrim`/`MVarPrim`/`VoidPrim` are opaque: nothing in Haskell may
@@ -2142,16 +2266,38 @@ const PRIMITIVE_TYPES: Record<string, string> = {
   primNewMutVar: "a -> MutVarPrim a",
   primReadMutVar: "MutVarPrim a -> a",
   primWriteMutVar: "MutVarPrim a -> a -> VoidPrim",
+  // GHC's `realWorld# :: State# RealWorld`. It is a value of a void type, so
+  // it is not an operation at all: `src/desugar.ts` resolves it to a binder
+  // that occupies no JS value, and every reference to it disappears.
+  primRealWorld: "RealWorld",
   primNewMVar: "RealWorld -> MVarPrim a",
   primTakeMVar: "MVarPrim a -> a",
   primPutMVar: "MVarPrim a -> a -> VoidPrim",
   primReadMVar: "MVarPrim a -> a",
   primTryPutMVar: "MVarPrim a -> a -> Bool",
   primIsEmptyMVar: "MVarPrim a -> Bool",
+  primWordAdd: "WordPrim -> WordPrim -> WordPrim",
+  primWordSub: "WordPrim -> WordPrim -> WordPrim",
+  primWordMul: "WordPrim -> WordPrim -> WordPrim",
+  primWordQuot: "WordPrim -> WordPrim -> WordPrim",
+  primWordRem: "WordPrim -> WordPrim -> WordPrim",
+  primWordEq: "WordPrim -> WordPrim -> Bool",
+  primWordLt: "WordPrim -> WordPrim -> Bool",
+  primWordLe: "WordPrim -> WordPrim -> Bool",
+  primWordGt: "WordPrim -> WordPrim -> Bool",
+  primWordGe: "WordPrim -> WordPrim -> Bool",
+  primIntToWord: "IntPrim -> WordPrim",
+  primWordToDouble: "WordPrim -> DoublePrim",
   primMakeStableName: "a -> StableNamePrim",
   primStableNameInt: "StableNamePrim -> IntPrim",
   primFork: "a -> ThreadIdPrim",
   primDelay: "IntPrim -> VoidPrim",
+  // GHC's `catch#`, `raiseIO#` and `killThread#`, at their real types. The
+  // action and the handler are functions of the state token, which is what
+  // makes them closures the RTS can enter with `h$ap_1_0`/`h$ap_2_1`.
+  primCatch: "(RealWorld -> IOResult a) -> (JSValPrim -> RealWorld -> IOResult a) -> RealWorld -> IOResult a",
+  primRaiseIO: "JSValPrim -> RealWorld -> IOResult a",
+  primKillThread: "ThreadIdPrim -> JSValPrim -> RealWorld -> VoidPrim",
 };
 
 /** `class Eq a => Ord a where` keeps only its name and parameters in the
@@ -2316,20 +2462,23 @@ function referencedNames(decl: ValueDeclaration): Set<string> {
         return;
     }
   };
+  const qualifiers = (qs: readonly GuardQualifier[] | undefined): void => {
+    for (const q of qs ?? []) expr(q.tag === "bool" ? q.condition : q.source);
+  };
   const alternative = (alt: CaseAlternative): void => {
-    if (alt.guard) expr(alt.guard);
+    qualifiers(alt.qualifiers);
     expr(alt.body);
   };
   const local = (b: LocalBinding): void => {
     for (const guard of b.guards ?? [{ body: b.value }]) {
-      if (guard.condition) expr(guard.condition);
+      qualifiers(guard.qualifiers);
       expr(guard.body);
     }
     for (const w of b.whereBindings ?? []) local(w);
   };
   for (const equation of decl.equations) {
     for (const guard of equation.guards) {
-      if (guard.condition) expr(guard.condition);
+      qualifiers(guard.qualifiers);
       expr(guard.body);
     }
     for (const w of equation.whereBindings) local(w);
@@ -2464,7 +2613,9 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
       case "app":
         return { ...e, fn: rewriteExpr(e.fn), arg: rewriteExpr(e.arg) };
       case "lambda":
-        return { ...e, body: rewriteExpr(e.body) };
+        return elaborator.isVoidRep(e)
+          ? { ...e, voidRep: true, body: rewriteExpr(e.body) }
+          : { ...e, body: rewriteExpr(e.body) };
       case "lambdaCase":
         return { ...e, alternatives: e.alternatives.map(rewriteAlt) };
       case "if":
@@ -2480,15 +2631,21 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
         return e;
     }
   };
+  const rewriteQualifiers = (qs: GuardQualifier[] | undefined): GuardQualifier[] | undefined =>
+    qs?.map((q) =>
+      q.tag === "bool"
+        ? { ...q, condition: rewriteExpr(q.condition) }
+        : { ...q, pattern: rewritePattern(elaborator, q.pattern), source: rewriteExpr(q.source) },
+    );
   const rewriteAlt = (alt: CaseAlternative): CaseAlternative => ({
     ...alt,
     pattern: rewritePattern(elaborator, alt.pattern),
-    guard: alt.guard ? rewriteExpr(alt.guard) : undefined,
+    qualifiers: rewriteQualifiers(alt.qualifiers),
     body: rewriteExpr(alt.body),
   });
   const rewriteGuard = (guard: Guard): Guard => ({
     ...guard,
-    condition: guard.condition ? rewriteExpr(guard.condition) : undefined,
+    qualifiers: rewriteQualifiers(guard.qualifiers),
     body: rewriteExpr(guard.body),
   });
   const rewriteLocal = (b: LocalBinding): LocalBinding => ({
@@ -2511,10 +2668,28 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
   };
 }
 
+/** A numeric literal pattern at `Double`/`Float` matches the one-field box and
+ * then the raw JS number, exactly as an `Int` literal matches `I` and then its
+ * machine word.  An integer literal at `Double` is the double of that whole
+ * number, which is what the literal alternative has to carry. */
+function boxedDouble(elaborator: Elaborator, p: Extract<Pattern, { tag: "int" | "double" }>): Pattern {
+  const box = elaborator.doubleLit.get(p);
+  if (!box) return p;
+  return {
+    tag: "con",
+    name: box === "Double" ? "DoubleBox" : "FloatBox",
+    args: [{ tag: "double", value: p.value, span: p.span }],
+    span: p.span,
+  };
+}
+
 function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
   switch (p.tag) {
+    case "double":
+      return boxedDouble(elaborator, p);
     case "int":
-      return elaborator.boxedInt.has(p) ? { tag: "con", name: "I", args: [p], span: p.span } : p;
+      if (elaborator.boxedInt.has(p)) return { tag: "con", name: "I", args: [p], span: p.span };
+      return boxedDouble(elaborator, p);
     // A `Char` is `C CharPrim`, so matching one is matching that constructor
     // and then the machine code point - the same two steps `I 0` takes for an
     // `Int` literal pattern. The inner `char` pattern is the raw one.
@@ -2529,6 +2704,11 @@ function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
       return p.name === "()" && p.args.length === 0
         ? { tag: "int", value: 0, span: p.span }
         : { ...p, args: p.args.map((arg) => rewritePattern(elaborator, arg)) };
+    // The state token is the one type with no runtime value at all, so a
+    // binder at that type has to say so before types are erased.
+    case "var":
+    case "wild":
+      return elaborator.isVoidRep(p) ? { ...p, voidRep: true } : p;
     default:
       return p;
   }

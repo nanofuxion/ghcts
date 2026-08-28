@@ -26,13 +26,10 @@
  * why `Foldable` here has no `foldMap`, and why `traverse`/`mapM` are ordinary
  * list functions rather than `Traversable` methods.
  *
- * `IO` follows GHC: an action is a *function of a state token*, so building it
- * is not running it, and running it means applying it. GHC's is
- * `State# RealWorld -> (# State# RealWorld, a #)`; the token here is a real
- * nullary constructor and the result pair is a real data type, because this
- * frontend has no void types and no unboxed tuples. What matters is preserved:
- * matching the result constructor is what sequences one action after another,
- * and it does so without forcing the value inside.
+ * `IO` is GHC's `State# RealWorld -> (# State# RealWorld, a #)`, exactly: the
+ * token is a void type the backend erases and the result is an unboxed tuple
+ * returned in registers, so a bind step allocates nothing. See the comment on
+ * the declaration below.
  */
 export const PRELUDE_SOURCE = `module GHCTS.Prelude where
 
@@ -47,11 +44,30 @@ data Char = C CharPrim
 -- away from every program that declares one, and \`data C = A | B | D\` is a
 -- thing people write.
 data Double = DoubleBox DoublePrim
+
+-- IEEE *single* precision. On this backend a \`Float\` is a JS number like a
+-- \`Double\`; what makes it a different type is that every arithmetic result
+-- goes back through \`Math.fround\`, which is what \`FloatAddOp\` and its
+-- neighbours do. \`Float\` is in the backend's \`unboxableTyCons\` for the same
+-- reason \`Double\` is, so a \`FloatBox\` IS the number.
+data Float = FloatBox FloatPrim
 data Ordering = LT | EQ | GT
 data Maybe a = Nothing | Just a
 data Either a b = Left a | Right b
 
-data RealWorld = RealWorld
+-- \`IO\` in GHC's own representation. \`RealWorld\` is GHC's \`State# RealWorld\`:
+-- a VOID type, zero JS values wide, declared nowhere because it has no values
+-- to declare - \`src/elaborate.ts\` recognises the name and \`src/desugar.ts\`
+-- gives every binder at that type \`arity = 0\`, which is what makes codegen
+-- drop the argument register entirely. \`IOResult\` is GHC's unboxed tuple
+-- \`(# State# RealWorld, a #)\`, wired to the backend's \`(#,#)\` in
+-- \`src/desugar.ts\`; it is written as an ordinary data declaration only so the
+-- type checker can see its fields.
+--
+-- The two together are what make an \`IO\` action a closure of arity 1 with NO
+-- argument registers, which is the calling convention \`h\$ap_1_0\`, \`h\$catch\`
+-- and \`h\$forkThread\` all assume - and they are why a bind step now assigns a
+-- register where it used to allocate a two-field heap object.
 data IOResult a = IOResult RealWorld a
 data IO a = IO (RealWorld -> IOResult a)
 
@@ -102,16 +118,36 @@ class Fractional a => RealFrac a where
 class Num a => Integral a where
   toIntPrim :: a -> IntPrim
 
+-- GHC's own three methods and their mutual defaults. \`showsPrec\` is what
+-- makes nesting print right - a field is shown at precedence 11, so
+-- \`Just (Just 1)\` gets the parentheses \`show\` alone could never place - and
+-- \`showList\` is what makes \`show "hi"\` a quoted string rather than a list of
+-- quoted characters.
 class Show a where
+  showsPrec :: Int -> a -> [Char] -> [Char]
   show :: a -> [Char]
+  showList :: [a] -> [Char] -> [Char]
+  showsPrec d x s = show x ++ s
+  show x = showsPrec 0 x ""
+  showList xs s = showList__ shows xs s
 
 class Enum a where
   toEnum :: Int -> a
   fromEnum :: a -> Int
   succ :: a -> a
   pred :: a -> a
+  enumFrom :: a -> [a]
+  enumFromTo :: a -> a -> [a]
+  enumFromThen :: a -> a -> [a]
+  enumFromThenTo :: a -> a -> a -> [a]
   succ x = toEnum (fromEnum x + 1)
   pred x = toEnum (fromEnum x - 1)
+  -- GHC's own defaults: the range is walked on the \`Int\` the type maps to and
+  -- mapped back, so \`[x ..]\` stops at \`maxBound :: Int\` rather than wrapping.
+  enumFrom x = map toEnum (enumIntFromTo (fromEnum x) maxBound)
+  enumFromTo x y = map toEnum (enumIntFromTo (fromEnum x) (fromEnum y))
+  enumFromThen x y = map toEnum (enumIntFromThenTo (fromEnum x) (fromEnum y - fromEnum x) (enumLimit (fromEnum y - fromEnum x)))
+  enumFromThenTo x y z = map toEnum (enumIntFromThenTo (fromEnum x) (fromEnum y - fromEnum x) (fromEnum z))
 
 class Bounded a where
   minBound :: a
@@ -199,7 +235,81 @@ instance Num Int where
   fromInteger n = I n
 
 instance Show Int where
-  show n = showInt n
+  -- GHC's \`showSignedInt\`: a negative number is parenthesised at any
+  -- precedence above 6, so \`show (Just (-1))\` is \`Just (-1)\`.
+  showsPrec d n s = if n < 0 && d > 6 then '(' : showInt n ++ (')' : s) else showInt n ++ s
+
+-- GHC's \`showFloat\` is \`formatRealFloat FFGeneric Nothing\` over the shortest
+-- decimal digits that read back as the same value. \`toExponential()\` with no
+-- argument is specified to produce exactly those digits - the same shortest
+-- representation \`GHC.Float.floatToDigits\` computes - so only the placement of
+-- the point around them is transcribed here, case for case: scientific below
+-- 0.1 and from 10^7 up, fixed in between, and always a digit either side of
+-- the point.
+foreign import javascript unsafe "((x) => { if (x !== x) return 'NaN'; if (x === Infinity) return 'Infinity'; if (x === -Infinity) return '-Infinity'; var neg = x < 0 || Object.is(x, -0); var a = neg ? -x : x; var t = a.toExponential(); var i = t.indexOf('e'); var ds = t.slice(0, i).replace('.', ''); var e = parseInt(t.slice(i + 1), 10) + 1; var out; if (e < 0 || e > 7) { out = (ds.length === 1 ? ds + '.0' : ds[0] + '.' + ds.slice(1)) + 'e' + (e - 1); } else if (e <= 0) { out = '0.' + '0'.repeat(-e) + ds; } else { var w = ds.length >= e ? ds.slice(0, e) : ds + '0'.repeat(e - ds.length); var f = ds.length > e ? ds.slice(e) : ''; out = w + '.' + (f === '' ? '0' : f); } return neg ? '-' + out : out; })" primShowDouble :: DoublePrim -> JSStringPrim
+
+-- A \`Float\`'s shortest digits are the shortest that round-trip *at single
+-- precision*, which is not what \`toExponential()\` gives for a value held in a
+-- double: 0.1 as a Float is 0.10000000149011612 as a double. The search is for
+-- the first precision whose reading fronds back to the same float.
+foreign import javascript unsafe "((x) => { if (x !== x) return 'NaN'; if (x === Infinity) return 'Infinity'; if (x === -Infinity) return '-Infinity'; var neg = x < 0 || Object.is(x, -0); var a = Math.fround(neg ? -x : x); var t = null; for (var p = 0; p < 9; p++) { var c = a.toExponential(p); if (Math.fround(Number(c)) === a) { t = c; break; } } if (t === null) t = a.toExponential(); var i = t.indexOf('e'); var ds = t.slice(0, i).replace('.', ''); var e = parseInt(t.slice(i + 1), 10) + 1; var out; if (e < 0 || e > 7) { out = (ds.length === 1 ? ds + '.0' : ds[0] + '.' + ds.slice(1)) + 'e' + (e - 1); } else if (e <= 0) { out = '0.' + '0'.repeat(-e) + ds; } else { var w = ds.length >= e ? ds.slice(0, e) : ds + '0'.repeat(e - ds.length); var f = ds.length > e ? ds.slice(e) : ''; out = w + '.' + (f === '' ? '0' : f); } return neg ? '-' + out : out; })" primShowFloat :: FloatPrim -> JSStringPrim
+
+foreign import javascript unsafe "((s) => s.length)" primAsciiLength :: JSStringPrim -> IntPrim
+foreign import javascript unsafe "((s, i) => s.charCodeAt(i))" primAsciiAt :: JSStringPrim -> IntPrim -> IntPrim
+foreign import javascript unsafe "((x) => x < 0 || Object.is(x, -0))" primDoubleIsNeg :: DoublePrim -> Bool
+
+-- These strings are digits, signs and \`e\`, so a code unit is a code point.
+jsAscii :: JSStringPrim -> [Char]
+jsAscii s = jsAsciiFrom s 0 (primAsciiLength s)
+
+jsAsciiFrom :: JSStringPrim -> IntPrim -> IntPrim -> [Char]
+jsAsciiFrom s i n = if primIntGe i n then [] else C (primChr (primAsciiAt s i)) : jsAsciiFrom s (primIntAdd i 1) n
+
+showDouble :: Double -> [Char]
+showDouble x = case x of
+  DoubleBox p -> jsAscii (primShowDouble p)
+
+showFloat :: Float -> [Char]
+showFloat x = case x of
+  FloatBox p -> jsAscii (primShowFloat p)
+
+-- \`showSignedFloat\`: the sign is not part of the number's own spelling, so a
+-- negative one is parenthesised wherever a prefix application would be.
+instance Show Double where
+  showsPrec d x s = case x of
+    DoubleBox p -> if primDoubleIsNeg p && d > 6 then '(' : showDouble x ++ (')' : s) else showDouble x ++ s
+
+instance Show Float where
+  showsPrec d x s = case x of
+    FloatBox p -> if x < 0 && d > 6 then '(' : showFloat x ++ (')' : s) else showFloat x ++ s
+
+instance Show () where
+  showsPrec d x s = showString "()" s
+
+instance Show a => Show (Maybe a) where
+  showsPrec d x s = case x of
+    Nothing -> showString "Nothing" s
+    Just y -> showParen (d > 10) (\\r -> showString "Just " (showsPrec 11 y r)) s
+
+instance (Show a, Show b) => Show (Either a b) where
+  showsPrec d x s = case x of
+    Left y -> showParen (d > 10) (\\r -> showString "Left " (showsPrec 11 y r)) s
+    Right y -> showParen (d > 10) (\\r -> showString "Right " (showsPrec 11 y r)) s
+
+instance Show Char where
+  showsPrec _ c s = if c == '\\'' then showString "'\\\\''" s else showChar '\\'' (showLitChar c (showChar '\\'' s))
+  showList cs s = showChar '"' (showLitString cs (showChar '"' s))
+
+instance Show a => Show [a] where
+  showsPrec _ xs s = showList xs s
+
+instance (Show a, Show b) => Show (a, b) where
+  showsPrec _ p s = case p of
+    (a, b) -> showChar '(' (shows a (showChar ',' (shows b (showChar ')' s))))
+
+instance (Show a, Show b, Show c) => Show (a, b, c) where
+  showsPrec _ p s = case p of
+    (a, b, c) -> showChar '(' (shows a (showChar ',' (shows b (showChar ',' (shows c (showChar ')' s))))))
 
 instance Real Int where
   toDoublePrim (I n) = primIntToDouble n
@@ -233,10 +343,50 @@ instance Real Double where
 instance RealFrac Double where
   fracToDoublePrim (DoubleBox d) = d
 
+instance Eq Float where
+  (==) (FloatBox a) (FloatBox b) = primFloatEq a b
+
+instance Ord Float where
+  (<) (FloatBox a) (FloatBox b) = primFloatLt a b
+  (<=) (FloatBox a) (FloatBox b) = primFloatLe a b
+  (>) (FloatBox a) (FloatBox b) = primFloatGt a b
+  (>=) (FloatBox a) (FloatBox b) = primFloatGe a b
+
+instance Num Float where
+  (+) (FloatBox a) (FloatBox b) = FloatBox (primFloatAdd a b)
+  (-) (FloatBox a) (FloatBox b) = FloatBox (primFloatSub a b)
+  (*) (FloatBox a) (FloatBox b) = FloatBox (primFloatMul a b)
+  negate (FloatBox a) = FloatBox (primFloatNeg a)
+  fromInteger n = FloatBox (primDoubleToFloat (primIntToDouble n))
+
+instance Fractional Float where
+  (/) (FloatBox a) (FloatBox b) = FloatBox (primFloatDiv a b)
+  fromRational d = FloatBox (primDoubleToFloat d)
+
+instance Real Float where
+  toDoublePrim (FloatBox a) = primFloatToDouble a
+
+instance RealFrac Float where
+  fracToDoublePrim (FloatBox a) = primFloatToDouble a
+
 -- The JS backend's \`Int\` is 32-bit, exactly as GHC's is on that platform.
 instance Bounded Int where
   minBound = negate 2147483648
   maxBound = 2147483647
+
+-- Lazy in the tail, so \`zip [0 ..] xs\` walks only as far as \`xs\` does.
+enumIntFromTo :: Int -> Int -> [Int]
+enumIntFromTo x y = if x > y then [] else x : enumIntFromTo (x + 1) y
+
+enumIntFromThenTo :: Int -> Int -> Int -> [Int]
+enumIntFromThenTo x d y =
+  if (if d < 0 then x < y else x > y)
+    then []
+    else x : enumIntFromThenTo (x + d) d y
+
+-- \`[x, y ..]\` runs to whichever end of \`Int\` its step is heading for.
+enumLimit :: Int -> Int
+enumLimit d = if d < 0 then minBound else maxBound
 
 instance Enum Int where
   toEnum n = n
@@ -387,18 +537,18 @@ ioPure x = IO (\\s -> IOResult s x)
 -- what runs \`m\` to completion before \`k\` starts; \`a\` stays a thunk, so
 -- binding a result never forces it.
 ioBind :: IO a -> (a -> IO b) -> IO b
-ioBind m k = IO (\\s -> ioBindStep (unIO m s) k)
+ioBind m k = IO (\\s -> ioBindStep m k s)
 
-ioBindStep :: IOResult a -> (a -> IO b) -> IOResult b
-ioBindStep r k = case r of
-  IOResult s a -> unIO (k a) s
+ioBindStep :: IO a -> (a -> IO b) -> RealWorld -> IOResult b
+ioBindStep m k s = case unIO m s of
+  IOResult t a -> unIO (k a) t
 
 ioThen :: IO a -> IO b -> IO b
-ioThen m k = IO (\\s -> ioThenStep (unIO m s) k)
+ioThen m k = IO (\\s -> ioThenStep m k s)
 
-ioThenStep :: IOResult a -> IO b -> IOResult b
-ioThenStep r k = case r of
-  IOResult s a -> unIO k s
+ioThenStep :: IO a -> IO b -> RealWorld -> IOResult b
+ioThenStep m k s = case unIO m s of
+  IOResult t a -> unIO k t
 
 ioMap :: (a -> b) -> IO a -> IO b
 ioMap f m = ioBind m (\\x -> ioPure (f x))
@@ -406,12 +556,13 @@ ioMap f m = ioBind m (\\x -> ioPure (f x))
 ioAp :: IO (a -> b) -> IO a -> IO b
 ioAp f m = ioBind f (\\g -> ioMap g m)
 
-ioValue :: IOResult a -> a
-ioValue r = case r of
-  IOResult s a -> a
-
+-- GHC's \`unsafeDupablePerformIO (IO m) = case m realWorld# of (# _, a #) -> a\`.
+-- An unboxed tuple cannot be passed to a function, so the match has to happen
+-- here rather than in a helper - which is also why \`ioBindStep\` above takes
+-- the action and the token instead of the tuple.
 unsafePerformIO :: IO a -> a
-unsafePerformIO m = ioValue (unIO m RealWorld)
+unsafePerformIO m = case unIO m primRealWorld of
+  IOResult s a -> a
 
 -- GHC's real entry point is \`:Main.main = runMainIO Main.main\`, and
 -- \`src/elaborate.ts\` emits that same wrapper, so \`h$main(...Main.main)\` -
@@ -520,6 +671,85 @@ showOrdering o = case o of
   LT -> "LT"
   EQ -> "EQ"
   GT -> "GT"
+
+shows :: Show a => a -> [Char] -> [Char]
+shows x s = showsPrec 0 x s
+
+showChar :: Char -> [Char] -> [Char]
+showChar c s = c : s
+
+showString :: [Char] -> [Char] -> [Char]
+showString xs s = xs ++ s
+
+showParen :: Bool -> ([Char] -> [Char]) -> [Char] -> [Char]
+showParen b p s = if b then showChar '(' (p (showChar ')' s)) else p s
+
+showList__ :: (a -> [Char] -> [Char]) -> [a] -> [Char] -> [Char]
+showList__ showx xs s = case xs of
+  [] -> "[]" ++ s
+  (y : ys) -> '[' : showx y (showListTail showx ys s)
+
+showListTail :: (a -> [Char] -> [Char]) -> [a] -> [Char] -> [Char]
+showListTail showx xs s = case xs of
+  [] -> ']' : s
+  (y : ys) -> ',' : showx y (showListTail showx ys s)
+
+-- GHC.Show's own table, verbatim: the mnemonic for each of the first 33 code
+-- points. \`showLitChar\` never reaches the entries that have a shorter
+-- spelling (\`\\n\` for LF, \`\\t\` for HT), so they are here only to keep the
+-- indices right.
+asciiTab :: [[Char]]
+asciiTab =
+  [ "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL"
+  , "BS", "HT", "LF", "VT", "FF", "CR", "SO", "SI"
+  , "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB"
+  , "CAN", "EM", "SUB", "ESC", "FS", "GS", "RS", "US"
+  , "SP"
+  ]
+
+asciiName :: Int -> [Char]
+asciiName n = case drop n asciiTab of
+  (x : _) -> x
+  [] -> ""
+
+-- \`showLitChar\` and \`showLitString\` are GHC.Show's, case for case and in its
+-- order: a code point above DEL is a decimal escape, DEL and the backslash are
+-- named, anything printable stands for itself, seven control characters have
+-- short escapes, and the rest take their mnemonic from the table.
+showLitChar :: Char -> [Char] -> [Char]
+showLitChar c s =
+  if c > '\\DEL' then showChar '\\\\' (showString (showInt (ord c)) (escapeGuard isDecDigit s))
+  else if c == '\\DEL' then showString "\\\\DEL" s
+  else if c == '\\\\' then showString "\\\\\\\\" s
+  else if c >= ' ' then showChar c s
+  else if c == '\\a' then showString "\\\\a" s
+  else if c == '\\b' then showString "\\\\b" s
+  else if c == '\\f' then showString "\\\\f" s
+  else if c == '\\n' then showString "\\\\n" s
+  else if c == '\\r' then showString "\\\\r" s
+  else if c == '\\t' then showString "\\\\t" s
+  else if c == '\\v' then showString "\\\\v" s
+  else if c == '\\SO' then showString "\\\\SO" (escapeGuard isH s)
+  else showString ('\\\\' : asciiName (ord c)) s
+
+showLitString :: [Char] -> [Char] -> [Char]
+showLitString xs s = case xs of
+  [] -> s
+  (c : cs) -> if c == '"' then showString "\\\\\\"" (showLitString cs s) else showLitChar c (showLitString cs s)
+
+-- \`\\&\` is the empty escape, and it is all that separates the two readings of
+-- \`"\\1234"\`: without it a following digit would join the numeric escape, and
+-- \`"\\SOH"\` would be SOH rather than SO then H.
+escapeGuard :: (Char -> Bool) -> [Char] -> [Char]
+escapeGuard p s = case s of
+  (c : _) -> if p c then "\\\\&" ++ s else s
+  [] -> s
+
+isDecDigit :: Char -> Bool
+isDecDigit c = c >= '0' && c <= '9'
+
+isH :: Char -> Bool
+isH c = c == 'H'
 
 showInt :: Int -> [Char]
 showInt (I n) = if primIntLt n 0 then C (primChr 45) : digitsOf (primIntNeg n) [] else digitsOf n []

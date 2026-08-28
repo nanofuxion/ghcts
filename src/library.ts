@@ -176,10 +176,15 @@ withMVar v f = takeMVar v >>= (\\x -> f x >>= (\\r -> putMVar v x >> pure r))
 swapMVar :: MVar a -> a -> IO a
 swapMVar v x = takeMVar v >>= (\\old -> putMVar v x >> pure old)
 `,
-  "Control.Concurrent": `module Control.Concurrent (module Control.Concurrent.MVar, ThreadId, forkIO, threadDelay, yield) where
+  "Control.Concurrent": `module Control.Concurrent (module Control.Concurrent.MVar, ThreadId, ThreadStatus(..), forkIO, killThread, threadStatus, threadDelay, yield) where
 import Control.Concurrent.MVar
 
 data ThreadId = ThreadId ThreadIdPrim
+
+-- GHC's constructors and GHC's order. \`ThreadBlocked\` carries a
+-- \`BlockReason\` in GHC; \`h\$threadStatus\` reports one blocked state and no
+-- reason, so there is nothing to carry.
+data ThreadStatus = ThreadRunning | ThreadFinished | ThreadBlocked | ThreadDied
 
 -- \`h$forkThread\` starts the new thread with \`h$ap_1_0\`, i.e. it applies the
 -- closure to one *void* argument - which is exactly GHC's \`forkIO#\`, whose
@@ -206,6 +211,34 @@ threadDelayStep s (I n) = case primDelay n of
 
 yield :: IO ()
 yield = threadDelay 0
+
+foreign import javascript unsafe "((t) => new Error('thread killed'))" jsThreadKilled :: ThreadIdPrim -> JSValPrim
+foreign import javascript unsafe "((t) => h\$threadStatus(t))" jsThreadStatus :: ThreadIdPrim -> IntPrim
+-- \`killThread#\`, not a foreign call: killing the *current* thread means
+-- never returning to the caller, and \`h\$killThread\` says so by handing back
+-- the continuation to jump to instead. Only a primop can be compiled that way
+-- (\`PRPrimCall\` in the backend); a \`foreign import javascript unsafe\` is a
+-- plain call whose value is assigned to a register.
+killThread :: ThreadId -> IO ()
+killThread t = IO (\\s -> killThreadStep s t)
+
+killThreadStep :: RealWorld -> ThreadId -> IOResult ()
+killThreadStep s (ThreadId t) = case primKillThread t (jsThreadKilled t) s of
+  _ -> IOResult s ()
+
+-- GHC's \`threadStatus#\` returns \`(# status, capability, locked #)\`, and only
+-- the first of the three is ever asked for here. The status numbers are the
+-- RTS's own (\`src/stg-js/rts-static.ts\`): running 0, blocked 1, finished 16,
+-- died 17.
+threadStatus :: ThreadId -> IO ThreadStatus
+threadStatus t = IO (\\s -> threadStatusStep s t)
+
+threadStatusStep :: RealWorld -> ThreadId -> IOResult ThreadStatus
+threadStatusStep s (ThreadId t) = case jsThreadStatus t of
+  n -> IOResult s (toThreadStatus n)
+
+toThreadStatus :: IntPrim -> ThreadStatus
+toThreadStatus n = if primIntEq n 0 then ThreadRunning else (if primIntEq n 1 then ThreadBlocked else (if primIntEq n 16 then ThreadFinished else ThreadDied))
 `,
   "Data.Map": `module Data.Map where
 
@@ -370,6 +403,11 @@ foldlWithKey f z (Bin _ k x l r) = foldlWithKey f (f (foldlWithKey f z l) k x) r
 
 toList :: Map k a -> [(k, a)]
 toList m = foldrWithKey (\\k x acc -> (k, x) : acc) [] m
+
+-- containers shows a map as the call that rebuilds it, at precedence 10 so a
+-- nested one is parenthesised.
+instance (Show k, Show a) => Show (Map k a) where
+  showsPrec d m r = showParen (d > 10) (\\rest -> showString "fromList " (showsPrec 11 (toList m) rest)) r
 
 toAscList :: Map k a -> [(k, a)]
 toAscList m = toList m
@@ -540,6 +578,14 @@ type IntSet = Set Int
 
 data Seq a = Empty | (:<|) a (Seq a)
 
+instance Show a => Show (Seq a) where
+  showsPrec d s r = showParen (d > 10) (\\rest -> showString "fromList " (showsPrec 11 (seqToList s) rest)) r
+
+seqToList :: Seq a -> [a]
+seqToList s = case s of
+  Empty -> []
+  (x :<| xs) -> x : seqToList xs
+
 empty :: Seq a
 empty = Empty
 
@@ -706,15 +752,30 @@ instance Functor (Const a) where
   fmap f c = case c of
     Const x -> Const x
 `,
-  "Control.Category": `module Control.Category where
+  "Control.Category": `module Control.Category (Category(..), (>>>), (<<<)) where
 
--- Only the two names miso imports; the class itself would need a kind this
--- frontend cannot write down.
-id :: a -> a
-id x = x
+-- GHC's \`Category\` is over \`k -> k -> Type\`; this frontend has no kinds, and
+-- the class means the same without one. \`id\` and \`(.)\` are methods, not the
+-- Prelude's functions, which is the whole point: miso writes
+-- \`import Prelude hiding ((.))\` next to \`import Control.Category ((.))\` so
+-- that \`.\` composes lenses. Both names stay scoped to this module, so a
+-- program that does not import it keeps the Prelude's \`.\` unchanged.
+class Category cat where
+  id :: cat a a
+  (.) :: cat b c -> cat a b -> cat a c
 
-(.) :: (b -> c) -> (a -> b) -> a -> c
-(.) f g x = f (g x)
+instance Category (->) where
+  id = Prelude.id
+  (.) f g = \\x -> f (g x)
+
+(>>>) :: Category cat => cat a b -> cat b c -> cat a c
+(>>>) f g = g . f
+
+(<<<) :: Category cat => cat b c -> cat a b -> cat a c
+(<<<) f g = f . g
+`,
+  "Control.Arrow": `module Control.Arrow (module Control.Category) where
+import Control.Category
 `,
   "Data.JSString": `module Data.JSString where
 
@@ -918,6 +979,11 @@ filterList :: (a -> Bool) -> [a] -> [a]
 filterList p xs = case xs of
   [] -> []
   (y : ys) -> if p y then y : filterList p ys else filterList p ys
+
+-- GHC's \`Show Text\`/\`Show JSString\`: a text value prints as the \`String\` it
+-- denotes, quotes, escapes and all.
+instance Show JSString where
+  showsPrec d s r = showList (unpack s) r
 
 instance Eq JSString where
   (==) (JSString a) (JSString b) = jsStringEq a b
@@ -1296,6 +1362,7 @@ isUndefined (JSVal x) = jsIsUndefined x
 `,
   "GHC.JS.Foreign.Callback": `module GHC.JS.Foreign.Callback where
 import GHC.JS.Prim
+import GHCJS.Types (jsval)
 
 data OnBlocked = ThrowWouldBlock | ContinueAsync
 data Callback a = Callback CallbackPrim
@@ -1313,7 +1380,9 @@ data Callback a = Callback CallbackPrim
 foreign import javascript unsafe "((g) => { const c = () => (h$forkThread(g, false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback0 :: (RealWorld -> IOResult ()) -> CallbackPrim
 foreign import javascript unsafe "((g) => { const c = (x) => (h$forkThread(h$c2(h$ap1_e, g, x), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback1 :: (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
 foreign import javascript unsafe "((g) => { const c = (x,y) => (h$forkThread(h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback2 :: (JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((g) => { const c = (x,y,z) => (h$forkThread(h$c2(h$ap1_e, h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), z), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback3 :: (JSValPrim -> JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
 foreign import javascript unsafe "((c) => { h$extraRoots.remove(c); c.root = null; })" jsReleaseCallback :: CallbackPrim -> IntPrim
+foreign import javascript unsafe "((c) => c)" jsCallbackVal :: CallbackPrim -> JSValPrim
 
 asyncCallback :: IO () -> IO (Callback (IO ()))
 asyncCallback action = IO (\\s -> callbackStep s (jsCallback0 (\\t -> unIO action t)))
@@ -1324,11 +1393,100 @@ asyncCallback1 f = IO (\\s -> callbackStep s (jsCallback1 (\\x t -> unIO (f (JSV
 asyncCallback2 :: (JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> IO ()))
 asyncCallback2 f = IO (\\s -> callbackStep s (jsCallback2 (\\x y t -> unIO (f (JSVal x) (JSVal y)) t)))
 
--- A synchronous callback would have to run the action to completion before
--- returning, which needs \`h$runSync\` and its would-block handling. Until that
--- is modelled these are the asynchronous ones under the synchronous names,
--- which is a real difference: a \`syncCallback\` that returns before its action
--- has run would be a silent bug. They are therefore NOT defined here.
+asyncCallback3 :: (JSVal -> JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> JSVal -> IO ()))
+asyncCallback3 f = IO (\\s -> callbackStep s (jsCallback3 (\\x y z t -> unIO (f (JSVal x) (JSVal y) (JSVal z)) t)))
+
+-- The callback IS the JavaScript function, so handing it out as a \`JSVal\` is
+-- JavaScript's identity and no Haskell work - the same representational
+-- identity every other \`IsJSVal\` instance is.
+instance IsJSVal (Callback a) where
+  jsval (Callback c) = case jsCallbackVal c of
+    v -> JSVal v
+
+-- A synchronous callback runs its action to completion before the JavaScript
+-- function returns, which is what \`h$runSync\` does - GHC's own
+-- \`js_syncCallback\` is \`h$makeCallback(h$runSync, [onBlocked], action)\`.
+-- \`ContinueAsync\` lets a block fall back to the asynchronous scheduler;
+-- \`ThrowWouldBlock\` makes it throw instead.
+--
+-- These could not be written until now. \`h$runSync\` enters the action with
+-- \`h$ap_1_0\` - one argument occupying no register - and only an \`IO\` whose
+-- state token is a void type compiles to a closure of that shape.
+--
+-- The \`'\` variants hand the action's \`JSVal\` back to JavaScript. GHC uses
+-- \`h$runSyncReturn\`, which reads the value through a ghc-internal symbol a
+-- ghcts program does not link, so the value travels the same way the
+-- arguments do: the action stores it and the wrapper reads it out. The slot is
+-- saved and restored around the call, so a callback that runs another callback
+-- cannot lose its own result.
+foreign import javascript unsafe "((b, g) => { const run = globalThis['h$' + 'runSync']; const c = () => run(g, b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback0 :: Bool -> (RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((b, g) => { const run = globalThis['h$' + 'runSync']; const c = (x) => run(h$c2(h$ap1_e, g, x), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback1 :: Bool -> (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((b, g) => { const run = globalThis['h$' + 'runSync']; const c = (x,y) => run(h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback2 :: Bool -> (JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((b, g) => { const run = globalThis['h$' + 'runSync']; const c = (x,y,z) => run(h$c2(h$ap1_e, h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), z), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback3 :: Bool -> (JSValPrim -> JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+
+foreign import javascript unsafe "((v) => { globalThis.h$ghctsSyncResult = v; return 0; })" jsPutSyncResult :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((g) => { const run = globalThis['h$' + 'runSync']; const c = () => { const p = globalThis.h$ghctsSyncResult; run(g, false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn0 :: (RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((g) => { const run = globalThis['h$' + 'runSync']; const c = (x) => { const p = globalThis.h$ghctsSyncResult; run(h$c2(h$ap1_e, g, x), false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn1 :: (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((g) => { const run = globalThis['h$' + 'runSync']; const c = (x,y) => { const p = globalThis.h$ghctsSyncResult; run(h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn2 :: (JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "((g) => { const run = globalThis['h$' + 'runSync']; const c = (x,y,z) => { const p = globalThis.h$ghctsSyncResult; run(h$c2(h$ap1_e, h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), z), false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn3 :: (JSValPrim -> JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
+
+-- \`h$runSyncAction\` seats a top-level exception handler on the thread it
+-- creates, and names ghc-internal's \`setCurrentThreadResultException\` for the
+-- job. A ghcts program does not link ghc-internal, and a bare reference to an
+-- undefined global is a ReferenceError rather than \`undefined\`, so the slot is
+-- filled here instead - with a handler of exactly the shape \`h$catch_e\`
+-- applies: two arguments in one register, the exception and the erased token.
+-- Recording the exception is what makes \`h$runSync\` re-throw it to the
+-- JavaScript caller instead of reporting a thread that merely did not finish.
+foreign import javascript unsafe "((h) => { globalThis.h$ghczminternalZCGHCziInternalziJSziPrimziInternalzisetCurrentThreadResultException = h; return 0; })" jsInstallSyncHandler :: (JSValPrim -> RealWorld -> IOResult ()) -> IntPrim
+foreign import javascript unsafe "((e) => { h$setCurrentThreadResultJSException(e); return 0; })" jsSyncFailed :: JSValPrim -> IntPrim
+
+syncFailed :: JSValPrim -> RealWorld -> IOResult ()
+syncFailed e t = case jsSyncFailed e of
+  _ -> IOResult t ()
+
+syncCallbackStep :: RealWorld -> CallbackPrim -> IOResult (Callback a)
+syncCallbackStep s c = case jsInstallSyncHandler syncFailed of
+  _ -> IOResult s (Callback c)
+
+blocksAsync :: OnBlocked -> Bool
+blocksAsync b = case b of
+  ContinueAsync -> True
+  ThrowWouldBlock -> False
+
+syncCallback :: OnBlocked -> IO () -> IO (Callback (IO ()))
+syncCallback b action = IO (\\s -> syncCallbackStep s (jsSyncCallback0 (blocksAsync b) (\\t -> unIO action t)))
+
+syncCallback1 :: OnBlocked -> (JSVal -> IO ()) -> IO (Callback (JSVal -> IO ()))
+syncCallback1 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback1 (blocksAsync b) (\\x t -> unIO (f (JSVal x)) t)))
+
+syncCallback2 :: OnBlocked -> (JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> IO ()))
+syncCallback2 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback2 (blocksAsync b) (\\x y t -> unIO (f (JSVal x) (JSVal y)) t)))
+
+syncCallback3 :: OnBlocked -> (JSVal -> JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> JSVal -> IO ()))
+syncCallback3 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback3 (blocksAsync b) (\\x y z t -> unIO (f (JSVal x) (JSVal y) (JSVal z)) t)))
+
+putSyncResult :: IO JSVal -> IO ()
+putSyncResult m = m >>= putSyncResultStep
+
+putSyncResultStep :: JSVal -> IO ()
+putSyncResultStep (JSVal v) = IO (\\s -> putSyncResultDone s v)
+
+putSyncResultDone :: RealWorld -> JSValPrim -> IOResult ()
+putSyncResultDone s v = case jsPutSyncResult v of
+  _ -> IOResult s ()
+
+syncCallback' :: IO JSVal -> IO (Callback (IO JSVal))
+syncCallback' m = IO (\\s -> syncCallbackStep s (jsSyncCallbackReturn0 (\\t -> unIO (putSyncResult m) t)))
+
+syncCallback1' :: (JSVal -> IO JSVal) -> IO (Callback (JSVal -> IO JSVal))
+syncCallback1' f = IO (\\s -> syncCallbackStep s (jsSyncCallbackReturn1 (\\x t -> unIO (putSyncResult (f (JSVal x))) t)))
+
+syncCallback2' :: (JSVal -> JSVal -> IO JSVal) -> IO (Callback (JSVal -> JSVal -> IO JSVal))
+syncCallback2' f = IO (\\s -> syncCallbackStep s (jsSyncCallbackReturn2 (\\x y t -> unIO (putSyncResult (f (JSVal x) (JSVal y))) t)))
+
+syncCallback3' :: (JSVal -> JSVal -> JSVal -> IO JSVal) -> IO (Callback (JSVal -> JSVal -> JSVal -> IO JSVal))
+syncCallback3' f = IO (\\s -> syncCallbackStep s (jsSyncCallbackReturn3 (\\x y z t -> unIO (putSyncResult (f (JSVal x) (JSVal y) (JSVal z))) t)))
 
 callbackStep :: RealWorld -> CallbackPrim -> IOResult (Callback a)
 callbackStep s c = IOResult s (Callback c)
@@ -1341,14 +1499,18 @@ releaseStep s c = case jsReleaseCallback c of
   _ -> IOResult s ()
 `,
   "Control.Exception": `module Control.Exception where
-import Data.JSString (JSString)
+import Data.JSString (JSString, unpack)
 
 -- Only the JavaScript exception shape: this frontend has no \\\`Exception\\\` class
--- and no \\\`SomeException\\\` hierarchy, and \\\`throw\\\`/\\\`catch\\\` here are the JS
--- \\\`throw\\\` and \\\`try\\\`/\\\`catch\\\` a ghcts \\\`error\\\` already raises.
+-- and no \\\`SomeException\\\` hierarchy, so an exception is whatever JavaScript
+-- value was thrown.
+--
+-- What IS GHC's is the mechanism. \\\`throwIO\\\` is \\\`raiseIO#\\\` and \\\`catch\\\` is
+-- \\\`catch#\\\`, so the RTS unwinds the Haskell stack to the nearest handler frame
+-- exactly as it does under GHC - a JS \\\`throw\\\` would instead escape past every
+-- handler and kill the thread, which is what \\\`Prelude.error\\\` still does.
 data SomeException = SomeException JSValPrim
 
-foreign import javascript unsafe "((e) => { throw e; })" jsThrow :: JSValPrim -> IntPrim
 foreign import javascript unsafe "((s) => new Error(s))" jsError :: JSStringPrim -> JSValPrim
 foreign import javascript unsafe "((e) => String(e && e.message !== undefined ? e.message : e))" jsShowException :: JSValPrim -> JSStringPrim
 
@@ -1356,14 +1518,298 @@ displayException :: SomeException -> JSString
 displayException (SomeException e) = case jsShowException e of
   s -> JSString s
 
-throwIO :: SomeException -> IO a
-throwIO (SomeException e) = IO (\\s -> throwStep s e)
+-- GHC shows a \`SomeException\` as the exception it wraps shows itself, which
+-- for the one shape this frontend has is the JavaScript error's message.
+instance Show SomeException where
+  showsPrec d e r = showString (unpack (displayException e)) r
 
-throwStep :: RealWorld -> JSValPrim -> IOResult a
-throwStep s e = case jsThrow e of
-  _ -> IOResult s (error "Control.Exception.throwIO: unreachable")
+-- \`raiseIO#\` does not return: it unwinds to a handler frame, so there is no
+-- result to build and no unreachable value to invent.
+throwIO :: SomeException -> IO a
+throwIO (SomeException e) = IO (\\s -> primRaiseIO e s)
+
+-- GHC's \`catch\`. \`h\$catch\` pushes the handler frame and jumps into the
+-- action; \`h\$throw\` unwinds to that frame and applies the handler to the
+-- exception and the state token. Both ends need the action to be a closure of
+-- one erased argument, which is exactly what \`\\\\t -> unIO m t\` now compiles to.
+catch :: IO a -> (SomeException -> IO a) -> IO a
+catch m h = IO (\\s -> primCatch (\\t -> unIO m t) (\\e t -> unIO (h (SomeException e)) t) s)
+
+-- GHC's \`bracket\`, without \`mask\`: this target runs one JS thread and has no
+-- asynchronous exceptions to mask against, so the ordering \`mask\` buys is
+-- already guaranteed. What matters is kept - the release action runs on the
+-- exception path *before* the exception is re-thrown, and on the normal path
+-- after the body.
+bracket :: IO a -> (a -> IO b) -> (a -> IO c) -> IO c
+bracket before after thing = before >>= bracketWith after thing
+
+bracketWith :: (a -> IO b) -> (a -> IO c) -> a -> IO c
+bracketWith after thing a = catch (thing a) (bracketFailed after a) >>= bracketDone after a
+
+bracketFailed :: (a -> IO b) -> a -> SomeException -> IO c
+bracketFailed after a e = after a >> throwIO e
+
+bracketDone :: (a -> IO b) -> a -> c -> IO c
+bracketDone after a r = after a >> pure r
+
 `,
   "System.IO.Unsafe": `module System.IO.Unsafe (unsafePerformIO) where
+`,
+  // A `StablePtr` is a slot in the JS backend's own `h$stablePtrData`:
+  // `h$makeStablePtr` returns `slot << 2` and `h$deRefStablePtr` shifts it
+  // back, so a pointer made here is exactly the one a program's own
+  // `foreign import ccall` sees - which is what `Miso.Reload` stores across a
+  // reload and reads out again.
+  "Foreign.StablePtr": `module Foreign.StablePtr (StablePtr, newStablePtr, deRefStablePtr, freeStablePtr) where
+
+data StablePtr a = StablePtr IntPrim
+
+foreign import javascript unsafe "((x) => h$makeStablePtr(x))" jsMakeStablePtr :: a -> IntPrim
+foreign import javascript unsafe "((p) => h$deRefStablePtr(p))" jsDeRefStablePtr :: IntPrim -> a
+foreign import javascript unsafe "((p) => { h$hs_free_stable_ptr(0, p); return 0; })" jsFreeStablePtr :: IntPrim -> IntPrim
+
+newStablePtr :: a -> IO (StablePtr a)
+newStablePtr x = IO (\\s -> newStablePtrStep s x)
+
+newStablePtrStep :: RealWorld -> a -> IOResult (StablePtr a)
+newStablePtrStep s x = case jsMakeStablePtr x of
+  p -> IOResult s (StablePtr p)
+
+deRefStablePtr :: StablePtr a -> IO a
+deRefStablePtr (StablePtr p) = IO (\\s -> deRefStablePtrStep s p)
+
+-- The slot holds the closure that was stored, thunk and all, so this returns
+-- it unforced - \`deRefStablePtr\` is not a \`seq\`.
+deRefStablePtrStep :: RealWorld -> IntPrim -> IOResult a
+deRefStablePtrStep s p = case jsDeRefStablePtr p of
+  x -> IOResult s x
+
+freeStablePtr :: StablePtr a -> IO ()
+freeStablePtr (StablePtr p) = IO (\\s -> freeStablePtrStep s p)
+
+freeStablePtrStep :: RealWorld -> IntPrim -> IOResult ()
+freeStablePtrStep s p = case jsFreeStablePtr p of
+  _ -> IOResult s ()
+`,
+  "Foreign": `module Foreign (module Foreign.StablePtr) where
+import Foreign.StablePtr
+`,
+  // This backend's `Int` IS a 32-bit signed machine int - `IntMulOp` is
+  // `Math.imul` and `IntToInt32Op` is the identity - so `Int32` is that same
+  // arithmetic, and `Int8`/`Int16` are it narrowed after every operation,
+  // which is exactly what GHC's `Int8AddOp` does with its `signExtend8`.
+  // Every intermediate stays inside 32 bits (two 16-bit factors reach 2^30),
+  // so nothing here rounds.
+  //
+  // `Int64` is deliberately absent: it does not fit a JavaScript number, and
+  // aliasing it to `Int` would be wrong without saying so.
+  "Data.Int": `module Data.Int (Int8, Int16, Int32) where
+
+data Int8 = I8 IntPrim
+data Int16 = I16 IntPrim
+data Int32 = I32 IntPrim
+
+-- \`primIntRem\` truncates towards zero, so a negative \`n\` needs the second
+-- \`rem\` to land back in [0, m). Every caller names the result with a \`case\`
+-- before storing it: a Haskell function\'s result in a constructor field is a
+-- THUNK, and one of these constructors is unboxed, so the field would BE the
+-- thunk.
+unsignedRem :: IntPrim -> IntPrim -> IntPrim
+unsignedRem m n = primIntRem (primIntAdd (primIntRem n m) m) m
+
+narrow8 :: IntPrim -> IntPrim
+narrow8 n = primIntSub (unsignedRem 256 (primIntAdd n 128)) 128
+
+narrow16 :: IntPrim -> IntPrim
+narrow16 n = primIntSub (unsignedRem 65536 (primIntAdd n 32768)) 32768
+
+instance Eq Int8 where
+  (==) (I8 a) (I8 b) = primIntEq a b
+
+instance Ord Int8 where
+  (<) (I8 a) (I8 b) = primIntLt a b
+  (<=) (I8 a) (I8 b) = primIntLe a b
+  (>) (I8 a) (I8 b) = primIntGt a b
+  (>=) (I8 a) (I8 b) = primIntGe a b
+
+instance Num Int8 where
+  (+) (I8 a) (I8 b) = case narrow8 (primIntAdd a b) of
+    n -> I8 n
+  (-) (I8 a) (I8 b) = case narrow8 (primIntSub a b) of
+    n -> I8 n
+  (*) (I8 a) (I8 b) = case narrow8 (primIntMul a b) of
+    n -> I8 n
+  negate (I8 a) = case narrow8 (primIntNeg a) of
+    n -> I8 n
+  fromInteger n = case narrow8 n of
+    m -> I8 m
+
+instance Real Int8 where
+  toDoublePrim (I8 a) = primIntToDouble a
+
+instance Show Int8 where
+  show (I8 a) = show (I a)
+
+instance Eq Int16 where
+  (==) (I16 a) (I16 b) = primIntEq a b
+
+instance Ord Int16 where
+  (<) (I16 a) (I16 b) = primIntLt a b
+  (<=) (I16 a) (I16 b) = primIntLe a b
+  (>) (I16 a) (I16 b) = primIntGt a b
+  (>=) (I16 a) (I16 b) = primIntGe a b
+
+instance Num Int16 where
+  (+) (I16 a) (I16 b) = case narrow16 (primIntAdd a b) of
+    n -> I16 n
+  (-) (I16 a) (I16 b) = case narrow16 (primIntSub a b) of
+    n -> I16 n
+  (*) (I16 a) (I16 b) = case narrow16 (primIntMul a b) of
+    n -> I16 n
+  negate (I16 a) = case narrow16 (primIntNeg a) of
+    n -> I16 n
+  fromInteger n = case narrow16 n of
+    m -> I16 m
+
+instance Real Int16 where
+  toDoublePrim (I16 a) = primIntToDouble a
+
+instance Show Int16 where
+  show (I16 a) = show (I a)
+
+instance Eq Int32 where
+  (==) (I32 a) (I32 b) = primIntEq a b
+
+instance Ord Int32 where
+  (<) (I32 a) (I32 b) = primIntLt a b
+  (<=) (I32 a) (I32 b) = primIntLe a b
+  (>) (I32 a) (I32 b) = primIntGt a b
+  (>=) (I32 a) (I32 b) = primIntGe a b
+
+instance Num Int32 where
+  (+) (I32 a) (I32 b) = I32 (primIntAdd a b)
+  (-) (I32 a) (I32 b) = I32 (primIntSub a b)
+  (*) (I32 a) (I32 b) = I32 (primIntMul a b)
+  negate (I32 a) = I32 (primIntNeg a)
+  fromInteger n = I32 n
+
+instance Real Int32 where
+  toDoublePrim (I32 a) = primIntToDouble a
+
+instance Show Int32 where
+  show (I32 a) = show (I a)
+`,
+  // \`Word\` is the unsigned machine word, 32 bits here as \`Int\` is signed 32.
+  // What makes it unsigned is its own primops: every result comes back through
+  // \`>>> 0\` and the multiply through \`Math.imul\`, so the carrier always holds a
+  // number in [0, 2^32), which is why the comparisons and the conversion to
+  // \`Double\` need nothing further. \`Word8\`/\`Word16\` narrow after every step.
+  //
+  // \`Word64\` is deliberately absent, for the reason \`Int64\` is.
+  "Data.Word": `module Data.Word (Word, Word8, Word16, Word32) where
+
+data Word = W WordPrim
+data Word8 = W8 WordPrim
+data Word16 = W16 WordPrim
+data Word32 = W32 WordPrim
+
+mask8 :: WordPrim -> WordPrim
+mask8 n = primWordRem n (primIntToWord 256)
+
+mask16 :: WordPrim -> WordPrim
+mask16 n = primWordRem n (primIntToWord 65536)
+
+instance Eq Word where
+  (==) (W a) (W b) = primWordEq a b
+
+instance Ord Word where
+  (<) (W a) (W b) = primWordLt a b
+  (<=) (W a) (W b) = primWordLe a b
+  (>) (W a) (W b) = primWordGt a b
+  (>=) (W a) (W b) = primWordGe a b
+
+instance Num Word where
+  (+) (W a) (W b) = W (primWordAdd a b)
+  (-) (W a) (W b) = W (primWordSub a b)
+  (*) (W a) (W b) = W (primWordMul a b)
+  negate (W a) = W (primWordSub (primIntToWord 0) a)
+  fromInteger n = W (primIntToWord n)
+
+instance Real Word where
+  toDoublePrim (W a) = primWordToDouble a
+
+instance Eq Word8 where
+  (==) (W8 a) (W8 b) = primWordEq a b
+
+instance Ord Word8 where
+  (<) (W8 a) (W8 b) = primWordLt a b
+  (<=) (W8 a) (W8 b) = primWordLe a b
+  (>) (W8 a) (W8 b) = primWordGt a b
+  (>=) (W8 a) (W8 b) = primWordGe a b
+
+instance Num Word8 where
+  (+) (W8 a) (W8 b) = case mask8 (primWordAdd a b) of
+    n -> W8 n
+  (-) (W8 a) (W8 b) = case mask8 (primWordSub a b) of
+    n -> W8 n
+  (*) (W8 a) (W8 b) = case mask8 (primWordMul a b) of
+    n -> W8 n
+  negate (W8 a) = case mask8 (primWordSub (primIntToWord 0) a) of
+    n -> W8 n
+  fromInteger n = case mask8 (primIntToWord n) of
+    m -> W8 m
+
+instance Real Word8 where
+  toDoublePrim (W8 a) = primWordToDouble a
+
+instance Eq Word16 where
+  (==) (W16 a) (W16 b) = primWordEq a b
+
+instance Ord Word16 where
+  (<) (W16 a) (W16 b) = primWordLt a b
+  (<=) (W16 a) (W16 b) = primWordLe a b
+  (>) (W16 a) (W16 b) = primWordGt a b
+  (>=) (W16 a) (W16 b) = primWordGe a b
+
+instance Num Word16 where
+  (+) (W16 a) (W16 b) = case mask16 (primWordAdd a b) of
+    n -> W16 n
+  (-) (W16 a) (W16 b) = case mask16 (primWordSub a b) of
+    n -> W16 n
+  (*) (W16 a) (W16 b) = case mask16 (primWordMul a b) of
+    n -> W16 n
+  negate (W16 a) = case mask16 (primWordSub (primIntToWord 0) a) of
+    n -> W16 n
+  fromInteger n = case mask16 (primIntToWord n) of
+    m -> W16 m
+
+instance Real Word16 where
+  toDoublePrim (W16 a) = primWordToDouble a
+
+instance Eq Word32 where
+  (==) (W32 a) (W32 b) = primWordEq a b
+
+instance Ord Word32 where
+  (<) (W32 a) (W32 b) = primWordLt a b
+  (<=) (W32 a) (W32 b) = primWordLe a b
+  (>) (W32 a) (W32 b) = primWordGt a b
+  (>=) (W32 a) (W32 b) = primWordGe a b
+
+instance Num Word32 where
+  (+) (W32 a) (W32 b) = W32 (primWordAdd a b)
+  (-) (W32 a) (W32 b) = W32 (primWordSub a b)
+  (*) (W32 a) (W32 b) = W32 (primWordMul a b)
+  negate (W32 a) = W32 (primWordSub (primIntToWord 0) a)
+  fromInteger n = W32 (primIntToWord n)
+
+instance Real Word32 where
+  toDoublePrim (W32 a) = primWordToDouble a
+`,
+  // GHC's \`CInt\` is \`Int32\`, and on this backend so is \`Int\`.
+  "Foreign.C.Types": `module Foreign.C.Types (CInt) where
+import Data.Int (Int32)
+
+type CInt = Int32
 `,
   // GHC's \\`StableName\\` is pointer identity made observable. \\`h$makeStableName\\`
   // gives one object per heap object and \\`h$stableNameInt\\` its unique integer,
@@ -1463,7 +1909,7 @@ import Data.Functor.Identity
   // m => m s` mentions `s` nowhere but the result, so `m -> s` is the only
   // thing that can decide which state type a `n <- get` produced. See the
   // improvement pass in `src/elaborate.ts`.
-  "Control.Monad.State.Class": `module Control.Monad.State.Class (gets, modify, modify') where
+  "Control.Monad.State.Class": `module Control.Monad.State.Class (MonadState(..), gets, modify, modify') where
 
 class Monad m => MonadState s m | m -> s where
   get :: m s
@@ -1486,7 +1932,7 @@ modify' f = get >>= (\\s -> putStrict (f s))
 putStrict :: MonadState s m => s -> m ()
 putStrict s = seq s (put s)
 `,
-  "Control.Monad.Reader.Class": `module Control.Monad.Reader.Class (asks, reader) where
+  "Control.Monad.Reader.Class": `module Control.Monad.Reader.Class (MonadReader(..), asks, reader) where
 
 class Monad m => MonadReader r m | m -> r where
   ask :: m r
@@ -1977,6 +2423,12 @@ instance MonadWriter w m => MonadWriter w (MaybeT m) where
   tell w = MaybeT (maybeTLift (tell w))
 `,
   // ----------------------------------------------------------- marshalling ---
+  // ghcjs-base's name for the same module. miso imports it under this name on
+  // the ghcjs path and under `GHC.JS.Foreign.Callback` on the GHC one, so both
+  // spellings have to resolve to the one implementation.
+  "GHCJS.Foreign.Callback": `module GHCJS.Foreign.Callback (module GHC.JS.Foreign.Callback) where
+import GHC.JS.Foreign.Callback
+`,
   "GHCJS.Types": `module GHCJS.Types (jsval) where
 import GHC.JS.Prim (JSVal)
 import Data.JSString (JSString)
@@ -2077,6 +2529,11 @@ instance ToJSValue Double where
   toJSValue (DoubleBox d) = case doubleToVal d of
     v -> pureVal v
 
+instance ToJSValue Float where
+  toJSValue (FloatBox f) = case primFloatToDouble f of
+    d -> case doubleToVal d of
+      v -> pureVal v
+
 instance ToJSValue Char where
   toJSValue (C c) = case charToVal c of
     v -> pureVal v
@@ -2138,6 +2595,16 @@ instance FromJSValue Double where
 fromDoubleStep :: JSValPrim -> IO (Maybe Double)
 fromDoubleStep x = case valToDouble x of
   d -> pure (Just (DoubleBox d))
+
+-- JavaScript has one number type, so what comes back is a double; \`Float\` is
+-- the nearest single-precision value to it, which is what \`Math.fround\` gives.
+instance FromJSValue Float where
+  fromJSValue (JSVal x) = if isNumberVal x then fromFloatStep x else pure Nothing
+
+fromFloatStep :: JSValPrim -> IO (Maybe Float)
+fromFloatStep x = case valToDouble x of
+  d -> case primDoubleToFloat d of
+    f -> pure (Just (FloatBox f))
 
 instance FromJSValue JSString where
   fromJSValue (JSVal x) = if isStringVal x then fromStringStep x else pure Nothing

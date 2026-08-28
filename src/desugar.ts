@@ -26,6 +26,7 @@ import type {
   Declaration,
   Expr,
   Guard,
+  GuardQualifier,
   LocalBinding,
   Module,
   Pattern,
@@ -35,7 +36,7 @@ import type { CoreAlt, CoreBind, CoreExpr, CoreProgram } from "./core.js";
 import { coreFreeVars, mkApps, mkLams } from "./core.js";
 import { error } from "./diagnostics.js";
 import type { Binder, DataCon, Literal, StgOp } from "./stg.js";
-import { mkBinder, mkDataCon } from "./stg.js";
+import { isUnboxedTupleCon, mkBinder, mkDataCon } from "./stg.js";
 import type { Diagnostic } from "./types.js";
 
 export interface DesugarResult {
@@ -53,6 +54,29 @@ interface Prim {
   arity: number;
   bool?: true;
 }
+
+/** GHC's `realWorld# :: State# RealWorld`, wired in exactly as GHC wires it.
+ *
+ * It is a variable, not a primop: it stands for a value of a VOID type, so it
+ * occupies no JS value and codegen drops every reference to it. That is why
+ * one shared binder for the whole program is safe - nothing is ever loaded
+ * from it, stored into it or captured by it. */
+const REAL_WORLD: Binder = mkBinder("realWorld#", { arity: 0 });
+
+/** Data types the frontend represents as GHC's unboxed tuples rather than as
+ * heap objects. The only one is `IOResult`, which IS `(# State# RealWorld,
+ * a #)`: it is declared as ordinary Haskell so the type checker can see its
+ * fields, and wired here to the backend's unboxed-tuple constructor, which is
+ * recognised by the `(#` name prefix (`stg-js/utils.ts isUnboxedTupleDataCon`).
+ *
+ * The consequences are the whole point of the representation: building one
+ * assigns registers instead of allocating, and matching one binds the result
+ * slot WITHOUT entering it, so an `IO` action can return a thunk - which is
+ * what makes `readIORef` hand back what was written without forcing it. */
+const UNBOXED_TUPLE_TYPES = new Set(["IOResult"]);
+
+/** `(#,,#)` with `n-1` commas, GHC's own spelling. */
+const unboxedTupleName = (arity: number): string => `(#${",".repeat(Math.max(0, arity - 1))}#)`;
 
 const primOps: Record<string, Prim> = {
   primIntAdd: { op: "IntAddOp", arity: 2 },
@@ -86,6 +110,22 @@ const primOps: Record<string, Prim> = {
   primDoubleLog: { op: "DoubleLogOp", arity: 1 },
   primDoubleExp: { op: "DoubleExpOp", arity: 1 },
   primDoublePower: { op: "DoublePowerOp", arity: 2 },
+  // `Float` is IEEE *single* precision: every result goes through `Math.fround`,
+  // which is the whole of what makes it a different type from `Double` on a
+  // backend where both are JS numbers.
+  primFloatAdd: { op: "FloatAddOp", arity: 2 },
+  primFloatSub: { op: "FloatSubOp", arity: 2 },
+  primFloatMul: { op: "FloatMulOp", arity: 2 },
+  primFloatDiv: { op: "FloatDivOp", arity: 2 },
+  primFloatNeg: { op: "FloatNegOp", arity: 1 },
+  primFloatAbs: { op: "FloatFabsOp", arity: 1 },
+  primFloatEq: { op: "FloatEqOp", arity: 2, bool: true },
+  primFloatLt: { op: "FloatLtOp", arity: 2, bool: true },
+  primFloatLe: { op: "FloatLeOp", arity: 2, bool: true },
+  primFloatGt: { op: "FloatGtOp", arity: 2, bool: true },
+  primFloatGe: { op: "FloatGeOp", arity: 2, bool: true },
+  primFloatToDouble: { op: "FloatToDoubleOp", arity: 1 },
+  primDoubleToFloat: { op: "DoubleToFloatOp", arity: 1 },
   primIntToDouble: { op: "IntToDoubleOp", arity: 1 },
   // Truncates towards zero, as GHC's `double2Int#` does.
   primDoubleToInt: { op: "DoubleToIntOp", arity: 1 },
@@ -114,8 +154,41 @@ const primOps: Record<string, Prim> = {
   // names is object identity - which is what `Eq (StableName a)` means.
   primMakeStableName: { op: "MakeStableNameOp", arity: 1 },
   primStableNameInt: { op: "StableNameToIntOp", arity: 1 },
+  // `Word` is GHC's unsigned machine word, 32 bits on this backend exactly as
+  // `Int` is signed 32 bits. Its own primops are what make that unsigned: the
+  // results come back through `>>> 0` and the multiply through `Math.imul`,
+  // neither of which `Int` arithmetic would give.
+  primWordAdd: { op: "WordAddOp", arity: 2 },
+  primWordSub: { op: "WordSubOp", arity: 2 },
+  primWordMul: { op: "WordMulOp", arity: 2 },
+  primWordQuot: { op: "WordQuotOp", arity: 2 },
+  primWordRem: { op: "WordRemOp", arity: 2 },
+  primWordEq: { op: "WordEqOp", arity: 2, bool: true },
+  primWordLt: { op: "WordLtOp", arity: 2, bool: true },
+  primWordLe: { op: "WordLeOp", arity: 2, bool: true },
+  primWordGt: { op: "WordGtOp", arity: 2, bool: true },
+  primWordGe: { op: "WordGeOp", arity: 2, bool: true },
+  primIntToWord: { op: "IntToWordOp", arity: 1 },
+  primWordToDouble: { op: "WordToDoubleOp", arity: 1 },
   primFork: { op: "ForkOp", arity: 1 },
   primDelay: { op: "DelayOp", arity: 1 },
+  // These three are the reason `IO` had to move onto GHC's representation.
+  // Each one manipulates the *stack*, so none of them can be a foreign call:
+  //
+  //   - `h$catch` pushes a handler frame and then JUMPS into the action with
+  //     `h$ap_1_0_fast`, which only works if the action is a closure of arity
+  //     one whose argument occupies no register. `h$throw` later unwinds to
+  //     that frame and applies the handler with `h$ap_2_1_fast` - two
+  //     arguments, one register, the exception and the erased token.
+  //   - `h$throw` does not return at all; it hands back the frame to resume.
+  //   - `h$killThread` returns a *continuation* to jump to when the victim is
+  //     the current thread.
+  //
+  // A `foreign import javascript unsafe` cannot say "do not return, jump
+  // here"; `PRPrimCall` in the backend can, and that is what these compile to.
+  primCatch: { op: "CatchOp", arity: 3 },
+  primRaiseIO: { op: "RaiseIOOp", arity: 2 },
+  primKillThread: { op: "KillThreadOp", arity: 3 },
 };
 
 /** What a name resolves to. Locals shadow top levels, which shadow
@@ -204,7 +277,7 @@ class Desugarer {
         return this.application(head, args, scope);
       }
       case "lambda": {
-        const binder = mkBinder(e.parameter);
+        const binder = mkBinder(e.parameter, voidArity(e.voidRep));
         return { tag: "Lam", binder, body: this.expr(e.body, extend(scope, [[e.parameter, binder]])) };
       }
       case "lambdaCase": {
@@ -256,6 +329,7 @@ class Desugarer {
   varRef(name: string, scope: Scope, span: Span): CoreExpr {
     const local = scope.get(name);
     if (local) return { tag: "Var", binder: local };
+    if (name === "primRealWorld") return { tag: "Var", binder: REAL_WORLD };
     const con = this.cons.get(name);
     if (con) return this.saturateCon(con, []);
     const prim = primOps[name];
@@ -365,15 +439,52 @@ class Desugarer {
 
   /** `case` and `\case` alternatives; guards inside an alternative fall
    * through to the next alternative when none succeeds. */
+  /** `case <action> of IOResult s a -> body`.
+   *
+   * An unboxed tuple needs exactly ONE `case`, and the general path below
+   * would emit two: an outer one to bring the scrutinee to WHNF and an inner
+   * one to test the constructor. Both are wrong here. There is no constructor
+   * to test - the fields arrive in registers - and bringing the scrutinee to
+   * WHNF is precisely what must NOT happen, because the result slot of
+   * `(# s, a #)` is returned unevaluated. Forcing it would make every `>>=`
+   * force the value it binds.
+   *
+   * Only the shape the state token needs is recognised: one alternative, no
+   * guards, and every field a plain variable or wildcard. */
+  unboxedTupleCase(scrutinee: CoreExpr, alts: CaseAlternative[], scope: Scope): CoreExpr | undefined {
+    if (alts.length !== 1) return undefined;
+    const alt = alts[0]!;
+    if (alt.qualifiers?.length) return undefined;
+    if (alt.pattern.tag !== "con") return undefined;
+    const con = this.cons.get(alt.pattern.name);
+    if (!con || !isUnboxedTupleCon(con)) return undefined;
+    const args = alt.pattern.args;
+    if (args.length !== con.arity || args.some((a) => a.tag !== "var" && a.tag !== "wild")) return undefined;
+
+    const fields = args.map((a) => mkBinder(patternName(a) ?? "ubx", voidArity(voidRepOf(a))));
+    const names = args.flatMap((a, i): Array<[string, Binder]> => {
+      const name = patternName(a);
+      return name ? [[name, fields[i]!]] : [];
+    });
+    return {
+      tag: "Case",
+      scrutinee,
+      // The case binder holds the tuple's slots, so it is as wide as the
+      // fields that survive erasure - see `altTypeOf` in src/core-to-stg.ts.
+      binder: mkBinder("ubx", { arity: fields.filter((f) => f.arity !== 0).length }),
+      alts: [{ con: { tag: "DataAlt", con }, binders: fields, body: this.expr(alt.body, extend(scope, names)) }],
+    };
+  }
+
   alternatives(scrutinee: CoreExpr, alts: CaseAlternative[], scope: Scope, span: Span): CoreExpr {
+    const unboxed = this.unboxedTupleCase(scrutinee, alts, scope);
+    if (unboxed) return unboxed;
     const subject = scrutinee.tag === "Var" ? scrutinee.binder : mkBinder("scrut");
     const rows = alts.map((alt) => ({
       patterns: [alt.pattern],
-      guards: alt.guard ? [{ condition: alt.guard, body: alt.body }] : [{ body: alt.body }],
+      guards: [{ qualifiers: alt.qualifiers, body: alt.body }],
       whereBindings: [] as LocalBinding[],
-      hasPatternGuards: (alt.patternGuards?.length ?? 0) > 0,
     }));
-    for (const row of rows) if (row.hasPatternGuards) this.fail("pattern guards", span);
     // Naming an already-named scrutinee would add a `case` that enters it a
     // second time; that is wrong for an unboxed scrutinee and pointless for
     // any other.
@@ -442,6 +553,13 @@ class Desugarer {
           body: this.matchGroup(subjects, group, column, [], scope, fallback),
         };
       }
+      if (pattern.tag === "double") {
+        return {
+          con: { tag: "LitAlt", lit: { tag: "LitDouble", value: pattern.value } },
+          binders: [],
+          body: this.matchGroup(subjects, group, column, [], scope, fallback),
+        };
+      }
       if (pattern.tag === "int") {
         return {
           con: { tag: "LitAlt", lit: int(pattern.value) },
@@ -503,21 +621,62 @@ class Desugarer {
 
   /** One equation's guards, `where` bindings and body. */
   guardedBody(row: MatchRow, scope: Scope, next: () => CoreExpr): CoreExpr {
+    if (row.core) return row.core(scope);
     const [binds, inner] = this.localGroup(row.whereBindings, scope);
     const wrap = (body: CoreExpr): CoreExpr =>
       binds.reduceRight<CoreExpr>((b, bind) => ({ tag: "Let", bind, body: b }), body);
-    const chain = row.guards.reduceRight<CoreExpr>(
-      (rest, guard) =>
-        guard.condition === undefined
-          ? this.expr(guard.body, inner)
-          : this.boolCase(
-              this.expr(guard.condition, inner),
-              () => this.expr(guard.body, inner),
-              () => rest,
-            ),
-      next(),
-    );
+    const chain = row.guards.reduceRight<CoreExpr>((rest, guard) => this.guard(guard, inner, rest), next());
     return wrap(forceStrict(row.whereBindings, inner, chain));
+  }
+
+  /** One `|` guard: its qualifiers left to right, falling through to `rest`
+   * as soon as any of them fails. */
+  private guard(guard: Guard, scope: Scope, rest: CoreExpr): CoreExpr {
+    const qualifiers = guard.qualifiers ?? [];
+    // A lone boolean has exactly one way to fail and uses `rest` once. Anything
+    // else can reach the fall-through from several branches - a second
+    // qualifier, or the pattern-match compiler's own default alternatives - so
+    // the continuation is bound once instead of being copied into each of them.
+    if (qualifiers.length <= 1 && qualifiers[0]?.tag !== "pattern")
+      return this.qualifiers(qualifiers, guard.body, scope, () => rest);
+    const bail = mkBinder("guardfail");
+    const body = this.qualifiers(qualifiers, guard.body, scope, () => varOf(bail));
+    return { tag: "Let", bind: { tag: "NonRec", binder: bail, rhs: rest }, body };
+  }
+
+  private qualifiers(
+    qualifiers: readonly GuardQualifier[],
+    body: Expr,
+    scope: Scope,
+    bail: () => CoreExpr,
+  ): CoreExpr {
+    const [first, ...rest] = qualifiers;
+    if (!first) return this.expr(body, scope);
+    if (first.tag === "bool")
+      return this.boolCase(
+        this.expr(first.condition, scope),
+        () => this.qualifiers(rest, body, scope, bail),
+        bail,
+      );
+    // `p <- e` is a one-row match through the same pattern-match compiler an
+    // ordinary alternative goes through, so `p` may be nested, may be a
+    // literal, and binds for everything to its right.
+    const source = this.expr(first.source, scope);
+    const subject = source.tag === "Var" ? source.binder : mkBinder("guard");
+    const row: MatchRow = {
+      patterns: [first.pattern],
+      guards: [],
+      whereBindings: [],
+      core: (inner) => this.qualifiers(rest, body, inner, bail),
+    };
+    const matched = this.match([subject], [row], scope, bail());
+    if (source.tag === "Var") return matched;
+    return {
+      tag: "Case",
+      scrutinee: source,
+      binder: subject,
+      alts: [{ con: { tag: "DEFAULT" }, binders: [], body: matched }],
+    };
   }
 
   /** A `let`/`where` group. Bindings with parameters become functions; the
@@ -527,7 +686,7 @@ class Desugarer {
     const binders = bindings.map((b) => mkBinder(b.name));
     const inner = extend(scope, bindings.map((b, i) => [b.name, binders[i]!] as [string, Binder]));
     const rhss = bindings.map((binding) => {
-      const params = binding.patterns.map((p) => mkBinder(patternName(p) ?? "arg"));
+      const params = binding.patterns.map((p) => mkBinder(patternName(p) ?? "arg", voidArity(voidRepOf(p))));
       const bodyScope = extend(
         inner,
         binding.patterns.flatMap((p, j) => {
@@ -558,7 +717,10 @@ interface MatchRow {
   patterns: Pattern[];
   guards: Guard[];
   whereBindings: LocalBinding[];
-  hasPatternGuards?: boolean;
+  /** The one-row match a pattern guard compiles to: its body is the rest of
+   * that guard, which is Core already under construction rather than a
+   * surface expression, so it replaces `guards` entirely. */
+  core?: (scope: Scope) => CoreExpr;
 }
 
 const varOf = (binder: Binder): CoreExpr => ({ tag: "Var", binder });
@@ -613,8 +775,15 @@ const asOnly = (p: Pattern): Pattern =>
 const isRefutable = (p: Pattern | undefined): boolean => {
   if (p === undefined) return false;
   const q = stripAs(p);
-  return q.tag === "int" || q.tag === "string" || q.tag === "char" || q.tag === "con" || q.tag === "record";
+  return q.tag === "int" || q.tag === "double" || q.tag === "string" || q.tag === "char" || q.tag === "con" || q.tag === "record";
 };
+
+/** A binder at the void state token occupies no JS value; everything else
+ * takes the default (one slot). See `Binder.arity` in src/stg.ts. */
+const voidArity = (voidRep: true | undefined): Partial<Binder> => (voidRep ? { arity: 0 } : {});
+
+const voidRepOf = (p: Pattern): true | undefined =>
+  p.tag === "var" || p.tag === "wild" ? p.voidRep : undefined;
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
@@ -641,12 +810,17 @@ const patternArity = (p: Pattern): number => {
 };
 const patternKey = (p: Pattern): string => {
   const q = stripAs(p);
-  return q.tag === "int" ? `#${q.value}` : q.tag === "string" ? `s${q.value}` : q.tag === "char" ? `q${q.value}` : `c${patternConName(q)}`;
+  return q.tag === "int" || q.tag === "double" ? `#${q.value}` : q.tag === "string" ? `s${q.value}` : q.tag === "char" ? `q${q.value}` : `c${patternConName(q)}`;
 };
 
 function bindingsOf(subjects: Binder[], patterns: Pattern[]): Array<[string, Binder]> {
   const out: Array<[string, Binder]> = [];
   patterns.forEach((p, i) => {
+    // The only funnel through which an irrefutable column reaches the binder
+    // that stands for it, which makes it the one place the elaborator's
+    // void mark can be carried onto that binder. A wildcard at the state
+    // token binds no name but still has to erase its argument register.
+    if (voidRepOf(p) && subjects[i]) subjects[i]!.arity = 0;
     for (const name of patternNames(p)) out.push([name, subjects[i]!]);
   });
   return out;
@@ -657,10 +831,12 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
 
   for (const decl of module.declarations) {
     if (decl.tag === "data") {
+      const unboxed = UNBOXED_TUPLE_TYPES.has(decl.name);
       decl.constructors.forEach((con, i) => {
-        d.cons.set(con.name, mkDataCon(con.name, i + 1, con.arity, decl.name));
+        const name = unboxed ? unboxedTupleName(con.arity) : con.name;
+        d.cons.set(con.name, mkDataCon(name, i + 1, con.arity, unboxed ? name : decl.name));
       });
-      d.conCount.set(decl.name, decl.constructors.length);
+      d.conCount.set(unboxed ? unboxedTupleName(decl.constructors[0]?.arity ?? 0) : decl.name, decl.constructors.length);
     } else if (decl.tag === "class") {
       for (const member of decl.members) if ("name" in member) d.classMethods.add(member.name);
       d.diagnostics.push(
@@ -722,7 +898,9 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
   }
 
   return {
-    program: { name: module.name, binds, dataCons: [...d.cons.values()] },
+    // An unboxed tuple has no worker: there is no closure to enter, so GHC
+    // emits no `_con_e` for one and neither does this.
+    program: { name: module.name, binds, dataCons: [...d.cons.values()].filter((c) => !isUnboxedTupleCon(c)) },
     diagnostics: d.diagnostics,
   };
 }

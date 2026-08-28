@@ -16,6 +16,7 @@ import type {
   DoStatement,
   Expr,
   Guard,
+  GuardQualifier,
   ListQualifier,
   LocalBinding,
   Pattern,
@@ -109,12 +110,18 @@ class Sugar {
     };
   }
 
+  private qualifiers(qs: GuardQualifier[] | undefined): GuardQualifier[] | undefined {
+    return qs?.map((q) =>
+      q.tag === "bool"
+        ? { ...q, condition: this.expr(q.condition) }
+        : { ...q, pattern: this.pattern(q.pattern), source: this.expr(q.source) },
+    );
+  }
+
   private guard(g: Guard): Guard {
     return {
       ...g,
-      condition: g.condition ? this.expr(g.condition) : undefined,
-      pattern: g.pattern ? this.pattern(g.pattern) : undefined,
-      source: g.source ? this.expr(g.source) : undefined,
+      qualifiers: this.qualifiers(g.qualifiers),
       body: this.expr(g.body),
     };
   }
@@ -133,7 +140,7 @@ class Sugar {
     return {
       ...a,
       pattern: this.pattern(a.pattern),
-      guard: a.guard ? this.expr(a.guard) : undefined,
+      qualifiers: this.qualifiers(a.qualifiers),
       body: this.expr(a.body),
     };
   }
@@ -432,6 +439,66 @@ export function derivedEqMethod(decl: DataDeclaration): ValueDeclaration {
   };
 }
 
+/** `deriving Show`, as Haskell source, in GHC's own shape: a nullary
+ * constructor is its bare name, a prefix one is `showParen (d > 10)` over the
+ * name and each field at precedence 11, and a record one is
+ * `C {f = v, g = w}` with every field at precedence 0.
+ *
+ * The names printed are the *surface* ones - `URI`, not `Miso_Types_URI` -
+ * which is why `src/modules.ts` keeps them on the declaration.
+ *
+ * A constructor written infix is skipped rather than printed prefix: GHC uses
+ * its declared fixity, this pass does not track one, and a plausible guess
+ * would print a value that does not read back. */
+export function derivedShowSource(datas: readonly DataDeclaration[]): string {
+  const out: string[] = ["module GHCTS.DerivedShow where"];
+  let derived = 0;
+  for (const decl of datas) {
+    if (!decl.deriving.includes("Show")) continue;
+    if (decl.constructors.some((c) => c.arity > 0 && /^[:(]/.test(c.surface?.name ?? c.name))) continue;
+    derived++;
+    const applied = decl.parameters.length ? `(${[decl.name, ...decl.parameters].join(" ")})` : decl.name;
+    const context = decl.parameters.map((p) => `Show ${p}`).join(", ");
+    out.push(`instance ${context ? `(${context}) => ` : ""}Show ${applied} where`);
+    if (decl.constructors.length === 0) {
+      // No constructors: nothing can be shown, but the instance must exist.
+      out.push(`  showsPrec d x s = s`);
+      continue;
+    }
+    for (const con of decl.constructors) {
+      const name = con.surface?.name ?? con.name;
+      const xs = Array.from({ length: con.arity }, (_, i) => `sA${i}`);
+      const pattern = con.arity === 0 ? con.name : `(${con.name}${xs.map((x) => ` ${x}`).join("")})`;
+      if (con.arity === 0) {
+        out.push(`  showsPrec d ${pattern} s = showString ${JSON.stringify(name)} s`);
+        continue;
+      }
+      const fields = con.surface?.fields ?? con.fields;
+      // Each piece takes the rest of the output as its last argument, so the
+      // chain is built by nesting them - which is what `.`-composed `ShowS`
+      // functions come to once written out.
+      const pieces: string[] = [];
+      if (fields) {
+        pieces.push(`showString ${JSON.stringify(`${name} {${fields[0]} = `)}`);
+        xs.forEach((x, i) => {
+          pieces.push(`showsPrec 0 ${x}`);
+          if (i + 1 < xs.length) pieces.push(`showString ${JSON.stringify(`, ${fields[i + 1]} = `)}`);
+        });
+        pieces.push(`showString "}"`);
+      } else {
+        pieces.push(`showString ${JSON.stringify(`${name} `)}`);
+        xs.forEach((x, i) => {
+          if (i > 0) pieces.push(`showString " "`);
+          pieces.push(`showsPrec 11 ${x}`);
+        });
+      }
+      const body = pieces.reduceRight((rest, piece) => `${piece} (${rest})`, "sRest");
+      out.push(`  showsPrec d ${pattern} s = showParen (d > 10) (\\sRest -> ${body}) s`);
+    }
+  }
+  return derived === 0 ? "" : out.join("\n") + "\n";
+}
+
 /** `deriving Generic`, as Haskell source.
  *
  * GHC's deriving builds the `Rep` from the shape of the declaration and
@@ -465,7 +532,7 @@ export function derivedGenericSource(datas: readonly DataDeclaration[]): string 
     const applied = decl.parameters.length ? `(${[decl.name, ...decl.parameters].join(" ")})` : decl.name;
     out.push(`data Meta_D_${meta} = Meta_D_${meta}`);
     out.push(`instance Datatype Meta_D_${meta} where`);
-    out.push(`  datatypeName x = ${JSON.stringify(decl.name)}`);
+    out.push(`  datatypeName x = ${JSON.stringify(decl.surfaceName ?? decl.name)}`);
     out.push(`  isNewtype x = ${decl.newtype === true ? "True" : "False"}`);
 
     /** One constructor: its `C1` type, and how a value of it is wrapped and
@@ -475,7 +542,7 @@ export function derivedGenericSource(datas: readonly DataDeclaration[]): string 
       const tag = `Meta_C_${meta}_${i}`;
       out.push(`data ${tag} = ${tag}`);
       out.push(`instance Constructor ${tag} where`);
-      out.push(`  conName x = ${JSON.stringify(con.name)}`);
+      out.push(`  conName x = ${JSON.stringify(con.surface?.name ?? con.name)}`);
       out.push(`  conIsRecord x = ${con.fields ? "True" : "False"}`);
       const fields = Array.from({ length: con.arity }, (_, j) => {
         const sel = `Meta_S_${meta}_${i}_${j}`;
@@ -483,7 +550,7 @@ export function derivedGenericSource(datas: readonly DataDeclaration[]): string 
         out.push(`instance Selector ${sel} where`);
         // GHC's `selName` on a positional field is the empty string, and
         // generic code tests exactly that to tell a record from a tuple.
-        out.push(`  selName x = ${JSON.stringify(con.fields?.[j] ?? "")}`);
+        out.push(`  selName x = ${JSON.stringify(con.surface?.fields?.[j] ?? con.fields?.[j] ?? "")}`);
         const type = (con.fieldTypes?.[j] ?? "").replace(/^\s*!/, "").trim();
         return { type: `S1 ${sel} (Rec0 (${type}))`, wrap: `M1 (K1 gRep${j})`, name: `gRep${j}` };
       });
