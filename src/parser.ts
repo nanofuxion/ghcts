@@ -51,6 +51,12 @@ const operators: Record<string, { prec: number; assoc: Assoc }> = {
   "<=": { prec: 3, assoc: "left" },
   ">=": { prec: 3, assoc: "left" },
   ":": { prec: 4, assoc: "right" },
+  // `GHC.Generics` declares `infixr 5 :+:` and `infixr 6 :*:`. The *type*
+  // parser gives every type operator right-associativity outright, so without
+  // these two the same `a :*: b :*: c` associated one way in a type and the
+  // other in the expression it was the type of.
+  ":+:": { prec: 4, assoc: "right" },
+  ":*:": { prec: 5, assoc: "right" },
   "++": { prec: 4, assoc: "right" },
   "+~": { prec: 4, assoc: "right" },
   "-~": { prec: 4, assoc: "right" },

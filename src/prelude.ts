@@ -140,6 +140,17 @@ class Fractional a => RealFrac a where
 
 class Num a => Integral a where
   toInteger :: a -> Integer
+  quotRem :: a -> a -> (a, a)
+  divMod :: a -> a -> (a, a)
+  quot :: a -> a -> a
+  rem :: a -> a -> a
+  div :: a -> a -> a
+  mod :: a -> a -> a
+  quot n d = fst (quotRem n d)
+  rem n d = snd (quotRem n d)
+  div n d = fst (divMod n d)
+  mod n d = snd (divMod n d)
+  divMod n d = divModOfQuotRem (quotRem n d) d
 
 -- GHC's own three methods and their mutual defaults. \`showsPrec\` is what
 -- makes nesting print right - a field is shown at precedence 11, so
@@ -356,6 +367,9 @@ instance Real Int where
 
 instance Integral Int where
   toInteger (I n) = integerFromIntPrim n
+  -- \`primIntQuot\` is \`(a/b)|0\`, which is JavaScript's 0 on a zero divisor
+  -- rather than an exception; GHC raises one, and so does this.
+  quotRem (I a) (I b) = if primIntEq b 0 then error "divide by zero" else (I (primIntQuot a b), I (primIntRem a b))
 
 instance Eq Double where
   (==) (DoubleBox a) (DoubleBox b) = primDoubleEq a b
@@ -1006,6 +1020,55 @@ magDivStep qr x n = case qr of
 magDivJoin :: Int -> [Int] -> Int -> ([Int], Int)
 magDivJoin cur qs n = (quotSmall cur n : qs, remSmall cur n)
 
+-- Schoolbook long division by a divisor of any width, the same shape as
+-- \`magDivSmall\`: the recursion reaches the most significant limb first and the
+-- remainder flows back down. The remainder handed up is below the divisor, so
+-- \`r * 2^15 + limb\` is below \`divisor * 2^15\` and the limb that fits is found
+-- by bisecting [0, 2^15) - fifteen comparisons, and no estimate to correct.
+magQuotRem :: [Int] -> [Int] -> ([Int], [Int])
+magQuotRem ds b = case ds of
+  [] -> ([], [])
+  (x : xs) -> magQuotStep (magQuotRem xs b) x b
+
+magQuotStep :: ([Int], [Int]) -> Int -> [Int] -> ([Int], [Int])
+magQuotStep qr x b = case qr of
+  -- \`r\` is little-endian, so \`r * 2^15 + x\` is \`x\` pushed on the front.
+  (qs, r) -> magQuotJoin (magNorm (x : r)) qs b
+
+magQuotJoin :: [Int] -> [Int] -> [Int] -> ([Int], [Int])
+magQuotJoin cur qs b = magQuotOf cur qs b (magDigit cur b 0 32768)
+
+magQuotOf :: [Int] -> [Int] -> [Int] -> Int -> ([Int], [Int])
+magQuotOf cur qs b d = (d : qs, magNorm (magSub cur (magNorm (magMulLimb b d 0)) 0))
+
+-- The largest \`d\` in [lo, hi) with \`b * d <= cur\`.
+magDigit :: [Int] -> [Int] -> Int -> Int -> Int
+magDigit cur b lo hi = if hi - lo <= 1 then lo else magDigitStep cur b lo hi (quotSmall (lo + hi) 2)
+
+magDigitStep :: [Int] -> [Int] -> Int -> Int -> Int -> Int
+magDigitStep cur b lo hi m =
+  if magCmp (magNorm (magMulLimb b m 0)) cur > 0 then magDigit cur b lo m else magDigit cur b m hi
+
+-- Truncating division, which is \`quot\`/\`rem\`: the quotient takes the product
+-- of the signs and the remainder keeps the dividend's, so \`rem\` is zero or
+-- has the dividend's sign, exactly as GHC's does.
+bigQuotRem :: Big -> Big -> (Big, Big)
+bigQuotRem x y = case y of
+  Big nb b -> if nullList b then error "divide by zero" else bigQuotRemOf x nb (bigMag x) b
+
+bigMag :: Big -> [Int]
+bigMag (Big n ds) = ds
+
+bigQuotRemOf :: Big -> Bool -> [Int] -> [Int] -> (Big, Big)
+bigQuotRemOf x nb a b = bigQuotRemSign (bigIsNeg x) nb (magQuotRem a b)
+
+bigQuotRemSign :: Bool -> Bool -> ([Int], [Int]) -> (Big, Big)
+bigQuotRemSign na nb qr = case qr of
+  (q, r) -> (bigOf (if na then not nb else nb) q, bigOf na r)
+
+bigIsZero :: Big -> Bool
+bigIsZero (Big n ds) = nullList ds
+
 -- Repeated division by 10^4 - the largest power of ten for which
 -- \`r * 32768 + limb\` still fits in 31 bits. Every group but the leading one
 -- is zero-padded, which is what makes the concatenation the decimal number.
@@ -1185,6 +1248,7 @@ instance Real Integer where
 
 instance Integral Integer where
   toInteger n = n
+  quotRem (Integer a) (Integer b) = integerQuotRem (bigQuotRem a b)
 
 instance Show Integer where
   showsPrec d (Integer b) s = showsBigInt d b s
@@ -1216,6 +1280,7 @@ instance Real Int64 where
 
 instance Integral Int64 where
   toInteger (I64 b) = Integer b
+  quotRem (I64 a) (I64 b) = int64QuotRem (bigQuotRem a b)
 
 instance Show Int64 where
   showsPrec d (I64 b) s = showsBigInt d b s
@@ -1241,6 +1306,7 @@ instance Real Word64 where
 
 instance Integral Word64 where
   toInteger (W64 b) = Integer b
+  quotRem (W64 a) (W64 b) = word64QuotRem (bigQuotRem a b)
 
 -- A \`Word64\` is masked to [0, 2^64), so it never prints a sign and never needs
 -- the parentheses \`Int64\` does.
@@ -1254,6 +1320,35 @@ instance Show Word64 where
 -- value this used to pass, which could not be a lazy constructor field.
 fromIntegral :: (Integral a, Num b) => a -> b
 fromIntegral x = fromInteger (toInteger x)
+
+-- GHC's own default for \`divMod\`: it differs from \`quotRem\` exactly when the
+-- remainder's sign disagrees with the divisor's, in which case the quotient
+-- goes one lower and the remainder gains a divisor. GHC writes that test as
+-- \`signum r == negate (signum d)\`; \`Num\` here has no \`signum\` and \`Integral\`
+-- has no \`Ord\` superclass, so the two signs are read off \`toInteger\` instead.
+divModOfQuotRem :: Integral a => (a, a) -> a -> (a, a)
+divModOfQuotRem qr d = case qr of
+  (q, r) -> if signsDisagree (toInteger r) (toInteger d) then (q - 1, r + d) else qr
+
+signsDisagree :: Integer -> Integer -> Bool
+signsDisagree (Integer a) (Integer b) = if bigIsZero a then False else notBool (bigIsNeg a) (bigIsNeg b)
+
+notBool :: Bool -> Bool -> Bool
+notBool a b = if a then not b else b
+
+integerQuotRem :: (Big, Big) -> (Integer, Integer)
+integerQuotRem qr = case qr of
+  (q, r) -> (Integer q, Integer r)
+
+-- \`quot\` of two 64-bit values is in range except for \`minBound \`quot\` (-1)\`,
+-- which wraps back to \`minBound\` here exactly as GHC's \`quotInt64#\` does.
+int64QuotRem :: (Big, Big) -> (Int64, Int64)
+int64QuotRem qr = case qr of
+  (q, r) -> (I64 (bigNarrow64 q), I64 (bigNarrow64 r))
+
+word64QuotRem :: (Big, Big) -> (Word64, Word64)
+word64QuotRem qr = case qr of
+  (q, r) -> (W64 (bigMask64 q), W64 (bigMask64 r))
 
 realToFrac :: (Real a, Fractional b) => a -> b
 realToFrac x = case toDoublePrim x of
@@ -1554,6 +1649,19 @@ last xs = case xs of
   [] -> error "Prelude.last: empty list"
   (y : ys) -> if nullList ys then y else last ys
 
+init :: [a] -> [a]
+init xs = case xs of
+  [] -> error "Prelude.init: empty list"
+  (y : ys) -> if nullList ys then [] else y : init ys
+
+(!!) :: [a] -> Int -> a
+(!!) xs n = if n < 0 then error "Prelude.!!: negative index" else indexList xs n
+
+indexList :: [a] -> Int -> a
+indexList xs n = case xs of
+  [] -> error "Prelude.!!: index too large"
+  (y : ys) -> if n == 0 then y else indexList ys (n - 1)
+
 reverse :: [a] -> [a]
 reverse xs = reverseOnto xs []
 
@@ -1791,6 +1899,226 @@ zipWithM f xs ys = sequence (zipWith f xs ys)
 
 zipWithM_ :: Monad m => (a -> b -> m c) -> [a] -> [b] -> m ()
 zipWithM_ f xs ys = sequence_ (zipWith f xs ys)
+
+-- ------------------------------------------------------------------ Read ---
+--
+-- GHC's \`Read\` is \`ReadPrec\` over a full Haskell lexer; the instances that
+-- carry their weight are the numeric ones. Half a lexer would read some
+-- programs' text *wrongly* rather than not at all, so what is here is exactly
+-- the numeric-literal grammar - optional parentheses, an optional sign, and a
+-- decimal, hexadecimal or octal numeral - and nothing derives \`Read\`.
+class Read a where
+  readsPrec :: Int -> [Char] -> [(a, [Char])]
+
+reads :: Read a => [Char] -> [(a, [Char])]
+reads s = readsPrec 0 s
+
+read :: Read a => [Char] -> a
+read s = readOne (reads s)
+
+readOne :: [(a, [Char])] -> a
+readOne ps = case readParsed ps of
+  Just x -> x
+  Nothing -> error "Prelude.read: no parse"
+
+-- What \`read\` and \`readMaybe\` both demand: exactly one parse, with nothing
+-- but whitespace left after it.
+readParsed :: [(a, [Char])] -> Maybe a
+readParsed ps = case ps of
+  [] -> Nothing
+  (p : rest) -> if nullList rest then readParsedFull p else Nothing
+
+readParsedFull :: (a, [Char]) -> Maybe a
+readParsedFull p = case p of
+  (x, r) -> if nullList (dropWhile isSpaceChar r) then Just x else Nothing
+
+-- \`readsPrec\` ignores its precedence because GHC's \`readNumber\` does: the
+-- minus sign is read as a lexeme of its own, under no precedence test, so
+-- \`readsPrec 11 "-5"\` is -5 there as well.
+instance Read Int where
+  readsPrec d s = readsSigned readsIntegral s
+
+instance Read Integer where
+  readsPrec d s = readsSigned readsIntegral s
+
+instance Read Double where
+  readsPrec d s = readsSigned readsDouble s
+
+-- Whitespace, then either a parenthesised number or a signed numeral. The
+-- parentheses nest and the sign may be separated from the digits, so
+-- \`read " ( - 5 ) "\` is -5 here exactly as it is in GHC.
+readsSigned :: Num a => ([Char] -> [(a, [Char])]) -> [Char] -> [(a, [Char])]
+readsSigned body s = readsSignedAt body (dropWhile isSpaceChar s)
+
+readsSignedAt :: Num a => ([Char] -> [(a, [Char])]) -> [Char] -> [(a, [Char])]
+readsSignedAt body s = case s of
+  [] -> []
+  (c : t) ->
+    if c == '(' then readsParen (readsSigned body t)
+    else if c == '-' then readsNegate (body (dropWhile isSpaceChar t))
+    else body s
+
+readsParen :: [(a, [Char])] -> [(a, [Char])]
+readsParen ps = case ps of
+  [] -> []
+  (p : rest) -> readsCloseAt p
+
+readsCloseAt :: (a, [Char]) -> [(a, [Char])]
+readsCloseAt p = case p of
+  (x, r) -> readsCloseOn x (dropWhile isSpaceChar r)
+
+readsCloseOn :: a -> [Char] -> [(a, [Char])]
+readsCloseOn x s = case s of
+  [] -> []
+  (c : t) -> if c == ')' then (x, t) : [] else []
+
+readsNegate :: Num a => [(a, [Char])] -> [(a, [Char])]
+readsNegate ps = case ps of
+  [] -> []
+  (p : rest) -> readsNegateAt p
+
+readsNegateAt :: Num a => (a, [Char]) -> [(a, [Char])]
+readsNegateAt p = case p of
+  (x, r) -> (negate x, r) : []
+
+-- Every integral instance reads the same numeral and ends in \`fromInteger\`,
+-- which is what GHC's \`convertInt\` does.
+readsIntegral :: Num a => [Char] -> [(a, [Char])]
+readsIntegral s = readsFromInteger (readsNatural s)
+
+-- A leading \`0\` may begin \`0x\`/\`0o\`; when the base prefix is not followed by a
+-- digit of that base the \`0\` is a decimal numeral on its own, and the prefix
+-- letter is left behind - GHC's lexer backtracks the same way.
+readsNatural :: [Char] -> [(Integer, [Char])]
+readsNatural s = case s of
+  [] -> []
+  (c : t) -> if c == '0' then readsPrefixed t s else readsRadix 10 s
+
+readsPrefixed :: [Char] -> [Char] -> [(Integer, [Char])]
+readsPrefixed t s = case t of
+  [] -> readsRadix 10 s
+  (c : u) ->
+    if c == 'x' || c == 'X' then readsOrDecimal (readsRadix 16 u) s
+    else if c == 'o' || c == 'O' then readsOrDecimal (readsRadix 8 u) s
+    else readsRadix 10 s
+
+readsOrDecimal :: [(Integer, [Char])] -> [Char] -> [(Integer, [Char])]
+readsOrDecimal ps s = if nullList ps then readsRadix 10 s else ps
+
+readsRadix :: Int -> [Char] -> [(Integer, [Char])]
+readsRadix r s = readsRadixOf r (span (isRadixDigit r) s)
+
+readsRadixOf :: Int -> ([Char], [Char]) -> [(Integer, [Char])]
+readsRadixOf r p = case p of
+  (ds, rest) -> if nullList ds then [] else (digitsValue r ds 0, rest) : []
+
+digitsValue :: Int -> [Char] -> Integer -> Integer
+digitsValue r ds acc = case ds of
+  [] -> acc
+  (c : cs) -> digitsValue r cs (acc * toInteger r + toInteger (digitValue c))
+
+isRadixDigit :: Int -> Char -> Bool
+isRadixDigit r c = digitValue c >= 0 && digitValue c < r
+
+isDigitChar :: Char -> Bool
+isDigitChar c = isRadixDigit 10 c
+
+-- -1 for anything that is not a digit in any base this reads.
+digitValue :: Char -> Int
+digitValue c = digitValueOf (ord c)
+
+digitValueOf :: Int -> Int
+digitValueOf n =
+  if n >= 48 && n <= 57 then n - 48
+  else if n >= 97 && n <= 102 then n - 87
+  else if n >= 65 && n <= 70 then n - 55
+  else negate 1
+
+readsFromInteger :: Num a => [(Integer, [Char])] -> [(a, [Char])]
+readsFromInteger ps = case ps of
+  [] -> []
+  (p : rest) -> readsFromIntegerAt p
+
+readsFromIntegerAt :: Num a => (Integer, [Char]) -> [(a, [Char])]
+readsFromIntegerAt p = case p of
+  (n, r) -> (fromInteger n, r) : []
+
+-- GHC's \`isSpace\` over the range \`read\` can meet: the ASCII whitespace and
+-- the non-breaking space.
+isSpaceChar :: Char -> Bool
+isSpaceChar c = isSpaceOrd (ord c)
+
+isSpaceOrd :: Int -> Bool
+isSpaceOrd n = n == 32 || (n >= 9 && n <= 13) || n == 160
+
+-- A \`Double\` has its shape checked here against Haskell's grammar and its
+-- value computed by JavaScript's own \`Number\`, which is correctly rounded -
+-- and so is GHC's \`fromRational\`, while a mantissa scaled by a power of ten
+-- rounds twice and would differ in the last bit. Only text the two languages
+-- read alike is ever handed over, \`0x\`/\`0o\` included.
+readsDouble :: [Char] -> [(Double, [Char])]
+readsDouble s = case s of
+  [] -> []
+  (c : t) -> if c == '0' then readsDoublePrefixed t s else readsDecimalDouble s
+
+readsDoublePrefixed :: [Char] -> [Char] -> [(Double, [Char])]
+readsDoublePrefixed t s = case t of
+  [] -> readsDecimalDouble s
+  (c : u) ->
+    if c == 'x' || c == 'X' then readsDoubleRadix (readsRadix 16 u) s
+    else if c == 'o' || c == 'O' then readsDoubleRadix (readsRadix 8 u) s
+    else readsDecimalDouble s
+
+readsDoubleRadix :: [(Integer, [Char])] -> [Char] -> [(Double, [Char])]
+readsDoubleRadix ps s = if nullList ps then readsDecimalDouble s else readsFromInteger ps
+
+readsDecimalDouble :: [Char] -> [(Double, [Char])]
+readsDecimalDouble s = readsWhole (span isDigitChar s)
+
+readsWhole :: ([Char], [Char]) -> [(Double, [Char])]
+readsWhole p = case p of
+  (whole, r) -> if nullList whole then [] else readsFrac whole r
+
+-- A fraction counts only when a digit follows the point, and an exponent only
+-- when a digit follows the \`e\`: \`read "1." :: Double\` leaves the \`.\` behind in
+-- GHC rather than reading it, and so does \`1e\`.
+readsFrac :: [Char] -> [Char] -> [(Double, [Char])]
+readsFrac whole r = case r of
+  [] -> readsExp whole r
+  (c : t) -> if c == '.' then readsFracDigits whole (span isDigitChar t) r else readsExp whole r
+
+readsFracDigits :: [Char] -> ([Char], [Char]) -> [Char] -> [(Double, [Char])]
+readsFracDigits whole p r = case p of
+  (ds, rest) -> if nullList ds then readsExp whole r else readsExp (whole ++ ('.' : ds)) rest
+
+readsExp :: [Char] -> [Char] -> [(Double, [Char])]
+readsExp mant r = case r of
+  [] -> readsDoubleOf mant r
+  (c : t) -> if c == 'e' || c == 'E' then readsExpSign mant t r else readsDoubleOf mant r
+
+readsExpSign :: [Char] -> [Char] -> [Char] -> [(Double, [Char])]
+readsExpSign mant t r = case t of
+  [] -> readsDoubleOf mant r
+  (c : u) ->
+    if c == '+' then readsExpDigits mant "e+" (span isDigitChar u) r
+    else if c == '-' then readsExpDigits mant "e-" (span isDigitChar u) r
+    else readsExpDigits mant "e" (span isDigitChar t) r
+
+readsExpDigits :: [Char] -> [Char] -> ([Char], [Char]) -> [Char] -> [(Double, [Char])]
+readsExpDigits mant tag p r = case p of
+  (ds, rest) -> if nullList ds then readsDoubleOf mant r else readsDoubleOf (mant ++ (tag ++ ds)) rest
+
+readsDoubleOf :: [Char] -> [Char] -> [(Double, [Char])]
+readsDoubleOf text rest = (DoubleBox (primReadDouble (packDigits text (primDigitsEmpty 0))), rest) : []
+
+packDigits :: [Char] -> JSStringPrim -> JSStringPrim
+packDigits cs acc = case cs of
+  [] -> acc
+  (c : rest) -> packDigits rest (primDigitsSnoc acc (unInt (ord c)))
+
+foreign import javascript unsafe "((n) => '')" primDigitsEmpty :: IntPrim -> JSStringPrim
+foreign import javascript unsafe "((s, c) => s + String.fromCharCode(c))" primDigitsSnoc :: JSStringPrim -> IntPrim -> JSStringPrim
+foreign import javascript unsafe "((s) => Number(s))" primReadDouble :: JSStringPrim -> DoublePrim
 
 -- ------------------------------------------------------------- StaticPtr ---
 --

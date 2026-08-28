@@ -457,7 +457,12 @@ class Desugarer {
     const lit = args[1]!;
     // A dictionary in the first slot is what says this is the elaborated class
     // method and not something else the source happened to call `fromInteger`.
-    if (args[0]!.tag !== "Var" || lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return args;
+    // A dictionary is not always a plain `Var`: under a constraint that only
+    // *implies* `Num` - `Real a => a -> a`, say - the elaborator passes
+    // `$p0Real dReal`, an application. Requiring a `Var` here left the machine
+    // literal unboxed in exactly those bindings, so `x + 1` handed `Integer`'s
+    // `fromInteger` a JS number to destructure.
+    if (!isDictionaryArg(args[0]!) || lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return args;
     const box = this.top.get("integerFromIntPrim");
     if (!box) return args;
     return [args[0]!, { tag: "App", fn: { tag: "Var", binder: box }, arg: lit }];
@@ -1022,6 +1027,14 @@ function bindingsOf(subjects: Binder[], patterns: Pattern[]): Array<[string, Bin
     for (const name of patternNames(p)) out.push([name, subjects[i]!]);
   });
   return out;
+}
+
+/** An elaborated dictionary argument: a dictionary binding, or a superclass
+ * selector or instance function applied to further dictionaries. */
+function isDictionaryArg(e: CoreExpr): boolean {
+  let head = e;
+  while (head.tag === "App") head = head.fn;
+  return head.tag === "Var";
 }
 
 export function desugarModule(module: Module, file = `${module.name}.hs`): DesugarResult {

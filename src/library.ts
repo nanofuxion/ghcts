@@ -1262,6 +1262,19 @@ digitToInt c =
 intToDigit :: Int -> Char
 intToDigit n = if n < 10 then chr (48 + n) else chr (87 + n)
 `,
+  // \`Read\`, \`reads\` and \`read\` are the Prelude's, as they are in GHC; the two
+  // names that are not are here.
+  "Text.Read": `module Text.Read where
+
+readMaybe :: Read a => [Char] -> Maybe a
+readMaybe s = readParsed (reads s)
+
+readEither :: Read a => [Char] -> Either [Char] a
+readEither s = case readMaybe s of
+  Nothing -> Left "Prelude.read: no parse"
+  Just x -> Right x
+`,
+
   "Data.List": `module Data.List where
 
 -- Only the names the Prelude does not already provide. Everything else a

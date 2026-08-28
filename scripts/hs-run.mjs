@@ -1694,6 +1694,56 @@ const programs = [
     expect: "RedGreenBlueBluepx=3,py=4",
   },
   {
+    // The derived `Rep` and the derived `from`/`to` must be the SAME tree.
+    // Four is the smallest arity that tells them apart: at three the balanced
+    // tree and the right-nested one coincide, so `Colour`/`Point` above pass
+    // whatever the generator does. The `Rep` was written as text with only its
+    // right operand bracketed, so `:*:`'s fixity re-associated it - to the
+    // right in a type and to the left in an expression, since only the type
+    // parser gives the operator GHC's `infixr`. The two directions then
+    // disagreed for every record of four fields or more, which is what put 44
+    // "pattern does not match the scrutinee type" errors in misogram.
+    name: "generics: derived Rep and from/to agree at four fields and four constructors",
+    source: [
+      "module Main where",
+      "import GHC.Generics",
+      "data Suit = Clubs | Diamonds | Hearts | Spades",
+      "  deriving (Generic)",
+      "data Quad = Quad { qa :: Int, qb :: Int, qc :: Int, qd :: Int }",
+      "  deriving (Generic)",
+      "class GName f where",
+      "  gname :: f p -> [Char]",
+      "instance GName f => GName (M1 D c f) where",
+      "  gname (M1 x) = gname x",
+      "instance (GName f, GName g) => GName (f :+: g) where",
+      "  gname v = case v of",
+      "    L1 a -> gname a",
+      "    R1 b -> gname b",
+      "instance Constructor c => GName (M1 C c f) where",
+      "  gname m = conName m",
+      "class GSum f where",
+      "  gsum :: f p -> Int",
+      "instance GSum f => GSum (M1 D c f) where",
+      "  gsum (M1 x) = gsum x",
+      "instance GSum f => GSum (M1 C c f) where",
+      "  gsum (M1 x) = gsum x",
+      "instance (GSum f, GSum g) => GSum (f :*: g) where",
+      "  gsum (a :*: b) = gsum a + gsum b",
+      "instance GSum (M1 S s (K1 R Int)) where",
+      "  gsum (M1 (K1 v)) = v",
+      "roundTrip :: Generic a rep => a -> a",
+      "roundTrip x = to (from x)",
+      "sumOf :: (Generic a, GSum (Rep a)) => a -> Int",
+      "sumOf x = gsum (from x)",
+      "nameOf :: (Generic a, GName (Rep a)) => a -> [Char]",
+      "nameOf x = gname (from x)",
+      "main :: [Char]",
+      "main = nameOf (roundTrip Clubs) ++ (nameOf (roundTrip Diamonds) ++ (nameOf (roundTrip Hearts) ++ (nameOf (roundTrip Spades) ++ show (sumOf (roundTrip (Quad 1 20 300 4000))))))",
+      "",
+    ].join("\n"),
+    expect: "ClubsDiamondsHeartsSpades4321",
+  },
+  {
     // GHC's DefaultSignatures. `instance Label Colour` writes no method at all,
     // so the class default runs - and it can only run because the *instance*
     // supplies the `Generic Colour rep` and `GName rep` dictionaries that the
@@ -3747,6 +3797,131 @@ const programs = [
       "",
     ].join("\n"),
     expect: 42,
+  },
+  {
+    // `GHC.Generics` declares `infixr 6 :*:`. The type parser gives every type
+    // operator right-associativity outright, so before the fixity table knew
+    // the constructor the signature below nested to the right while the body
+    // nested to the left, and the two could not be the same value.
+    name: "infix :*: associates to the right in an expression, as its type does",
+    source: [
+      "module Main where",
+      "import GHC.Generics",
+      "class GSum f where",
+      "  gsum :: f p -> Int",
+      "instance GSum (K1 R Int) where",
+      "  gsum (K1 v) = v",
+      "instance (GSum f, GSum g) => GSum (f :*: g) where",
+      "  gsum (a :*: b) = gsum a + gsum b",
+      "three :: K1 R Int p -> K1 R Int p -> K1 R Int p -> (K1 R Int :*: (K1 R Int :*: K1 R Int)) p",
+      "three a b c = a :*: b :*: c",
+      "main :: Int",
+      "main = gsum (three (K1 1) (K1 20) (K1 300))",
+      "",
+    ].join("\n"),
+    expect: 321,
+  },
+  {
+    // An integer literal is `fromInteger` applied to a dictionary, and the
+    // desugarer boxes the machine literal into an `Integer` only when it
+    // recognises that dictionary. It insisted on a plain variable, so under a
+    // constraint that merely *implies* `Num` - where the dictionary arrives as
+    // `$p0Real dReal`, an application - the boxing was skipped and `Integer`'s
+    // `fromInteger` was handed a raw JS number to destructure. `x + 1` under
+    // `Real a` or `Integral a` crashed; `x + fromInteger 1` did not.
+    name: "an integer literal under a superclass-of-Num constraint",
+    source: [
+      "module Main where",
+      "bump :: Real a => a -> a",
+      "bump x = x + 1",
+      "step :: Integral a => a -> a",
+      "step x = x - 2",
+      "main = bump (5 :: Int) + step (10 :: Int)",
+      "",
+    ].join("\n"),
+    expect: 14,
+  },
+  {
+    // `div`/`mod` round towards negative infinity and `quot`/`rem` towards
+    // zero, so the two disagree on exactly one of these four and `mod` keeps
+    // the divisor's sign where `rem` keeps the dividend's.
+    name: "div/mod against quot/rem on a negative Int",
+    source: [
+      "module Main where",
+      "main :: [Char]",
+      "main = show [7 `div` 2, negate 7 `div` 2, 7 `mod` 2, negate 7 `mod` 2, 7 `quot` 2, negate 7 `quot` 2, 7 `rem` 2, negate 7 `rem` (2 :: Int)]",
+      "",
+    ].join("\n"),
+    expect: "[3,-4,1,1,3,-3,1,-1]",
+  },
+  {
+    // Long division on a magnitude of any width, which `Integer` has no other
+    // way to reach: the divisor is far past one 2^15 limb, so `magDivSmall`'s
+    // single-limb path cannot serve. The dividend is built by multiplying,
+    // because a source literal above 2^53 has already lost bits in the lexer.
+    name: "Integer division by a multi-limb divisor",
+    source: [
+      "module Main where",
+      "a :: Integer",
+      "a = 123456789012345 * 999999999999983 + 7654321",
+      "b :: Integer",
+      "b = 4294967311 * 65539",
+      "main :: [Char]",
+      "main = show (a `quotRem` b) ++ (show (negate a `divMod` b) ++ show (a `divMod` negate b))",
+      "",
+    ].join("\n"),
+    expect:
+      "(438586544634411,112221262854937)(-438586544634412,169266599740692)(-438586544634412,-169266599740692)",
+  },
+  {
+    // The same division at the two 64-bit widths. `Word64` is unsigned, so its
+    // `div` IS its `quot`, and the value here is 2^64-1 built by multiplying.
+    name: "Int64 and Word64 division",
+    source: [
+      "module Main where",
+      "import Data.Int (Int64)",
+      "import Data.Word (Word64)",
+      "a :: Int64",
+      "a = 1234567890123 * 7 + 5",
+      "b :: Word64",
+      "b = 4294967296 * 4294967295 + 4294967295",
+      "main :: [Char]",
+      "main = show (a `divMod` 1000000007) ++ (show (negate a `quotRem` 1000000007) ++ (show (b `quot` 3) ++ show (b `rem` 1000000007)))",
+      "",
+    ].join("\n"),
+    expect: "(8641,975170379)(-8641,-975170379)6148914691236517205582344007",
+  },
+  {
+    name: "list indexing and init",
+    source: [
+      "module Main where",
+      "main :: [Char]",
+      "main = show ([10, 20, 30] !! (1 :: Int)) ++ (show (init \"abcd\") ++ show (init [1, 2, 3 :: Int]))",
+      "",
+    ].join("\n"),
+    expect: "20\"abc\"[1,2]",
+  },
+  {
+    // `readMaybe` demands one parse and nothing but whitespace after it, so
+    // `"1."` is a parse of 1.0 with a `.` left over and therefore no parse at
+    // all - which is GHC's answer too. The `Double` is read by JavaScript's
+    // `Number` on text this grammar has already accepted, so `0.1` is the same
+    // correctly-rounded double GHC's `fromRational` produces.
+    name: "readMaybe over the numeric Read instances",
+    source: [
+      "module Main where",
+      "import Text.Read (readMaybe)",
+      "main :: [Char]",
+      "main = show (readMaybe \" -3.5e2 \" :: Maybe Double)",
+      "  ++ (show (readMaybe \"0x1f\" :: Maybe Int)",
+      "  ++ (show (readMaybe \"( -12 )\" :: Maybe Integer)",
+      "  ++ (show (readMaybe \"1.\" :: Maybe Double)",
+      "  ++ (show (readMaybe \"\" :: Maybe Int)",
+      "  ++ (show (readMaybe \"0.1\" :: Maybe Double)",
+      "  ++ show (read \"42\" :: Int))))))",
+      "",
+    ].join("\n"),
+    expect: "Just (-350.0)Just 31Just (-12)NothingNothingJust 0.142",
   },
 ];
 

@@ -654,7 +654,11 @@ function balance(items: ReadonlyArray<{ type: string; term: string }>, op: strin
   const half = Math.floor(items.length / 2);
   const left = balance(items.slice(0, half), op);
   const right = balance(items.slice(half), op);
-  return { type: `${left.type} ${op} (${right.type})`, term: `${left.term} ${op} (${right.term})` };
+  // Both sides are parenthesised: the tree's shape is the whole point, and an
+  // unbracketed left operand would be re-associated away by whatever fixity
+  // `op` happens to have - differently at the type level and the term level,
+  // which is exactly how `from`'s balanced product stopped matching `Rep`'s.
+  return { type: `(${left.type}) ${op} (${right.type})`, term: `(${left.term}) ${op} (${right.term})` };
 }
 
 /** The balanced `:+:` tree, handing each leaf the `L1`/`R1` path that reaches
@@ -664,5 +668,5 @@ function balanceSum(items: readonly number[], leaf: (item: number, path: string[
   const half = Math.floor(items.length / 2);
   const left = balanceSum(items.slice(0, half), leaf, [...path, "L1"]);
   const right = balanceSum(items.slice(half), leaf, [...path, "R1"]);
-  return `${left} :+: (${right})`;
+  return `(${left}) :+: (${right})`;
 }
