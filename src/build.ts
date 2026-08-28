@@ -45,20 +45,46 @@ async function walkHs(root: string, found: string[] = []): Promise<string[]> {
   return found;
 }
 
-/** Parse every module under the configured source roots. */
+/** Parse the entry module and everything it transitively imports.
+ *
+ * Only the import closure, which is what GHC does: a module nothing imports
+ * is never read, so its syntax cannot fail the build. That is not an
+ * optimisation. miso ships Miso/FFI/QQ.hs, Miso/Lens/Generic.hs and
+ * Miso/Lens/TH.hs - quasiquotes, type-level operators and Template Haskell -
+ * which appear only inside comments in Miso.hs. Parsing every file under the
+ * source roots made three unreachable modules gate the whole program. */
 export async function loadProgram(
   project: string,
   config: GhctsConfig,
 ): Promise<{ modules: Map<string, Module>; diagnostics: Diagnostic[] }> {
+  // A module's name is its path under a source root, so the index can be
+  // built without reading anything.
+  const byName = new Map<string, string>();
+  for (const root of config.sourceRoots) {
+    const base = join(project, root);
+    for (const file of await walkHs(base)) {
+      const name = relative(base, file).replace(/\.hs$/, "").split(/[\\/]/).join(".");
+      if (!byName.has(name)) byName.set(name, file);
+    }
+  }
+
   const modules = new Map<string, Module>();
   const diagnostics: Diagnostic[] = [];
-  for (const root of config.sourceRoots) {
-    for (const file of await walkHs(join(project, root))) {
-      const source = await readFile(file, "utf8");
-      const parsed = parseModule(source, relative(project, file));
-      diagnostics.push(...parsed.diagnostics);
-      if (parsed.module?.ast) modules.set(parsed.module.ast.name, parsed.module.ast);
-    }
+  const queue = [config.entry.module];
+  const seen = new Set<string>();
+  while (queue.length) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const file = byName.get(name);
+    // A module we cannot find is reported by the elaborator as unresolved
+    // names, which says more than a missing-file error would.
+    if (!file) continue;
+    const parsed = parseModule(await readFile(file, "utf8"), relative(project, file));
+    diagnostics.push(...parsed.diagnostics);
+    if (!parsed.module?.ast) continue;
+    modules.set(parsed.module.ast.name, parsed.module.ast);
+    for (const imported of parsed.module.ast.imports) queue.push(imported.module);
   }
   return { modules, diagnostics };
 }

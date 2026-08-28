@@ -316,7 +316,7 @@ class Desugarer {
     if (rows.length === 0) return fallback;
     if (subjects.length === 0) return this.guardedBody(rows[0]!, scope, () => this.match([], rows.slice(1), scope, fallback));
 
-    const column = subjects.findIndex((_, i) => rows.some((row) => isRefutable(row.patterns[i]!)));
+    const column = subjects.findIndex((_, i) => rows.some((row) => isRefutable(row.patterns[i])));
     if (column < 0) {
       // Every remaining pattern binds or ignores; bind the first row's names.
       const row = rows[0]!;
@@ -493,8 +493,14 @@ function flattenApp(e: Expr): [Expr, Expr[]] {
   return [head, args];
 }
 
-const isRefutable = (p: Pattern): boolean =>
-  p.tag === "int" || p.tag === "string" || p.tag === "con" || p.tag === "record";
+/** A missing pattern means the equation has fewer arguments than its
+ * siblings. That is an arity error, and the elaborator already reports it as
+ * one; crashing here would replace a good diagnostic with a stack trace, so
+ * an absent column is treated as irrefutable and the build carries on to
+ * report everything else it finds. */
+const isRefutable = (p: Pattern | undefined): boolean =>
+  p !== undefined &&
+  (p.tag === "int" || p.tag === "string" || p.tag === "con" || p.tag === "record");
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
