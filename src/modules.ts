@@ -333,6 +333,7 @@ class Renamer {
       // Only the expression is renamed: types live in one global namespace
       // here, so the written type needs no qualification.
       case "annot":
+      case "typeApp":
         return { ...expr, expr: this.expr(expr.expr, shadow) };
       case "app":
         return { ...expr, fn: this.expr(expr.fn, shadow), arg: this.expr(expr.arg, shadow) };

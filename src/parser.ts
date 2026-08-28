@@ -296,6 +296,7 @@ function expandExprQuotes(expr: Expr): Expr {
         })),
       };
     case "annot":
+    case "typeApp":
       return { ...expr, expr: expandExprQuotes(expr.expr) };
     case "app":
       return {
@@ -1477,11 +1478,11 @@ class Parser {
   // line retain its ordinary Haskell meaning.
   private application(): Expr {
     let value = this.negativeLiteral() ?? this.recordUpdates(this.atom());
-    this.skipVisibleTypeApplications();
+    value = this.visibleTypeApplications(value);
     while (this.startsAtom()) {
       const arg = this.recordUpdates(this.atom());
       value = { tag: "app", fn: value, arg, span: value.span };
-      this.skipVisibleTypeApplications();
+      value = this.visibleTypeApplications(value);
     }
     return value;
   }
@@ -1502,24 +1503,40 @@ class Parser {
     }
     return base;
   }
-  private skipVisibleTypeApplications() {
+  /** `e @T @U`, in an *expression*.  The `@` of an as-pattern is never seen
+   * here: patterns are parsed by `pattern()`, and this runs only between the
+   * atoms of an application, where a bare `@` can only be a type argument.
+   *
+   * Each argument is kept as source text and re-lexed by `src/elaborate.ts`,
+   * the way `annot` already is; the outermost wrapper is the *last* written
+   * argument, so the elaborator peels the chain to recover the written order. */
+  private visibleTypeApplications(value: Expr): Expr {
     while (this.at("@")) {
       this.take();
+      // A promoted constructor, `@'Just`: the tick is not part of the name.
       if (this.at("'")) this.take();
       const open = this.current().text;
       if (open === "(" || open === "[") {
         const close = open === "(" ? ")" : "]";
+        const parts: string[] = [];
         this.take();
         let depth = 1;
         while (depth && this.current().kind !== "eof") {
           if (this.current().text === open) depth++;
           else if (this.current().text === close) depth--;
-          this.take();
+          const token = this.take();
+          if (depth) parts.push(token.text);
         }
+        // `@[a]` is a list type; `@(...)` is only grouping, so its brackets
+        // are dropped and the list's are kept.
+        const text = open === "[" ? `[ ${parts.join(" ")} ]` : parts.join(" ");
+        value = { tag: "typeApp", expr: value, type: text, span: value.span };
         continue;
       }
-      if (this.current().kind === "ident") this.take();
+      if (this.current().kind === "ident")
+        value = { tag: "typeApp", expr: value, type: this.take().text, span: value.span };
     }
+    return value;
   }
   private startsAtom() {
     const t = this.current();

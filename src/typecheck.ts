@@ -1302,6 +1302,7 @@ class Inferencer {
       // This checker has no reader for a written signature; the ascription is
       // honoured by `src/elaborate.ts`, which is the pass on the compiler path.
       case "annot":
+      case "typeApp":
         return this.expr(expression.expr, environment);
       case "int":
         return int;

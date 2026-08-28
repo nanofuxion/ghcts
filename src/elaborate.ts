@@ -192,8 +192,12 @@ function substGens(t: Type, images: Type[]): Type {
   return p;
 }
 
-function instantiate(scheme: Scheme): { type: Type; constraints: Constraint[] } {
-  const images = Array.from({ length: scheme.gens }, () => freshVar());
+/** `given` supplies the images of the *leading* quantified variables, in the
+ * order `quantify` fixed - which for a class method is the class variable
+ * first.  That is exactly what a visible type application writes, so `@T`
+ * lands on `gen 0`, `@T @U` on `gen 0` and `gen 1`, and the rest stay fresh. */
+function instantiate(scheme: Scheme, given: readonly Type[] = []): { type: Type; constraints: Constraint[] } {
+  const images = Array.from({ length: scheme.gens }, (_, i) => given[i] ?? freshVar());
   return {
     type: substGens(scheme.type, images),
     constraints: scheme.constraints.map((c) => ({ cls: c.cls, types: c.types.map((t) => substGens(t, images)) })),
@@ -796,6 +800,32 @@ class Elaborator {
       // implicit `forall` amounts to here. A context on the ascription is not
       // turned into a local given; a constraint that only it could discharge
       // therefore fails loudly at the use site rather than being assumed.
+      // `f @T`.  For a term whose type is `forall a. C a => t` this binds
+      // `a := T` in *this* instantiation, which is the only thing that can
+      // make the `C a` wanted resolvable when `a` appears nowhere in the
+      // arguments or the result - `gAllNullary :: forall f. GAllNullary f =>
+      // Bool` in miso's `Miso.JSON` is exactly that shape.
+      case "typeApp": {
+        const written: string[] = [];
+        let head: Expr = e;
+        // The parser nests later arguments outermost, so peeling recovers the
+        // written left-to-right order the `forall` quantifies in.
+        while (head.tag === "typeApp") {
+          written.unshift(head.type);
+          head = head.expr;
+        }
+        // One variable map for the whole chain, so `@f @f` names one variable,
+        // and seeded with the enclosing instance's skolems so `@f` inside
+        // `instance (C f, C g) => C (f :+: g)` is *that* `f`.
+        const vars = new Map(this.current?.tyvars ?? []);
+        const types = written.map((t) => parseType(t, vars));
+        // Anything but a plain name - a constructor is instantiated here too,
+        // since `this.constructors` schemes quantify in declaration order -
+        // keeps the pre-existing behaviour of erasing the argument rather than
+        // failing: this elaborator has no higher-rank types to apply one to.
+        if (head.tag !== "var") return this.infer(head, env);
+        return this.inferVar(head, env, types);
+      }
       case "annot": {
         const written = parseSignature(e.type, new Map(this.current?.tyvars ?? []));
         // A string literal whose type is *written out* is `fromString` at that
@@ -871,7 +901,7 @@ class Elaborator {
     }
   }
 
-  private inferVar(e: Extract<Expr, { tag: "var" }>, env: Env): Type {
+  private inferVar(e: Extract<Expr, { tag: "var" }>, env: Env, typeArgs: readonly Type[] = []): Type {
     const entry = env.get(e.name);
     if (entry) {
       if (entry.tag === "mono") return entry.type;
@@ -879,14 +909,14 @@ class Elaborator {
         this.current?.uses.push({ kind: "group", node: e, target: entry.name });
         return entry.type;
       }
-      const { type, constraints } = instantiate(entry.scheme);
+      const { type, constraints } = instantiate(entry.scheme, typeArgs);
       if (constraints.length || entry.emit !== e.name) {
         this.current?.uses.push({ kind: "apply", node: e, emit: entry.emit, constraints });
       }
       return type;
     }
     const con = this.constructors.get(e.name);
-    if (con) return instantiate(con).type;
+    if (con) return instantiate(con, typeArgs).type;
     this.report(`\`${e.name}\` is not in scope`, e.span);
     return freshVar();
   }
@@ -1380,14 +1410,21 @@ export function elaborateProgram(
   for (const decl of datas) {
     for (const con of decl.constructors) {
       const vars = new Map<string, Type>();
+      const params: TVar[] = [];
       const result = decl.parameters.reduce<Type>((acc, name) => {
         const v = freshVar();
+        if (v.tag === "var") params.push(v.v);
         vars.set(name, v);
         return tapp(acc, v);
       }, tcon(decl.name));
       const fields = (con.fieldTypes ?? Array.from({ length: con.arity }, () => "_field")).map((f) => parseType(f, vars));
       const type = fields.reduceRight((acc, field) => tfun(field, acc), result);
-      elaborator.constructors.set(con.name, quantify(typeVars(type), type, []));
+      // The datatype's own parameters are quantified first, in declaration
+      // order, so `Proxy @flag` binds what GHC binds. Occurrence order - which
+      // is the order the fields mention them in - would put `MkPair @a @b` of
+      // `data Pair a b = MkPair b a` the wrong way round.
+      const ordered = [...params, ...typeVars(type).filter((v) => !params.includes(v))];
+      elaborator.constructors.set(con.name, quantify(ordered, type, []));
     }
   }
   const listVar = freshVar();
@@ -2033,6 +2070,7 @@ function referencedNames(decl: ValueDeclaration): Set<string> {
         names.add(e.name);
         return;
       case "annot":
+      case "typeApp":
         expr(e.expr);
         return;
       case "app":
@@ -2226,6 +2264,7 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
       case "string":
         return args?.length ? applyAll(variable("fromString", e.span), [...args, e]) : e;
       case "annot":
+      case "typeApp":
         return { ...e, expr: rewriteExpr(e.expr) };
       case "app":
         return { ...e, fn: rewriteExpr(e.fn), arg: rewriteExpr(e.arg) };

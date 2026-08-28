@@ -1838,6 +1838,73 @@ const programs = [
     },
     expect: 11,
   },
+  {
+    // `gAllNullary`'s exact shape, from `references/miso/src/Miso/JSON.hs`:
+    // the class variable appears nowhere in the method's arguments or result,
+    // so `@f` is the only thing that can pick the instance. Erase the `@`s and
+    // the recursive instances have no way to name their own constraint.
+    name: "visible type application selects an instance the method's type cannot",
+    source: [
+      "module Main where",
+      "data U1 = MkU1",
+      "data K1 = MkK1",
+      "data C1 f = MkC1 f",
+      "data Sum f g = MkSum f g",
+      "class GAllNullary f where",
+      "  gAllNullary :: Bool",
+      "instance GAllNullary U1 where",
+      "  gAllNullary = True",
+      "instance GAllNullary K1 where",
+      "  gAllNullary = False",
+      "instance GAllNullary f => GAllNullary (C1 f) where",
+      "  gAllNullary = gAllNullary @f",
+      "instance (GAllNullary f, GAllNullary g) => GAllNullary (Sum f g) where",
+      "  gAllNullary = gAllNullary @f && gAllNullary @g",
+      "digit :: Bool -> Int",
+      "digit b = if b then 1 else 0",
+      "main :: IO Int",
+      "main = pure (digit (gAllNullary @(Sum (C1 U1) U1)) * 10 + digit (gAllNullary @(Sum (C1 K1) U1)))",
+      "",
+    ].join("\n"),
+    expect: 10,
+  },
+  {
+    // Two parameters, two overlapping-by-shape instances: only the *order* of
+    // the type arguments tells them apart, which is what fixes `@` filling the
+    // `forall`'s variables left to right.
+    name: "visible type applications fill the forall left to right",
+    source: [
+      "module Main where",
+      "class Which a b where",
+      "  which :: Int",
+      "instance Which Int Bool where",
+      "  which = 1",
+      "instance Which Bool Int where",
+      "  which = 2",
+      "main :: IO Int",
+      "main = pure (which @Int @Bool * 10 + which @Bool @Int)",
+      "",
+    ].join("\n"),
+    expect: 12,
+  },
+  {
+    // The parser now keeps `@` in an expression instead of skipping it; in a
+    // *pattern* it still binds a name.
+    name: "an as-pattern is not a visible type application",
+    source: [
+      "module Main where",
+      "total :: [Int] -> Int",
+      "total [] = 0",
+      "total (z : zs) = z + total zs",
+      "dup :: [Int] -> Int",
+      "dup [] = 0",
+      "dup xs@(y : ys) = y * 100 + total xs + total ys",
+      "main :: IO Int",
+      "main = pure (dup [1, 2, 3])",
+      "",
+    ].join("\n"),
+    expect: 111,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

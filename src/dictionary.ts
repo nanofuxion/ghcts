@@ -94,11 +94,14 @@ export function instanceMethodValues(declaration: InstanceDeclaration, file = '<
   for (const item of instanceMembers(declaration)) {
     if (item.kind !== 'method') continue;
     const equals = item.tokens.indexOf('='); if (equals < 0) continue;
-    const operatorAt = infixOperatorAt(item.tokens, equals);
+    // The body starts at the first guard, not at the first `=`, so a guarded
+    // infix equation keeps all of its guards.
+    const end = lhsEnd(item.tokens, equals);
+    const operatorAt = infixOperatorAt(item.tokens, end);
     let sourceTokens = item.tokens;
     if (operatorAt >= 0) {
-      const left = item.tokens.slice(0, operatorAt); const right = item.tokens.slice(operatorAt + 1, equals); const body = item.tokens.slice(equals + 1);
-      sourceTokens = ['(', item.name, ')', '(', ...left, ')', '(', ...right, ')', '=', ...body];
+      const left = item.tokens.slice(0, operatorAt); const right = item.tokens.slice(operatorAt + 1, end); const body = item.tokens.slice(end);
+      sourceTokens = ['(', item.name, ')', '(', ...left, ')', '(', ...right, ')', ...body];
     }
     const parsed = parseModule(`module Dictionary where\n${sourceTokens.join(' ')}\n`, file);
     if (parsed.diagnostics.length) continue;
@@ -116,6 +119,22 @@ export function instanceMethodValues(declaration: InstanceDeclaration, file = '<
 
 /** Infix instance equations are `pat <> pat = ...`. Record wildcards (`{..}`)
  * and symbols nested in `{ }` / `( )` / `[ ]` are not the method operator. */
+/** Where the left-hand side of an equation stops.  A depth-zero `|` is a
+ * guard - `|` is reserved, so it can never be a user operator - and every
+ * token from there on belongs to the right-hand side, not to the binder.
+ * Without this, `toJSON x | p = a | otherwise = b` looks like a definition of
+ * an infix operator named `|`, and the member is dropped. */
+function lhsEnd(tokens: readonly string[], equals: number): number {
+  let depth = 0;
+  for (let i = 0; i < equals; i++) {
+    const token = tokens[i];
+    if (token === '{' || token === '(' || token === '[') depth++;
+    else if (token === '}' || token === ')' || token === ']') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && token === '|') return i;
+  }
+  return equals;
+}
+
 function infixOperatorAt(tokens: readonly string[], equals: number): number {
   let depth = 0;
   for (let i = 0; i < equals; i++) {
@@ -142,7 +161,7 @@ function member(slice: ClassMemberSlice, classBody: boolean): DictionaryMember[]
     return name ? [{ name, kind: 'signature', tokens, span: slice.span }] : [];
   }
   if (equals < 0) return [];
-  const name = binder(tokens.slice(0, equals));
+  const name = binder(tokens.slice(0, lhsEnd(tokens, equals)));
   if (!name) return [];
   return [{ name, kind: classBody ? 'signature' : 'method', tokens, span: slice.span }];
 }

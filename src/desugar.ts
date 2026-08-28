@@ -190,6 +190,7 @@ class Desugarer {
       // The type has already done its work in `src/elaborate.ts`, and STG is
       // type-erased, so the node is simply the expression it wraps.
       case "annot":
+      case "typeApp":
         return this.expr(e.expr, scope);
       case "var":
         return this.varRef(e.name, scope, e.span);
@@ -481,13 +482,12 @@ class Desugarer {
     const rows = group.map((row) => {
       const pattern = row.patterns[column]!;
       const matched = isRefutable(pattern);
+      const inner = stripAs(pattern);
       const sub: Pattern[] =
-        pattern.tag === "con" && matched
-          ? pattern.args
+        inner.tag === "con" && matched
+          ? inner.args
           : fields.map<Pattern>(() => ({ tag: "wild", span: pattern.span }));
-      const columns = row.patterns.map((p, i) =>
-        i === column && matched ? ({ tag: "wild", span: p.span } as Pattern) : p,
-      );
+      const columns = row.patterns.map((p, i) => (i === column && matched ? asOnly(p) : p));
       return { ...row, patterns: [...sub, ...columns] };
     });
     return this.match([...fields, ...subjects], rows, scope, fallback);
@@ -579,24 +579,56 @@ function flattenApp(e: Expr): [Expr, Expr[]] {
  * one; crashing here would replace a good diagnostic with a stack trace, so
  * an absent column is treated as irrefutable and the build carries on to
  * report everything else it finds. */
-const isRefutable = (p: Pattern | undefined): boolean =>
-  p !== undefined &&
-  (p.tag === "int" || p.tag === "string" || p.tag === "char" || p.tag === "con" || p.tag === "record");
+/** `xs@(y : ys)` discriminates on what it wraps; the name it binds is kept
+ * separately, by `asOnly` below.  Every question the match compiler asks about
+ * a column - is it refutable, which constructor, how many fields - is a
+ * question about the wrapped pattern. */
+const stripAs = (p: Pattern): Pattern => (p.tag === "as" ? stripAs(p.pattern) : p);
+
+/** The same column once its alternative has matched: the constructor test is
+ * spent, but the as-names still have to bind the scrutinee, so what is left is
+ * irrefutable and binds exactly those names. */
+const asOnly = (p: Pattern): Pattern =>
+  p.tag === "as" ? { ...p, pattern: asOnly(p.pattern) } : { tag: "wild", span: p.span };
+
+const isRefutable = (p: Pattern | undefined): boolean => {
+  if (p === undefined) return false;
+  const q = stripAs(p);
+  return q.tag === "int" || q.tag === "string" || q.tag === "char" || q.tag === "con" || q.tag === "record";
+};
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
 
+/** Every name an irrefutable column binds, outermost first: `xs@ys@_` binds
+ * both, and each one binds the whole subject. */
+const patternNames = (p: Pattern, out: string[] = []): string[] => {
+  if (p.tag === "var") out.push(p.name);
+  if (p.tag === "as") {
+    out.push(p.name);
+    patternNames(p.pattern, out);
+  }
+  return out;
+};
+
 const patternSpan = (p: Pattern): Span => p.span;
-const patternConName = (p: Pattern): string => (p.tag === "con" ? p.name : p.tag === "record" ? p.name : "?");
-const patternArity = (p: Pattern): number => (p.tag === "con" ? p.args.length : 0);
-const patternKey = (p: Pattern): string =>
-  p.tag === "int" ? `#${p.value}` : p.tag === "string" ? `s${p.value}` : p.tag === "char" ? `q${p.value}` : `c${patternConName(p)}`;
+const patternConName = (p: Pattern): string => {
+  const q = stripAs(p);
+  return q.tag === "con" ? q.name : q.tag === "record" ? q.name : "?";
+};
+const patternArity = (p: Pattern): number => {
+  const q = stripAs(p);
+  return q.tag === "con" ? q.args.length : 0;
+};
+const patternKey = (p: Pattern): string => {
+  const q = stripAs(p);
+  return q.tag === "int" ? `#${q.value}` : q.tag === "string" ? `s${q.value}` : q.tag === "char" ? `q${q.value}` : `c${patternConName(q)}`;
+};
 
 function bindingsOf(subjects: Binder[], patterns: Pattern[]): Array<[string, Binder]> {
   const out: Array<[string, Binder]> = [];
   patterns.forEach((p, i) => {
-    const name = patternName(p);
-    if (name) out.push([name, subjects[i]!]);
+    for (const name of patternNames(p)) out.push([name, subjects[i]!]);
   });
   return out;
 }

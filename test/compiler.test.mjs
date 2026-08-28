@@ -395,13 +395,24 @@ test('treats lowercase.ident as composition rather than qualification', () => {
   assert.deepEqual(tokens.map(token => token.text), ['queue', '.', 'at', 'k']);
 });
 
-test('skips visible type applications in expressions', () => {
+test('keeps visible type applications in expressions', () => {
   const parsed = parseModule('module Main where\nmain = readIORef @Int ref\n', 'TypeApp.hs');
   assert.deepEqual(parsed.diagnostics, []);
   const body = parsed.module.ast.declarations.find(declaration => declaration.tag === 'value').equations[0].guards[0].body;
   assert.equal(body.tag, 'app');
-  assert.equal(body.fn.name, 'readIORef');
   assert.equal(body.arg.name, 'ref');
+  assert.equal(body.fn.tag, 'typeApp');
+  assert.equal(body.fn.type, 'Int');
+  assert.equal(body.fn.expr.name, 'readIORef');
+});
+
+test('an as-pattern is not a visible type application', () => {
+  const parsed = parseModule('module Main where\nmain xs@(y : ys) = y\n', 'AsPattern.hs');
+  assert.deepEqual(parsed.diagnostics, []);
+  const pattern = parsed.module.ast.declarations.find(declaration => declaration.tag === 'value').equations[0].patterns[0];
+  assert.equal(pattern.tag, 'as');
+  assert.equal(pattern.name, 'xs');
+  assert.equal(pattern.pattern.tag, 'con');
 });
 
 test('parses qualified identifiers used as backticked infix operators', () => {
