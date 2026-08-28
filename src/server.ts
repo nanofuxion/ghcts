@@ -2,7 +2,8 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
-import { compileProject } from './compiler.js';
+import { build } from './build.js';
+import { readFile } from 'node:fs/promises';
 import { formatDiagnostic } from './diagnostics.js';
 
 const mimeTypes: Record<string, string> = {
@@ -15,10 +16,12 @@ export interface RunningServer { server: Server; url: string; close(): Promise<v
 
 /** Build a project, then serve its browser output using only Node's standard library. */
 export async function serveProject(options: ServeOptions): Promise<RunningServer> {
-  const result = await compileProject({ project: options.project });
+  const config = JSON.parse(await readFile(`${options.project}/ghcts.json`, 'utf8'));
+  const result = await build({ project: options.project, config });
   if (result.diagnostics.some(d => d.severity === 'error')) throw new Error(result.diagnostics.map(formatDiagnostic).join('\n'));
-  if (!result.config?.targets.includes('browser')) throw new Error('ghcts.json must include "browser" in targets to use serve');
-  const root = resolve(options.project, result.config.outDir, 'browser');
+  // The new pipeline emits a GHC-shaped .jsexe rather than per-target trees,
+  // so `serve` hands out that directory directly.
+  const root = resolve(options.project, config.outDir, 'jsexe');
   const server = createServer(async (request, response) => {
     const rawPath = new URL(request.url ?? '/', 'http://localhost').pathname;
     const relativePath = decodeURIComponent(rawPath === '/' ? '/index.html' : rawPath).replace(/^\/+/, '');

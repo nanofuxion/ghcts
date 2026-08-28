@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from 'node:path';
-import { compileProject, formatDiagnostic } from './index.js';
+import { readFile } from 'node:fs/promises';
+import { build, formatDiagnostic } from './index.js';
 import { serveProject } from './server.js';
 
 const [command, ...args] = process.argv.slice(2);
@@ -21,8 +22,11 @@ if (!['build', 'check', 'serve'].includes(command ?? '') || !project || (port !=
     process.exitCode = 1;
   }
 } else {
-  const result = await compileProject({ project: resolve(project), emit: command === 'build' });
+  const dir = resolve(project);
+  const config = JSON.parse(await readFile(resolve(dir, 'ghcts.json'), 'utf8'));
+  const result = await build({ project: dir, config, emit: command === 'build' });
   for (const diagnostic of result.diagnostics) console.error(formatDiagnostic(diagnostic));
-  if (!result.diagnostics.some(d => d.severity === 'error') && command === 'build') for (const output of result.outputPaths) console.log(output);
+  if (!result.diagnostics.some(d => d.severity === 'error') && command === 'build')
+    console.log(resolve(dir, config.outDir, 'jsexe', 'all.js'));
   process.exitCode = result.diagnostics.some(d => d.severity === 'error') ? 1 : 0;
 }

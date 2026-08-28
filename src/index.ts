@@ -1,19 +1,17 @@
-export { compileProject } from './compiler.js';
+export { build, loadProgram } from './build.js';
 export { formatDiagnostic } from './diagnostics.js';
 export { serveProject } from './server.js';
 export { checkModule } from './typecheck.js';
 export { classMembers, collectDictionaries, instanceHead, instanceMembers, instanceMethodValues, selectInstance } from './dictionary.js';
-export { lowerExpr, lowerModule, lowerModules } from './core-legacy.js';
-export { elaborateModule } from './elaborate.js';
+export { elaborateModule, elaborateProgram } from './elaborate.js';
 export { PRELUDE_SOURCE } from './prelude.js';
 export { desugarModule } from './desugar.js';
 export { coreToStg } from './core-to-stg.js';
-export { global, jblock, jcall, jfunction, jglobal, jif, jindex, jinfix, jnumber, jraw, jrawStat, jselect, jstring, junary, jvar, optimizeExpr, optimizeStat, printExpr, printStat } from './js-ast.js';
-export type { AOp, Ident, JExpr, JStat, JStgExpr, JStgStat, JStgVal, JVal, Op, UOp } from './js-ast.js';
-export { JSM, jStgExprToJS, jStgStatToJS } from './js-ast.js';
+export { link, renderModules } from './linker/linker.js';
 export type { RunningServer, ServeOptions } from './server.js';
 export type { CompileProjectOptions, CompileResult, Diagnostic, GhctsConfig, Target } from './types.js';
 
-/** The faithful port of GHC's GHC.JS.* module family - see src/ghc-js.ts. */
+/** GHC.JS: the JavaScript AST, printer and optimizer, ported 1:1. */
 export * as GhcJs from './ghc-js.js';
+/** GHC.StgToJS: the code generator and the RTS it emits. */
 export * as StgToJs from './stg-to-js.js';
