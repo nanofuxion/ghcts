@@ -2689,11 +2689,12 @@ export function elaborateProgram(
     out.push(valueDecl("main", [], apply(variable("runMainIO", decl.span), body), decl.span));
   }
 
-  const roots = new Set(
+  const ownNames = new Set(
     declarations
       .slice(prelude.module.ast.declarations.length)
       .flatMap((d) => (d.tag === "value" || d.tag === "foreign" ? [d.name] : [])),
   );
+  const roots = new Set(ownNames);
   // `integerFromIntPrim` is reachable from no *source* occurrence: the
   // desugarer introduces it, after this pass, around every machine literal
   // whose `fromInteger` it could not short-cut (see `boxIntegerLit`). Without
@@ -2705,9 +2706,36 @@ export function elaborateProgram(
   // only when there is an entry point to wrap.
   if (wrapMain) for (const seat of RTS_SEATS) roots.add(seat.binding);
   return {
-    module: { ...user, declarations: reachable(out, roots) },
+    module: { ...user, declarations: ownFirst(reachable(out, roots), ownNames) },
     diagnostics: elaborator.diagnostics,
   };
+}
+
+/** Emit the user's own bindings ahead of the Prelude's.
+ *
+ * Nothing about a Haskell module depends on the order of its top-level
+ * bindings, but one byte of GHC's output does. `GHC.StgToJS.Expr.globalOccs`
+ * turns the globals a top-level closure mentions into its payload fields, and
+ * orders equally-used ones by the order their symbols were first interned -
+ * which `stg-js/monad.ts` models with `gsIdentMint`. GHC interns a symbol when
+ * it first emits it, and an *imported* Id is first emitted at its use site, so
+ * `mix a b = a * b + a` interns `$fNumInt` (from the inner `a * b` thunk,
+ * generated first) before `+`, and its closure is `[$fNumInt, +]`.
+ *
+ * ghcts prepends its Prelude to the module instead of importing one, so `+` and
+ * `$fNumInt` are interned at their *definitions* - before any user code - and
+ * the payload came out `[+, $fNumInt]`, reversing `h$r1`/`h$r2` at every such
+ * call. Compiling the user's declarations first restores use-order interning
+ * for everything they reference, which is exactly what GHC has for an import.
+ * The Prelude's own closures are then interned in whatever order their uses
+ * fall in, which is fine: GHC's `base` is compiled as its own modules and has
+ * no counterpart here to match.
+ *
+ * Non-value declarations stay put; they emit no code of their own. */
+function ownFirst(kept: readonly Declaration[], ownNames: ReadonlySet<string>): Declaration[] {
+  const own = (d: Declaration): boolean =>
+    (d.tag === "value" || d.tag === "foreign") && ownNames.has(d.name);
+  return [...kept.filter(own), ...kept.filter((d) => !own(d))];
 }
 
 /** Emit only what the program can reach from the user's own declarations.
