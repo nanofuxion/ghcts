@@ -247,6 +247,10 @@ class Desugarer {
 
   application(head: Expr, args: Expr[], scope: Scope): CoreExpr {
     const lowered = args.map((arg) => this.expr(arg, scope));
+    if (head.tag === "var") {
+      const shortCut = this.overloadedLit(head.name, lowered);
+      if (shortCut) return shortCut;
+    }
     if (head.tag === "var" && !scope.has(head.name)) {
       const con = this.cons.get(head.name);
       if (con) return this.saturateCon(con, lowered);
@@ -254,6 +258,26 @@ class Desugarer {
       if (prim) return this.saturateOp(prim, lowered);
     }
     return mkApps(this.expr(head, scope), lowered);
+  }
+
+  /** GHC's `dsOverLit` short-cut: an overloaded literal whose type is already
+   * known is built directly rather than left as a `fromInteger` call, so
+   * `5 :: Int` is `I# 5#` and not a thunk that computes it. The literal is
+   * then a constructor application with an atomic argument, which the backend
+   * allocates statically - and for `Int`, whose one field is unboxable, that
+   * static allocation IS the number.
+   *
+   * Elaboration has already picked the dictionary, and `$fNumInt` names the
+   * `Int` instance the way GHC's `intDataCon` names its constructor, so the
+   * type is recoverable here without a type checker. */
+  overloadedLit(head: string, args: CoreExpr[]): CoreExpr | undefined {
+    if (head !== "fromInteger" || args.length !== 2) return undefined;
+    const [dict, lit] = args;
+    // Binder identity, not just the name: only the module's own `$fNumInt`
+    // pins the type down to `Int`.
+    if (dict.tag !== "Var" || dict.binder !== this.top.get("$fNumInt")) return undefined;
+    if (lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return undefined;
+    return { tag: "Con", con: this.lookupCon("I", 1), args: [lit] };
   }
 
   /** `case` and `\case` alternatives; guards inside an alternative fall

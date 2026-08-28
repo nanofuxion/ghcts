@@ -214,11 +214,18 @@ function splitTop(tokens: readonly string[], separator: string): string[][] {
   return parts;
 }
 
+/** `type X a = ...` declarations, by name. Types are never renamed by the
+ * module system (see `src/modules.ts`), so one table serves the program.
+ * Filled once per `elaborateProgram`, like `nextTVar`. */
+let synonyms = new Map<string, { parameters: string[]; target: string }>();
+
 class TypeParser {
   private index = 0;
   constructor(
     private readonly tokens: readonly string[],
     private readonly vars: Map<string, Type>,
+    /** Guards against `type T = T`; a chain longer than this is a cycle. */
+    private readonly depth = 0,
   ) {}
 
   static tokens(source: string): string[] {
@@ -235,6 +242,20 @@ class TypeParser {
   }
 
   private application(): Type {
+    const head = this.tokens[this.index];
+    const synonym = head === undefined ? undefined : synonyms.get(head);
+    if (synonym && this.depth < 16) {
+      this.index++;
+      const bound = new Map<string, Type>();
+      for (const parameter of synonym.parameters) bound.set(parameter, this.atom());
+      let value = new TypeParser(TypeParser.tokens(synonym.target), bound, this.depth + 1).fun();
+      // A partially applied synonym is still an application: `type Handler a =
+      // a -> ()` used as `Handler Int Extra` keeps consuming arguments.
+      while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
+        value = tapp(value, this.atom());
+      }
+      return value;
+    }
     let value = this.atom();
     while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
       value = tapp(value, this.atom());
@@ -246,6 +267,12 @@ class TypeParser {
     const token = this.tokens[this.index++];
     if (token === undefined) return freshVar();
     if (token === "[") {
+      // `[]` on its own is the list *constructor*, which is what an instance
+      // head like `Foldable []` names; `[a]` is that constructor applied.
+      if (this.tokens[this.index] === "]") {
+        this.index++;
+        return tcon("[]");
+      }
       const item = this.fun();
       if (this.tokens[this.index] === "]") this.index++;
       return tlist(item);
@@ -273,8 +300,15 @@ class TypeParser {
       return made;
     }
     // `String` is the only alias the minimal Prelude relies on; keeping it here
-    // rather than in Haskell avoids needing type synonyms in the frontend.
-    return token === "String" ? tString : tcon(token);
+    // rather than in Haskell avoids declaring it.
+    if (token === "String") return tString;
+    // A nullary synonym is a type by itself, so it expands in argument
+    // position too - `Both Count` has to reach `(Int, Int)`, not `(Count, Count)`.
+    const synonym = synonyms.get(token);
+    if (synonym && synonym.parameters.length === 0 && this.depth < 16) {
+      return new TypeParser(TypeParser.tokens(synonym.target), new Map(), this.depth + 1).fun();
+    }
+    return tcon(token);
   }
 }
 
@@ -828,6 +862,15 @@ export function elaborateProgram(
   }
   const env: Env = new Map();
 
+  // --- type synonyms ----------------------------------------------------
+  // Expanded wherever a type is parsed, so `MisoString` and `Text` are one
+  // type and an instance written at either head is found from both.
+  synonyms = new Map();
+  for (const decl of declarations) {
+    if (decl.tag !== "typeAlias" || !/^[A-Z]/.test(decl.name)) continue;
+    synonyms.set(decl.name, { parameters: decl.parameters, target: decl.target });
+  }
+
   // --- data constructors -----------------------------------------------
   const datas = declarations.filter((d): d is DataDeclaration => d.tag === "data");
   for (const decl of datas) {
@@ -850,6 +893,17 @@ export function elaborateProgram(
     ":",
     quantify(typeVars(tfun(consVar, tfun(tlist(consVar), tlist(consVar)))), tfun(consVar, tfun(tlist(consVar), tlist(consVar))), []),
   );
+  // Tuple constructors. `(x, y)` reaches this pass as a `tuple` expression but
+  // as a `con` *pattern* named `(,)`, and `(,)` is also a legal value; all
+  // three want the same scheme. `src/desugar.ts` invents the matching DataCon
+  // on demand, so the two ends agree without a declaration anywhere.
+  elaborator.constructors.set("()", { gens: 0, constraints: [], type: tcon("()") });
+  for (let arity = 2; arity <= 7; arity++) {
+    const name = `(${",".repeat(arity - 1)})`;
+    const fields = Array.from({ length: arity }, () => freshVar());
+    const type = fields.reduceRight((acc, field) => tfun(field, acc), fields.reduce<Type>(tapp, tcon(name)));
+    elaborator.constructors.set(name, quantify(typeVars(type), type, []));
+  }
 
   // --- primitives -------------------------------------------------------
   for (const [name, signature] of Object.entries(PRIMITIVE_TYPES)) {
@@ -1050,7 +1104,17 @@ export function elaborateProgram(
   const order = orderBindings(bindings);
   for (const group of order) {
     const groupEnv = new Map(env);
-    for (const binding of group) groupEnv.set(binding.name, { tag: "group", type: binding.monoType, name: binding.name });
+    // A signature makes a binding usable *polymorphically* inside its own
+    // recursive group, as in GHC. Without it two mutually recursive signatured
+    // functions each see the other's skolemised type, whose rigid variables
+    // cannot unify with their own - a type error in code that is well typed.
+    for (const binding of group)
+      groupEnv.set(
+        binding.name,
+        binding.declaredScheme
+          ? { tag: "poly", scheme: binding.declaredScheme, emit: binding.name }
+          : { tag: "group", type: binding.monoType, name: binding.name },
+      );
     for (const binding of group) elaborator.inferBinding(binding, groupEnv);
     for (const binding of group) elaborator.finish(binding);
     for (const binding of group) {
@@ -1059,18 +1123,84 @@ export function elaborateProgram(
   }
 
   // --- rewrite ------------------------------------------------------------
-  const out: Declaration[] = declarations.filter((d) => d.tag === "data" || d.tag === "foreign");
+  // GHC declares `data [] a = [] | a : [a]` in GHC.Types; the parser has no
+  // syntax for it, so it is supplied here. Without a declaration the desugarer
+  // only learns the list constructors from the first expression that happens
+  // to mention a list, which leaves `x : xs` in a *prefix* position - the shape
+  // the parser gives every infix `:` - resolvable or not depending on
+  // declaration order. The tags and arities are the ones it invents anyway.
+  const listData: DataDeclaration = {
+    tag: "data",
+    name: "[]",
+    parameters: ["a"],
+    constructors: [
+      { name: "[]", arity: 0 },
+      { name: ":", arity: 2 },
+    ],
+    deriving: [],
+    span: NOWHERE,
+  };
+  const out: Declaration[] = [listData, ...declarations.filter((d) => d.tag === "data" || d.tag === "foreign")];
   for (const info of elaborator.classes.values()) out.push(...classDeclarations(info));
   for (const instance of elaborator.instances.values()) {
     const built = instanceDeclaration(elaborator, instance);
     if (built) out.push(built);
   }
-  for (const binding of bindings) out.push(rewriteBinding(elaborator, binding));
+  // GHC's entry is `:Main.main = runMainIO Main.main`, and the JS backend's
+  // `h$main` does nothing but *enter* that closure. An `IO` action here is a
+  // function of a state token, so entering it would only yield the function;
+  // the same wrapper GHC emits is what makes entry mean "run".
+  const mainBinding = elaborator.bindings.get("main");
+  const wrapMain = mainBinding !== undefined && headCon(mainBinding.monoType) === "IO";
+  for (const binding of bindings) {
+    const decl = rewriteBinding(elaborator, binding);
+    if (binding !== mainBinding || !wrapMain) {
+      out.push(decl);
+      continue;
+    }
+    out.push({ ...decl, name: "$mainIO" });
+    out.push(valueDecl("main", [], apply(variable("runMainIO", decl.span), variable("$mainIO", decl.span)), decl.span));
+  }
 
+  const roots = new Set(
+    declarations
+      .slice(prelude.module.ast.declarations.length)
+      .flatMap((d) => (d.tag === "value" || d.tag === "foreign" ? [d.name] : [])),
+  );
   return {
-    module: { ...user, declarations: out },
+    module: { ...user, declarations: reachable(out, roots) },
     diagnostics: elaborator.diagnostics,
   };
+}
+
+/** Emit only what the program can reach from the user's own declarations.
+ *
+ * The Prelude is prepended to every module, and its dictionaries, selectors,
+ * defaults and helpers are all real bindings; shipping the unused ones is not
+ * only waste but a hard limit, because `src/js/optimizer.ts` recurses once per
+ * statement in a block and overflows the stack on a few hundred closures.
+ * GHC's linker keeps the reachable closure for the same reason, so this is
+ * where that decision belongs rather than in a smaller Prelude.
+ *
+ * Data declarations are kept unconditionally: they emit no code, and the
+ * desugarer needs every constructor a pattern might name. */
+function reachable(out: readonly Declaration[], roots: ReadonlySet<string>): Declaration[] {
+  const byName = new Map<string, ValueDeclaration[]>();
+  for (const d of out) {
+    if (d.tag !== "value") continue;
+    const list = byName.get(d.name);
+    if (list) list.push(d);
+    else byName.set(d.name, [d]);
+  }
+  const seen = new Set<string>();
+  const queue = [...roots];
+  while (queue.length) {
+    const name = queue.pop()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    for (const decl of byName.get(name) ?? []) for (const ref of referencedNames(decl)) queue.push(ref);
+  }
+  return out.filter((d) => (d.tag === "value" || d.tag === "foreign" ? seen.has(d.name) : true));
 }
 
 /** Primitive operations, typed over the unboxed types only. The comparisons
@@ -1399,7 +1529,12 @@ function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
     case "as":
       return { ...p, pattern: rewritePattern(elaborator, p.pattern) };
     case "con":
-      return { ...p, args: p.args.map((arg) => rewritePattern(elaborator, arg)) };
+      // `src/desugar.ts` represents `()` as the machine integer 0, so matching
+      // it is matching that literal - strict, as GHC's `()` pattern is, and on
+      // the representation the value side already produces.
+      return p.name === "()" && p.args.length === 0
+        ? { tag: "int", value: 0, span: p.span }
+        : { ...p, args: p.args.map((arg) => rewritePattern(elaborator, arg)) };
     default:
       return p;
   }

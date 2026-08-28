@@ -306,15 +306,28 @@ export function genExpr(gs: GenState, ctx: ExprCtx, stg: StgExpr): [JStgStat, Ex
  * evaluation code for an Id.
  *
  * CONSERVATIVE: of GHC's nine clauses only the let-no-escape one, `proxy#` and
- * the final generic-apply fall-through survive. Every other clause is an
- * optimisation keyed on the Id's Core type, arity or details:
+ * the final generic-apply fall-through survive. Each of the six that do not is
+ * keyed on something ghcts's Binder cannot carry, and the reason differs:
  *
- *   - unboxed-tuple / strict-type field return: needs `isStrictType`
+ *   - the saturated and oversaturated direct jumps read `idFunRepArity`, which
+ *     the frontend does know - but both are additionally guarded by
+ *     `isStrictId i`, and that is `isStrictType (idType i) || isStrUsedDmd
+ *     (idDemandInfo i)`. A function's type is lifted, and demand analysis does
+ *     not run at -O0, so for an ordinary top-level function BOTH disjuncts are
+ *     False and neither clause fires in the output this port is measured
+ *     against. Carrying arity alone would therefore not move a single byte,
+ *     and ghcts has no demand analysis to make the guard true. That is why
+ *     `Binder` still has no arity field.
+ *   - "no args and Id can't be a function: just enter it" needs
+ *     `mightBeFunTy (idType i)`. There is no type on a Binder and no type
+ *     reaches desugar, so this one is genuinely out of reach; it is what emits
+ *     `h$e(x)` where this port emits `h$r1=x; return h$ap_0_0_fast()`.
+ *   - unboxed-tuple / strict-type field return: needs `isStrictType`.
  *   - the unboxable-heap-object check and the "known evaluated" return: both
- *     additionally require `ctxIsEvaluated`, which is already False
- *   - the newtype `DataConWrapId` wrapper: needs `idDetails`
- *   - "enter it" and the saturated/oversaturated direct jumps: need
- *     `idFunRepArity`
+ *     additionally require `ctxIsEvaluated`, which is `isTaggedSig . idTagSig`
+ *     - the result of GHC.Stg.InferTags, an unported pass. Nothing short of
+ *     porting it makes this answerable; see expr-ctx.ts.
+ *   - the newtype `DataConWrapId` wrapper: needs `idDetails`.
  *
  * Dropping them is sound because `h$ap_N_M` (and `h$ap_gen_fast`) decide arity
  * at run time from the closure's own info table, and `h$ap_0_0` is exactly the

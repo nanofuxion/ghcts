@@ -176,6 +176,10 @@ export function cachedIdentForId(
   if (ident === undefined) {
     ident = makeIdentForId(i, mi, idType, s.gsModule);
     s.gsIdents.set(key, ident);
+    // The symbol is a FastString in GHC, and interning one hands out the next
+    // unique. `globalOccs` depends on that order; record it here, the only
+    // place a symbol for an Id is built.
+    if (!s.gsIdentMint.has(ident)) s.gsIdentMint.set(ident, s.gsIdentMint.size);
   }
 
   // Now update the GlobalId cache, if required.

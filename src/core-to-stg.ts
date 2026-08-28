@@ -39,14 +39,8 @@ class Converter {
    * @param topLevel every top-level binder. These are never free variables of
    * a closure: codegen resolves them to module-level symbols, not payload
    * slots.
-   * @param topLevelThunks the nullary subset - CAFs. A reference to one is a
-   * pointer to an unentered thunk, so it has to be forced before it can be
-   * used as a value (see `atom`).
    */
-  constructor(
-    private readonly topLevel: ReadonlySet<Binder>,
-    private readonly topLevelThunks: ReadonlySet<Binder>,
-  ) {}
+  constructor(private readonly topLevel: ReadonlySet<Binder>) {}
 
   /** Peel the leading lambdas, so a right-hand side becomes a function
    * closure rather than a thunk that returns one. */
@@ -91,23 +85,27 @@ class Converter {
     return { tag: "StgRhsClosure", freeVars, update, args, body };
   }
 
-  expr(e: CoreExpr): StgExpr {
+  /** `out` collects the bindings this expression had to float out. When the
+   * caller passes one it takes on the job of re-attaching them, which is how
+   * CorePrep gets a `case`'s scrutinee floats to enclose the whole `case`
+   * rather than sit inside it. */
+  expr(e: CoreExpr, out?: Float[]): StgExpr {
+    const floats: Float[] = out ?? [];
+    const done = (body: StgExpr): StgExpr => (out === undefined ? wrap(floats, body) : body);
     switch (e.tag) {
       case "Var":
         return { tag: "StgApp", fn: e.binder, args: [] };
       case "Lit":
         return { tag: "StgLit", lit: e.lit };
       case "Con": {
-        const floats: Float[] = [];
         const args = e.args.map((arg) => this.atom(arg, floats, false));
-        return wrap(floats, { tag: "StgConApp", con: e.con, args });
+        return done({ tag: "StgConApp", con: e.con, args });
       }
       case "Op": {
-        const floats: Float[] = [];
         // A primop consumes machine values, so its arguments are evaluated
         // here rather than thunked.
         const args = e.args.map((arg) => this.atom(arg, floats, true));
-        return wrap(floats, { tag: "StgOpApp", op: e.op, args });
+        return done({ tag: "StgOpApp", op: e.op, args });
       }
       case "Lam": {
         // A lambda in a non-right-hand-side position still has to become a
@@ -119,43 +117,40 @@ class Converter {
           body: { tag: "StgApp", fn: binder, args: [] },
         };
       }
-      case "Let": {
-        // A non-recursive `let` whose right-hand side is not a function is
-        // evaluated here rather than thunked - see `atom` for why this
-        // language is call-by-value.
-        if (e.bind.tag === "NonRec" && e.bind.rhs.tag !== "Lam") {
-          return {
-            tag: "StgCase",
-            scrutinee: this.expr(e.bind.rhs),
-            binder: e.bind.binder,
-            altType: altTypeOfExpr(e.bind.rhs),
-            alts: [{ con: { tag: "DEFAULT" }, binders: [], body: this.expr(e.body) }],
-          };
-        }
+      case "Let":
+        // A source `let` is lazy, so it stays a `let`: the right-hand side
+        // becomes a thunk the body enters, which is what CorePrep leaves and
+        // what the backend allocates with h$c1.
         return { tag: "StgLet", binding: this.bind(e.bind), body: this.expr(e.body) };
-      }
       case "Case": {
+        // The scrutinee's floats belong outside the whole `case`, not inside
+        // its scrutinee: CorePrep produces `let sat = ... in case f x sat of`,
+        // and a float left in the scrutinee would be generated after the
+        // return frame was already pushed.
+        const scrutinee = this.expr(e.scrutinee, floats);
         const alts = e.alts.map((alt) => this.alt(alt));
-        return {
+        return done({
           tag: "StgCase",
-          scrutinee: this.expr(e.scrutinee),
+          scrutinee,
           binder: e.binder,
           altType: altTypeOf(e.alts, e.scrutinee),
           alts,
-        };
+        });
       }
       case "App": {
         const [head, args] = flatten(e);
-        const floats: Float[] = [];
         const atoms = args.map((arg) => this.atom(arg, floats, false));
         if (head.tag === "Var") {
-          return wrap(floats, { tag: "StgApp", fn: head.binder, args: atoms });
+          return done({ tag: "StgApp", fn: head.binder, args: atoms });
         }
-        // The head is itself a computation; name it, then apply the name.
+        // The head is itself a computation; name it, then apply the name. Its
+        // float has to come before the arguments', since the arguments may
+        // mention nothing of it but it is evaluated first.
         const headFloats: Float[] = [];
         const headAtom = this.atom(head, headFloats, true);
         if (headAtom.tag !== "StgVarArg") throw new Error("coreToStg: literal in function position");
-        return wrap([...headFloats, ...floats], { tag: "StgApp", fn: headAtom.id, args: atoms });
+        floats.unshift(...headFloats);
+        return done({ tag: "StgApp", fn: headAtom.id, args: atoms });
       }
     }
   }
@@ -188,17 +183,22 @@ class Converter {
    *     representation the backend has.
    *   - a primop result or a literal, which IS a machine value, and cannot be
    *     the payload of a thunk.
-   *   - a CAF reference, which is a pointer to an unentered thunk.
+   *
+   * A variable is already an atom, whatever it is bound to. In particular a
+   * reference to a top-level thunk is passed on unentered, exactly as
+   * CorePrep leaves it: the pointer IS the value, and whoever needs it in
+   * WHNF enters it. Forcing it here would be sound but would put a `case`
+   * where GHC puts an argument.
    *
    * The thunks this pass now builds are Updatable rather than SingleEntry: the
    * argument they stand for can be duplicated by the callee, so the update is
    * not provably wasted, and a missing update frame fails silently. */
   atom(e: CoreExpr, floats: Float[], strict: boolean): StgArg {
     if (e.tag === "Lit") return litArg(e.lit);
-    if (e.tag === "Var" && !this.topLevelThunks.has(e.binder)) return varArg(e.binder);
+    if (e.tag === "Var") return varArg(e.binder);
     const binder = mkBinder("t");
     const value = this.expr(e);
-    const evaluate = strict || e.tag === "Op" || e.tag === "Var";
+    const evaluate = strict || e.tag === "Op";
     floats.push(
       evaluate
         ? (body) => ({
@@ -310,19 +310,11 @@ const conWorker = (con: DataCon): StgBinding => ({
 
 export function coreToStg(program: CoreProgram): StgModule {
   const topLevel = new Set<Binder>();
-  const topLevelThunks = new Set<Binder>();
   for (const bind of program.binds) {
-    if (bind.tag === "NonRec") {
-      topLevel.add(bind.binder);
-      if (bind.rhs.tag !== "Lam") topLevelThunks.add(bind.binder);
-    } else {
-      for (const [b, rhs] of bind.pairs) {
-        topLevel.add(b);
-        if (rhs.tag !== "Lam") topLevelThunks.add(b);
-      }
-    }
+    if (bind.tag === "NonRec") topLevel.add(bind.binder);
+    else for (const [b] of bind.pairs) topLevel.add(b);
   }
-  const converter = new Converter(topLevel, topLevelThunks);
+  const converter = new Converter(topLevel);
   return {
     name: program.name,
     bindings: [

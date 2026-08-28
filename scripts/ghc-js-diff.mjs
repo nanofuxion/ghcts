@@ -38,7 +38,20 @@ const source = readFileSync(file, "utf8");
 const work = mkdtempSync(join(tmpdir(), "ghcjs-diff-"));
 const hs = join(work, "Main.hs");
 // GHC needs a main; ghcts has no IO yet, so it gets the module without one.
-writeFileSync(hs, /^main\s*::/m.test(source) ? source : `${source}\nmain :: IO ()\nmain = return ()\n`);
+//
+// The appended main has to *reach* every binding, not just exist: GHC's JS
+// linker emits only what main can reach, so `main = return ()` leaves out.js
+// with nothing of the module in it and nothing to compare. `seq` is enough to
+// make a binding a link root whatever its type. Keywords are skipped so a
+// `data`/`class` line is not mistaken for a binder.
+const KEYWORDS = new Set(["data", "type", "newtype", "class", "instance", "import", "module", "infixl", "infixr", "infix", "foreign", "where", "main"]);
+const roots = [...new Set([...source.matchAll(/^([a-z_][A-Za-z0-9_']*)/gm)].map((m) => m[1]))].filter(
+  (n) => !KEYWORDS.has(n),
+);
+const withMain = /^main\s*::/m.test(source)
+  ? source
+  : `${source}\nmain :: IO ()\nmain = ${roots.map((r) => `${r} \`seq\` `).join("")}return ()\n`;
+writeFileSync(hs, withMain);
 execFileSync(GHC_JS, [hs, "-o", join(work, "out")], { cwd: work, stdio: "pipe" });
 const jsexe = join(work, "out.jsexe");
 const ghcOut = readFileSync(join(jsexe, "out.js"), "utf8");

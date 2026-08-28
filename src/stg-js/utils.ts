@@ -235,16 +235,40 @@ export type IdSet = Map<number, Binder>;
 /** Id -> StgExpr map for unfloated arguments. */
 export type UnfloatedMap = Map<number, StgExpr>;
 
-const singleton = (i: Binder): IdSet => new Map([[i.unique, i]]);
-const unions = (ss: IdSet[]): IdSet => {
-  const out: IdSet = new Map();
-  for (const s of ss) for (const [k, v] of s) out.set(k, v);
-  return out;
+/** A `DVarSet` is a `UniqDFM`, which carries an upper bound on the tags it has
+ * handed out (`udfm_i`). `plusUDFM` compares the two bounds and inserts the
+ * smaller set into the larger, so the larger side keeps its order and only the
+ * other side's new keys are appended - which is why a free-variable list is
+ * neither in occurrence order nor reversed. The bound lives in a side table so
+ * that `IdSet` stays a plain Map for every other consumer; a Map built
+ * anywhere else reads as a set whose bound is its size, which is what
+ * `mkUniqDSet` would have produced. */
+const bounds = new WeakMap<IdSet, number>();
+const boundOf = (s: IdSet): number => bounds.get(s) ?? s.size;
+const withBound = (s: IdSet, n: number): IdSet => {
+  bounds.set(s, n);
+  return s;
 };
+
+const singleton = (i: Binder): IdSet => withBound(new Map([[i.unique, i]]), 1);
+
+/** `plusUDFM`. */
+const union2 = (l: IdSet, r: IdSet): IdSet => {
+  const [base, add] = boundOf(l) > boundOf(r) ? [l, r] : [r, l];
+  const out = new Map(base);
+  // A duplicate key keeps the tag it already had, but still costs a tag.
+  for (const [k, v] of add) if (!out.has(k)) out.set(k, v);
+  return withBound(out, boundOf(base) + add.size);
+};
+
+/** `unionManyUniqDSets`: foldl', with the empty set only for an empty list. */
+const unions = (ss: IdSet[]): IdSet => (ss.length === 0 ? withBound(new Map(), 0) : ss.reduce(union2));
+
+/** `delDVarSetList`. Deleting does not return the tag. */
 const without = (s: IdSet, bs: Binder[]): IdSet => {
   const out = new Map(s);
   for (const b of bs) out.delete(b.unique);
-  return out;
+  return withBound(out, boundOf(s));
 };
 
 /** collect Ids that this binding refers to (does not include the bindees
@@ -312,11 +336,11 @@ export type LiveVars = IdSet;
 
 /** GHC splits on `isGlobalId`; stg.ts's stand-in is the `exported` flag. */
 export function liveStatic(l: LiveVars): LiveVars {
-  return new Map([...l].filter(([, v]) => v.exported === true));
+  return withBound(new Map([...l].filter(([, v]) => v.exported === true)), boundOf(l));
 }
 
 export function liveVars(l: LiveVars): LiveVars {
-  return new Map([...l].filter(([, v]) => v.exported !== true));
+  return withBound(new Map([...l].filter(([, v]) => v.exported !== true)), boundOf(l));
 }
 
 export function stgBindLive(b: StgBinding): Array<[Binder, LiveVars]> {

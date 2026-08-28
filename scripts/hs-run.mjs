@@ -97,13 +97,19 @@ function compile(sources, file) {
   };
 }
 
-function run(emitted, symbol) {
+/** `probe` is a JS expression read *after* the program has run, which is the
+ * only way to observe an `IO ()`: its value carries nothing, so the proof that
+ * it ran has to come from the effect it had. Property order in the object
+ * literal is what sequences the two. */
+function run(emitted, symbol, probe) {
   // Indirect eval so the RTS's top-level `var h$...` land on globalThis.
   const entry = (0, eval)(
     `${rts}\n${bootstrap}\n${emitted}\n(function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
-      ` return { value: h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; }), force: h$forceClosure }; })`,
+      ` return { value: h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; }), probed: ${probe ?? "undefined"},` +
+      ` force: h$forceClosure }; })`,
   );
-  const { value, force } = entry();
+  const { value, probed, force } = entry();
+  if (probe !== undefined) return probed;
   // `Int`, `Char` and `Bool` arrive as plain JS values: the backend unboxes a
   // one-constructor, one-primitive-field type (`isUnboxableCon`), and `Bool`
   // is a JS boolean. Only a list is still a closure, so an object result is a
@@ -437,6 +443,204 @@ const programs = [
     },
     expect: 30,
   },
+  // `error` and the laziness that makes it usable as a fallback.
+  {
+    name: "error is not forced when its branch is not taken",
+    source: 'module Main where\nmain = if True then 42 else error "boom"\n',
+    expect: 42,
+  },
+  {
+    name: "error raises",
+    source: 'module Main where\nmain = error "boom"\n',
+    throws: "Prelude.error",
+  },
+  {
+    name: "head of an empty list raises through error",
+    source: "module Main where\nmain = head []\n",
+    throws: "Prelude.error",
+  },
+  // Either.
+  {
+    name: "Either: Left is taken",
+    source:
+      "module Main where\npick :: Either Int Int -> Int\npick e = either (\\x -> x) (\\y -> y + 1) e\nmain = pick (Left 42)\n",
+    expect: 42,
+  },
+  {
+    name: "Either: Right is taken",
+    source:
+      "module Main where\npick :: Either Int Int -> Int\npick e = either (\\x -> x) (\\y -> y + 1) e\nmain = pick (Right 41)\n",
+    expect: 42,
+  },
+  {
+    name: "Either as a Monad short-circuits on Left",
+    source:
+      'module Main where\nrun :: Either [Char] Int\nrun = do\n  x <- Right 1\n  y <- Left "no"\n  pure (x + y)\nmain = show (isLeft run)\n',
+    expect: "True",
+  },
+  {
+    name: "Either as a Monad threads a Right",
+    source:
+      'module Main where\nrun :: Either [Char] Int\nrun = do\n  x <- Right 20\n  y <- Right 22\n  pure (x + y)\nmain = show (run == Right 42)\n',
+    expect: "True",
+  },
+  // Prelude breadth.
+  {
+    name: "list functions: map, filter, sum",
+    source: "module Main where\nmain = sum (map (\\x -> x * 2) (filter (\\x -> x > 2) [1, 2, 3, 4]))\n",
+    expect: 14,
+  },
+  {
+    name: "Semigroup and Monoid on lists",
+    source: 'module Main where\nmain = mconcat ["a", "b"] ++ ("c" <> "de")\n',
+    expect: "abcde",
+  },
+  {
+    name: "compare, Ordering and the Ord defaults",
+    source: "module Main where\nmain = show (compare 3 4 == LT && max 3 4 == 4 && min 3 4 == 3)\n",
+    expect: "True",
+  },
+  {
+    name: "tuples: a tuple pattern, fst and snd",
+    source: "module Main where\nswap2 p = (snd p, fst p)\nmain = fst (swap2 (20, 42))\n",
+    expect: 42,
+  },
+  {
+    name: "Eq on a pair",
+    source: "module Main where\nmain = show ((1, 2) == (1, 2) && (1, 2) /= (1, 3))\n",
+    expect: "True",
+  },
+  {
+    name: "maybe, fromMaybe and <$>",
+    source: "module Main where\nmain = fromMaybe 0 ((\\x -> x + 1) <$> Just 41)\n",
+    expect: 42,
+  },
+  {
+    name: "flip and a section-free operator argument",
+    source: "module Main where\nmain = flip (-) 1 43\n",
+    expect: 42,
+  },
+  {
+    name: "mapM over a list in the Maybe monad",
+    source:
+      "module Main where\nmain = show (mapM (\\x -> if x > 0 then Just x else Nothing) [1, 2, 3] == Just [1, 2, 3])\n",
+    expect: "True",
+  },
+  {
+    name: "mapM short-circuits",
+    source:
+      "module Main where\nmain = show (mapM (\\x -> if x > 1 then Just x else Nothing) [1, 2] == Nothing)\n",
+    expect: "True",
+  },
+  {
+    name: "Foldable: length at Maybe, elem and any at a list",
+    source:
+      "module Main where\nmain = show (length (Just 1) == 1 && elem 3 [1, 2, 3] && any (\\x -> x > 2) [1, 2, 3])\n",
+    expect: "True",
+  },
+  {
+    name: "Alternative on Maybe, and guard",
+    source: "module Main where\nmain = show ((Nothing <|> Just 42) == Just 42 && isNothing (guard False))\n",
+    expect: "True",
+  },
+  // IO. `IO (\\s -> ...)` is how a primitive action is built: an action is a
+  // function of the state token, so the FFI call inside the lambda runs when
+  // the action runs, not when it is constructed. The `case` around the call is
+  // GHC's own shape (`case emit n of v -> (# s, I v #)`) and is what makes the
+  // effect happen at all: without it the result is a thunk nobody forces.
+  {
+    name: "IO: pure and fmap, entered through the runMainIO wrapper",
+    source: "module Main where\nmain :: IO Int\nmain = fmap (\\x -> x + 1) (pure 41)\n",
+    expect: 42,
+  },
+  {
+    name: "IO: a do block binds and returns",
+    source: "module Main where\nmain :: IO Int\nmain = do\n  x <- pure 20\n  y <- pure 22\n  pure (x + y)\n",
+    expect: 42,
+  },
+  {
+    name: "type synonyms, with and without parameters",
+    source:
+      "module Main where\ntype Count = Int\ntype Both a = (a, a)\ntotal :: Both Count -> Count\ntotal p = fst p + snd p\nmain = total (20, 22)\n",
+    expect: 42,
+  },
+  {
+    name: "a () pattern, in an equation and as a do binder",
+    source:
+      "module Main where\nf :: () -> Int\nf () = 42\ng :: IO Int\ng = do\n  () <- pure ()\n  pure (f ())\nmain = unsafePerformIO g\n",
+    expect: 42,
+  },
+  {
+    name: "unsafePerformIO runs an action",
+    source: "module Main where\nmain = unsafePerformIO (pure 42)\n",
+    expect: 42,
+  },
+  {
+    name: "IO: a do block runs its effects, in order",
+    source: [
+      "module Main where",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsOrder = (globalThis.$hsOrder || 0) * 10 + x; return x; })" emit :: IntPrim -> IntPrim',
+      'foreign import javascript unsafe "((x) => globalThis.$hsOrder)" readOrder :: IntPrim -> IntPrim',
+      "stepAt :: RealWorld -> IntPrim -> IOResult Int",
+      "stepAt s n = case emit n of",
+      "  v -> IOResult s (I v)",
+      "readAt :: RealWorld -> IOResult Int",
+      "readAt s = case readOrder 0 of",
+      "  v -> IOResult s (I v)",
+      "step :: IntPrim -> IO Int",
+      "step n = IO (\\s -> stepAt s n)",
+      "readOrderIO :: IO Int",
+      "readOrderIO = IO (\\s -> readAt s)",
+      "main :: IO Int",
+      "main = do",
+      "  step 1",
+      "  step 2",
+      "  step 3",
+      "  readOrderIO",
+      "",
+    ].join("\n"),
+    expect: 123,
+  },
+  {
+    name: "main :: IO () runs and has its effect",
+    source: [
+      "module Main where",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsProbe = x; return x; })" emit :: IntPrim -> IntPrim',
+      "stepAt :: RealWorld -> IntPrim -> IOResult Int",
+      "stepAt s n = case emit n of",
+      "  v -> IOResult s (I v)",
+      "step :: IntPrim -> IO Int",
+      "step n = IO (\\s -> stepAt s n)",
+      "main :: IO ()",
+      "main = do",
+      "  step 42",
+      "  pure ()",
+      "",
+    ].join("\n"),
+    probe: "globalThis.$hsProbe",
+    expect: 42,
+  },
+  {
+    // An action built but never run must have no effect: that is the whole
+    // point of representing `IO` as a function rather than as a value.
+    name: "an unrun IO action has no effect",
+    source: [
+      "module Main where",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsUnrun = x; return x; })" emit :: IntPrim -> IntPrim',
+      "stepAt :: RealWorld -> IntPrim -> IOResult Int",
+      "stepAt s n = case emit n of",
+      "  v -> IOResult s (I v)",
+      "step :: IntPrim -> IO Int",
+      "step n = IO (\\s -> stepAt s n)",
+      "main :: IO Int",
+      "main = pure (unused (step 7))",
+      "unused :: IO Int -> Int",
+      "unused m = 42",
+      "",
+    ].join("\n"),
+    probe: "globalThis.$hsUnrun === undefined ? 0 : globalThis.$hsUnrun",
+    expect: 0,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
@@ -473,8 +677,11 @@ for (const program of cases) {
   for (const d of compiled.diagnostics) console.log(`        ${formatDiagnostic(d)}`);
   if (show) console.log(`--- ${program.name} (${compiled.symbol}) ---\n${compiled.emitted}\n`);
   try {
-    const result = run(compiled.emitted, compiled.symbol);
-    if (program.expect === undefined) {
+    const result = run(compiled.emitted, compiled.symbol, program.probe);
+    if (program.throws !== undefined) {
+      console.log(`  FAIL  ${program.name}: expected a \`${program.throws}\` exception, got ${JSON.stringify(result)}`);
+      failures++;
+    } else if (program.expect === undefined) {
       console.log(`  ${program.name} => ${JSON.stringify(result)}`);
     } else if (result === program.expect) {
       console.log(`  ok    ${program.name} => ${result}`);
@@ -483,8 +690,13 @@ for (const program of cases) {
       failures++;
     }
   } catch (cause) {
-    console.log(`  FAIL  ${program.name}: ${cause instanceof Error ? `${cause.name}: ${cause.message}` : cause}`);
-    failures++;
+    const message = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    if (program.throws !== undefined && message.includes(program.throws)) {
+      console.log(`  ok    ${program.name} => ${message}`);
+    } else {
+      console.log(`  FAIL  ${program.name}: ${message}`);
+      failures++;
+    }
   }
 }
 

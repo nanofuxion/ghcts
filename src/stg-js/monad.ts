@@ -122,6 +122,8 @@ export class GenGroupState {
 export class GenState {
   /** hash consing for identifiers from a Unique */
   gsIdents: IdCache = new Map();
+  /** Order in which each Ident was first minted - see `globalOccs`. */
+  gsIdentMint: Map<Ident, number> = new Map();
   /** state for the current binding group */
   gsGroup = new GenGroupState();
   /** global (per module) statements (gets included when anything else from
@@ -384,6 +386,14 @@ export function globalOccs(s: GenState, jst: JStgStat): GlobalOcc[] {
     if (existing === undefined) gids.set(i, { global_ident: i, global_id: found.id, global_count: 1 });
     else existing.global_count += 1;
   }
-  // Array.prototype.sort is stable in ES2019+, matching Data.List.sortBy.
-  return [...gids.values()].sort((a, b) => a.global_count - b.global_count);
+  // GHC sorts `nonDetEltsUFM gids` by count. The UFM is keyed on the Ident's
+  // Unique, which for an Ident is its FastString's, and FastString uniques come
+  // from one monotonic counter bumped on first interning - so `nonDetEltsUFM`
+  // hands back the equal-count Idents in the order they were first minted, and
+  // `sortBy` (stable) keeps that order. Mint order is what `gsIdentMint`
+  // records, so this reproduces the "non-deterministic" list exactly.
+  const mint = (o: GlobalOcc): number => s.gsIdentMint.get(o.global_ident) ?? 0;
+  return [...gids.values()]
+    .sort((a, b) => mint(a) - mint(b))
+    .sort((a, b) => a.global_count - b.global_count);
 }
