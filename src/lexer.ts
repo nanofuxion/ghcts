@@ -1,7 +1,7 @@
 import type { Span } from './ast.js';
 import { error } from './diagnostics.js';
 import type { Diagnostic } from './types.js';
-export interface Token { kind: 'ident' | 'int' | 'string' | 'char' | 'symbol' | 'newline' | 'eof' | 'quasiquote'; text: string; span: Span; /** Punctuation inserted by the layout phase, never present in source. */ virtual?: true; quoter?: string; }
+export interface Token { kind: 'ident' | 'int' | 'float' | 'string' | 'char' | 'symbol' | 'newline' | 'eof' | 'quasiquote'; text: string; span: Span; /** Punctuation inserted by the layout phase, never present in source. */ virtual?: true; quoter?: string; }
 // Longest tokens must be considered before their prefixes.  This intentionally
 // includes the ordinary symbolic identifiers used by Miso's lens API.
 const symbols = new Set(['::', '->', '<-', '=>', '+=', '-=', '*=', '/=', '.=', '.~', '%~', '^.', '^?', '?~', '+~', '-~', '%=', '<&>', '<#', '#>', '//~', '==', '/=', '<=', '>=', '&&', '||', '++', '..', '(', ')', '[', ']', '{', '}', ',', ';', '=', '|', '\\', '`', '+', '-', '*', '/', '<', '>', '$', ':', '@', '~', '!', '&', '%', '^', '?', '#', '.']);
@@ -51,11 +51,23 @@ export function lex(source: string, file: string, defines: ReadonlySet<string> =
     if (source.startsWith('{-#', index)) { const end = source.indexOf('#-}', index + 3); if (end < 0) { diagnostics.push(error('E_LEX', 'Unterminated pragma', file, line, column)); break; } column += end + 3 - index; index = end + 3; continue; }
     if (/\d/.test(ch)) {
       while (index < source.length && /\d/.test(source[index])) { index++; column++; }
+      // A fraction (and an exponent, which only a fraction may carry here)
+      // makes this a *different* literal, not a longer integer: `2.5` must not
+      // reach Core as `LitNumInt 2`.
+      let fractional = false;
       if (source[index] === '.' && /\d/.test(source[index + 1] ?? '')) {
+        fractional = true;
         index++; column++;
         while (index < source.length && /\d/.test(source[index])) { index++; column++; }
       }
-      emit('int', source.slice(start, index), start, startLine, startColumn);
+      if (fractional && /[eE]/.test(source[index] ?? '')) {
+        const after = /[+-]/.test(source[index + 1] ?? '') ? index + 2 : index + 1;
+        if (/\d/.test(source[after] ?? '')) {
+          column += after - index; index = after;
+          while (index < source.length && /\d/.test(source[index])) { index++; column++; }
+        }
+      }
+      emit(fractional ? 'float' : 'int', source.slice(start, index), start, startLine, startColumn);
       continue;
     }
     if (/[A-Za-z_]/.test(ch)) {

@@ -1408,6 +1408,7 @@ class Parser {
         !["then", "else", "of", "where", "in"].includes(t.text) &&
         !this.qualifiedOperator()) ||
       t.kind === "int" ||
+      t.kind === "float" ||
       t.kind === "string" ||
       t.kind === "char" ||
       t.kind === "quasiquote" ||
@@ -1420,6 +1421,8 @@ class Parser {
     const t = this.take();
     if (t.kind === "int")
       return { tag: "int", value: Number(t.text), span: t.span };
+    if (t.kind === "float")
+      return { tag: "double", value: Number(t.text), span: t.span };
     if (t.kind === "string" || t.kind === "char")
       return { tag: "string", value: t.text, span: t.span };
     if (t.kind === "quasiquote")
@@ -2006,7 +2009,7 @@ class Parser {
     const token = this.current();
     if (token.text === "(" || token.text === "[" || token.text === "!")
       return this.pattern();
-    if (token.kind === "int" || token.kind === "string" || token.kind === "char")
+    if (token.kind === "int" || token.kind === "float" || token.kind === "string" || token.kind === "char")
       return this.pattern();
     if (token.kind === "ident") {
       this.take();
@@ -2076,6 +2079,7 @@ class Parser {
     return (
       token.kind === "ident" ||
       token.kind === "int" ||
+      token.kind === "float" ||
       token.kind === "string" ||
       token.kind === "char" ||
       token.text === "(" ||

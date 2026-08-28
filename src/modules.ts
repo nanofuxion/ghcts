@@ -297,6 +297,7 @@ class Renamer {
       case "var":
         return { ...expr, name: this.lookup(expr.name, shadow) };
       case "int":
+      case "double":
       case "string":
       case "unit":
       case "jsQuote":

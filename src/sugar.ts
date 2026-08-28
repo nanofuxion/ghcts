@@ -16,6 +16,7 @@ import type {
   DoStatement,
   Expr,
   Guard,
+  ListQualifier,
   LocalBinding,
   Pattern,
   Span,
@@ -155,6 +156,8 @@ class Sugar {
         return { ...e, items: e.items.map((item) => this.expr(item)) };
       case "do":
         return this.doBlock(e.statements, e.span);
+      case "listComp":
+        return this.comprehension(e.body, e.qualifiers, e.span);
       case "record":
         return this.construct(e);
       case "recordUpdate":
@@ -191,6 +194,39 @@ class Sugar {
         ? tail
         : { tag: "case", subject: variable(name, span), alternatives: [{ pattern, body: tail }], span };
     return apply2(">>=", this.expr(head.source), { tag: "lambda", parameter: name, body, span }, span);
+  }
+
+  /** The report's own translation:
+   *
+   *   [e | ]          = [e]
+   *   [e | b, Q]      = if b then [e | Q] else []
+   *   [e | p <- l, Q] = concatMap (\p -> [e | Q]) l
+   *
+   * A *refutable* generator pattern skips the elements it does not match, so
+   * it becomes a two-alternative `\case` rather than a lambda - dropping that
+   * would turn `[x | Just x <- xs]` into a pattern-match failure. */
+  private comprehension(body: Expr, qualifiers: readonly ListQualifier[], span: Span): Expr {
+    const nil: Expr = { tag: "list", items: [], span };
+    const head = qualifiers[0];
+    if (!head) return { tag: "list", items: [this.expr(body)], span };
+    const tail = this.comprehension(body, qualifiers.slice(1), span);
+    if (head.tag === "guard")
+      return { tag: "if", condition: this.expr(head.condition), thenBranch: tail, elseBranch: nil, span };
+    const pattern = this.pattern(head.pattern);
+    const step: Expr =
+      pattern.tag === "var"
+        ? { tag: "lambda", parameter: pattern.name, body: tail, span }
+        : pattern.tag === "wild"
+          ? { tag: "lambda", parameter: this.fresh("lc"), body: tail, span }
+          : {
+              tag: "lambdaCase",
+              alternatives: [
+                { pattern, body: tail },
+                { pattern: { tag: "wild", span }, body: nil },
+              ],
+              span,
+            };
+    return apply2("concatMap", step, this.expr(head.source), span);
   }
 
   private construct(e: Extract<Expr, { tag: "record" }>): Expr {

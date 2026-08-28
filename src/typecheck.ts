@@ -1301,6 +1301,8 @@ class Inferencer {
     switch (expression.tag) {
       case "int":
         return int;
+      case "double":
+        return { tag: "con", name: "Double" };
       case "string":
         return string;
       case "unit":

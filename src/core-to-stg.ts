@@ -197,13 +197,17 @@ class Converter {
     if (e.tag === "Lit") return litArg(e.lit);
     if (e.tag === "Var") return varArg(e.binder);
     const binder = mkBinder("t");
-    const value = this.expr(e);
     const evaluate = strict || e.tag === "Op";
+    // Only one of the two translations is used, and each one walks `e` again.
+    // Building both made a nested constructor cost 2^depth: a 25-character
+    // string literal - `error "Prelude.head: empty list"` - took eleven
+    // seconds to reach STG.
+    const value = evaluate ? this.expr(e) : undefined;
     floats.push(
       evaluate
         ? (body) => ({
             tag: "StgCase",
-            scrutinee: value,
+            scrutinee: value!,
             binder,
             altType: altTypeOfExpr(e),
             alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],

@@ -56,6 +56,7 @@ import { renameDeclarations, renameValue, resolveProgram, type Scope } from "./m
 import { error } from "./diagnostics.js";
 import { constructorTable, derivedEqMethod, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
+import { withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
 import type { Diagnostic } from "./types.js";
 
@@ -243,7 +244,7 @@ class TypeParser {
 
   private application(): Type {
     const head = this.tokens[this.index];
-    const synonym = head === undefined ? undefined : synonyms.get(head);
+    const synonym = head === undefined ? undefined : synonyms.get(unqualify(head));
     if (synonym && this.depth < 16) {
       this.index++;
       const bound = new Map<string, Type>();
@@ -264,8 +265,13 @@ class TypeParser {
   }
 
   private atom(): Type {
-    const token = this.tokens[this.index++];
-    if (token === undefined) return freshVar();
+    const raw = this.tokens[this.index++];
+    if (raw === undefined) return freshVar();
+    // A qualified type constructor names the same type as the bare one: types
+    // live in one global namespace here, exactly as `src/modules.ts` treats a
+    // qualified constructor in an expression. Without this, `M.Map Int a` is
+    // an unrelated opaque type from `Map Int a`.
+    const token = unqualify(raw);
     if (token === "[") {
       // `[]` on its own is the list *constructor*, which is what an instance
       // head like `Foldable []` names; `[a]` is that constructor applied.
@@ -313,6 +319,10 @@ class TypeParser {
 }
 
 /** A signature string, split into its context and its type. */
+/** `M.Map` -> `Map`, `Data.Text.Text` -> `Text`. */
+const unqualify = (name: string): string =>
+  /^[A-Z][A-Za-z0-9_']*(\.[A-Z][A-Za-z0-9_']*)+$/.test(name) ? name.slice(name.lastIndexOf(".") + 1) : name;
+
 function parseSignature(source: string, vars: Map<string, Type>): { context: Constraint[]; type: Type } {
   const tokens = TypeParser.tokens(source);
   const parts = splitTop(tokens, "=>");
@@ -322,7 +332,7 @@ function parseSignature(source: string, vars: Map<string, Type>): { context: Con
     const stripped = part[0] === "(" && part.at(-1) === ")" ? part.slice(1, -1) : part;
     for (const item of splitTop(stripped, ",")) {
       if (item.length < 2) continue;
-      context.push({ cls: item[0]!, type: new TypeParser(item.slice(1), vars).fun() });
+      context.push({ cls: unqualify(item[0]!), type: new TypeParser(item.slice(1), vars).fun() });
     }
   }
   return { context, type: new TypeParser(body, vars).fun() };
@@ -425,7 +435,7 @@ type Env = Map<string, EnvEntry>;
  * real syntax only once constraint solving has finished. */
 type Use =
   | { kind: "apply"; node: Expr; emit: string; constraints: Constraint[] }
-  | { kind: "literal"; node: Expr; type: Type }
+  | { kind: "literal"; node: Expr; type: Type; cls: "Num" | "Fractional" }
   | { kind: "group"; node: Expr; target: string };
 
 /** What a binding was told, or worked out, about its own constraints. */
@@ -520,7 +530,14 @@ class Elaborator {
     switch (e.tag) {
       case "int": {
         const t = freshVar();
-        this.current?.uses.push({ kind: "literal", node: e, type: t });
+        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "Num" });
+        return t;
+      }
+      // A fractional literal wants `Fractional`, not `Num`: `0.5 :: Int` is a
+      // type error in Haskell and must stay one here.
+      case "double": {
+        const t = freshVar();
+        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "Fractional" });
         return t;
       }
       case "string":
@@ -668,7 +685,7 @@ class Elaborator {
   /** Every constraint the binding still owes, in occurrence order. */
   private wanted(binding: Binding): Constraint[] {
     return binding.uses.flatMap((use) =>
-      use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: "Num", type: use.type }] : [],
+      use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: use.cls, type: use.type }] : [],
     );
   }
 
@@ -695,6 +712,9 @@ class Elaborator {
     // `IntPrim` is the machine integer itself, so a `Num IntPrim` wanted is
     // discharged by the literal staying raw; there is no dictionary to name.
     if (con === "IntPrim" && cls === "Num") return undefined;
+    // Likewise `DoublePrim`: a fractional literal at the machine type stays a
+    // raw `LitDouble`, so there is no `Fractional` dictionary to name.
+    if (con === "DoublePrim" && cls === "Fractional") return undefined;
     const instance = this.instances.get(`${cls} ${con}`);
     if (!instance) {
       this.report(`no instance for \`${cls} ${con}\``, span);
@@ -733,8 +753,10 @@ class Elaborator {
       // dictionary parameter, and defaulting it would erase the polymorphism.
       if (binding.givens.some((g) => sameType(g.type, t))) continue;
       const classes = wanted.filter((other) => sameType(other.type, t)).map((other) => other.cls);
-      if (!classes.includes("Num")) continue;
-      unify(t, tInt);
+      // Haskell's `default (Integer, Double)`: a `Fractional` wanted rules
+      // `Int` out, so the same ambiguous variable defaults to `Double`.
+      if (classes.includes("Fractional")) unify(t, tcon("Double"));
+      else if (classes.includes("Num")) unify(t, tInt);
     }
   }
 
@@ -799,8 +821,9 @@ class Elaborator {
       return (target?.givens ?? []).map((g) => this.resolve(g.cls, g.type, binding.givens, span) ?? errorExpr(span));
     }
     if (use.kind === "literal" && headCon(use.type) === "IntPrim") return [];
+    if (use.kind === "literal" && headCon(use.type) === "DoublePrim") return [];
     const constraints =
-      use.kind === "literal" ? [{ cls: "Num", type: use.type }] : use.constraints;
+      use.kind === "literal" ? [{ cls: use.cls, type: use.type }] : use.constraints;
     return constraints.map((c) => this.resolve(c.cls, c.type, binding.givens, span) ?? errorExpr(span));
   }
 }
@@ -839,7 +862,10 @@ export function elaborateProgram(
 ): ElaborateResult {
   nextTVar = 0;
   const user = modules.get(root) ?? { name: root, imports: [], exports: [], reexports: [], declarations: [] };
-  const resolved = resolveProgram(modules, root);
+  // The compiler's own library modules join the program before resolution, so
+  // they are ordered, renamed and scoped exactly like any other module - and a
+  // project module of the same name shadows them.
+  const resolved = resolveProgram(withLibraryModules(modules), root);
   const elaborator = new Elaborator(file);
   const prelude = parseModule(PRELUDE_SOURCE, "GHCTS/Prelude.hs");
   if (!prelude.module || prelude.diagnostics.some((d) => d.severity === "error")) {
@@ -1220,7 +1246,42 @@ const PRIMITIVE_TYPES: Record<string, string> = {
   primIntGt: "IntPrim -> IntPrim -> Bool",
   primIntGe: "IntPrim -> IntPrim -> Bool",
   primChr: "IntPrim -> CharPrim",
+  primCharOrd: "CharPrim -> IntPrim",
   primCharEq: "CharPrim -> CharPrim -> Bool",
+  primCharLt: "CharPrim -> CharPrim -> Bool",
+  primDoubleAdd: "DoublePrim -> DoublePrim -> DoublePrim",
+  primDoubleSub: "DoublePrim -> DoublePrim -> DoublePrim",
+  primDoubleMul: "DoublePrim -> DoublePrim -> DoublePrim",
+  primDoubleDiv: "DoublePrim -> DoublePrim -> DoublePrim",
+  primDoubleNeg: "DoublePrim -> DoublePrim",
+  primDoubleAbs: "DoublePrim -> DoublePrim",
+  primDoubleEq: "DoublePrim -> DoublePrim -> Bool",
+  primDoubleLt: "DoublePrim -> DoublePrim -> Bool",
+  primDoubleLe: "DoublePrim -> DoublePrim -> Bool",
+  primDoubleGt: "DoublePrim -> DoublePrim -> Bool",
+  primDoubleGe: "DoublePrim -> DoublePrim -> Bool",
+  primDoubleSqrt: "DoublePrim -> DoublePrim",
+  primDoubleLog: "DoublePrim -> DoublePrim",
+  primDoubleExp: "DoublePrim -> DoublePrim",
+  primDoublePower: "DoublePrim -> DoublePrim -> DoublePrim",
+  primIntToDouble: "IntPrim -> DoublePrim",
+  primDoubleToInt: "DoublePrim -> IntPrim",
+  // `MutVarPrim`/`MVarPrim`/`VoidPrim` are opaque: nothing in Haskell may
+  // scrutinise them, which is exactly the unlifted primitive types they stand
+  // for. `VoidPrim` is the absent result of a primop that only has an effect;
+  // the `case` that names it is what sequences the effect, and its binder is
+  // never read.
+  primNewMutVar: "a -> MutVarPrim a",
+  primReadMutVar: "MutVarPrim a -> a",
+  primWriteMutVar: "MutVarPrim a -> a -> VoidPrim",
+  primNewMVar: "RealWorld -> MVarPrim a",
+  primTakeMVar: "MVarPrim a -> a",
+  primPutMVar: "MVarPrim a -> a -> VoidPrim",
+  primReadMVar: "MVarPrim a -> a",
+  primTryPutMVar: "MVarPrim a -> a -> Bool",
+  primIsEmptyMVar: "MVarPrim a -> Bool",
+  primFork: "a -> ThreadIdPrim",
+  primDelay: "IntPrim -> VoidPrim",
 };
 
 /** `class Eq a => Ord a where` keeps only its name and parameters in the
@@ -1471,6 +1532,10 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
         // is no dictionary, and the literal stands for the machine integer.
         if (!args) return e;
         return args.length ? applyAll(variable("fromInteger", e.span), [...args, e]) : e;
+      }
+      case "double": {
+        if (!args) return e;
+        return args.length ? applyAll(variable("fromRational", e.span), [...args, e]) : e;
       }
       case "app":
         return { ...e, fn: rewriteExpr(e.fn), arg: rewriteExpr(e.arg) };

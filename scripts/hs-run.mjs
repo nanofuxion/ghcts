@@ -33,6 +33,7 @@ import { coreToStg } from "../dist/core-to-stg.js";
 import { formatDiagnostic } from "../dist/diagnostics.js";
 
 const show = process.argv.includes("--print");
+const forceThreaded = process.argv.includes("--threaded");
 const config = defaultStgToJSConfig;
 const rts = renderRts(config) + "\n" + renderStaticRts(config);
 
@@ -59,6 +60,35 @@ function h$runEntry(c) {
   h$testResult = undefined;
   while (c !== null) c = c();
   return h$testResult;
+}
+/** A program that forks, blocks or delays needs the RTS's own scheduler, not
+ * the bare trampoline above: only a real h$Thread can be put on an MVar's
+ * wait queue and woken again. h$forkThread + h$mainLoop is exactly what
+ * h$main does, minus base's top handler and stdout flush - neither of which
+ * exists here. The thread constructor names ghc-internal's reportError
+ * closure, which a ghcts program does not link, so it is stubbed. */
+var h$ghczminternalZCGHCziInternalziConcziSynczireportError = null;
+/** h$forkThread starts a thread with h$ap_1_0, which applies its closure to
+ * one void argument - right for GHC's main, whose type is State# -> (# #),
+ * and wrong for this frontend's, which runMainIO has already reduced to a
+ * plain thunk. So the start frame here simply ENTERS the closure. */
+function h$enterFrame() {
+  h$r1 = h$stack[h$sp - 1];
+  h$sp -= 2;
+  return h$r1.f;
+}
+h$enterFrame.f = h$enterFrame;
+h$o(h$enterFrame, -1, 0, 0, 0, null);
+function h$runThreaded(c) {
+  var t = new h$Thread();
+  t.stack[4] = c;
+  t.stack[5] = h$enterFrame;
+  t.sp = 5;
+  h$wakeupThread(t);
+  h$mainLoop();
+  // The scheduler re-arms itself on a timer forever; without this the process
+  // never exits once every thread has finished.
+  h$clearScheduleMainLoop();
 }
 `;
 
@@ -101,11 +131,14 @@ function compile(sources, file) {
  * only way to observe an `IO ()`: its value carries nothing, so the proof that
  * it ran has to come from the effect it had. Property order in the object
  * literal is what sequences the two. */
-function run(emitted, symbol, probe) {
+function run(emitted, symbol, probe, threaded) {
+  const enter = threaded
+    ? `h$runThreaded(${symbol})`
+    : `h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; })`;
   // Indirect eval so the RTS's top-level `var h$...` land on globalThis.
   const entry = (0, eval)(
     `${rts}\n${bootstrap}\n${emitted}\n(function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
-      ` return { value: h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; }), probed: ${probe ?? "undefined"},` +
+      ` return { value: ${enter}, probed: ${probe ?? "undefined"},` +
       ` force: h$forceClosure }; })`,
   );
   const { value, probed, force } = entry();
@@ -620,6 +653,304 @@ const programs = [
     probe: "globalThis.$hsProbe",
     expect: 42,
   },
+  // Library modules (src/library.ts). Each of these is here because a wrong
+  // implementation would fail silently rather than fail to compile.
+  {
+    name: "IORef: write, modify and read back",
+    source: [
+      "module Main where",
+      "import Data.IORef",
+      "main :: IO Int",
+      "main = do",
+      "  r <- newIORef (10 :: Int)",
+      "  writeIORef r 32",
+      "  modifyIORef r (\\x -> x + 10)",
+      "  v <- readIORef r",
+      "  n <- atomicModifyIORef' r (\\x -> (x * 2, x + 1))",
+      "  w <- readIORef r",
+      "  pure (v + n + w)",
+      "",
+    ].join("\n"),
+    expect: 169,
+  },
+  {
+    // `newIORef` stores the closure it is given and `readIORef` hands it back
+    // untouched, exactly as `newMutVar#`/`readMutVar#` do. If either forced,
+    // this would raise instead of returning 42.
+    name: "IORef holds an unforced thunk",
+    source: [
+      "module Main where",
+      "import Data.IORef",
+      "main :: IO Int",
+      "main = do",
+      '  r <- newIORef (error "IORef forced its contents")',
+      "  writeIORef r (42 :: Int)",
+      "  readIORef r",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    name: "MVar: put then take, and isEmptyMVar either side",
+    source: [
+      "module Main where",
+      "import Control.Concurrent.MVar",
+      "main :: IO Int",
+      "main = do",
+      "  v <- newEmptyMVar",
+      "  before <- isEmptyMVar v",
+      "  putMVar v (40 :: Int)",
+      "  x <- takeMVar v",
+      "  after <- isEmptyMVar v",
+      "  pure (x + (if before then 1 else 0) + (if after then 1 else 0))",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // The point of the RTS primops. The forked thread reaches `takeMVar v`
+    // while `v` is empty and must BLOCK - a non-blocking read would hand it a
+    // hole and the recorded value would not be 42. The main thread then blocks
+    // in turn on `done` until the child has finished, so both directions of
+    // block-and-resume are exercised.
+    name: "MVar: a take on an empty MVar blocks, and a put resumes it",
+    threaded: true,
+    source: [
+      "module Main where",
+      "import Control.Concurrent",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsMVar = x; return x; })" record :: IntPrim -> IntPrim',
+      "recordStep :: RealWorld -> IntPrim -> IOResult Int",
+      "recordStep s n = case record n of",
+      "  v -> IOResult s (I v)",
+      "say :: Int -> IO Int",
+      "say (I n) = IO (\\s -> recordStep s n)",
+      "child :: MVar Int -> MVar () -> IO ()",
+      "child v done = do",
+      "  x <- takeMVar v",
+      "  say x",
+      "  putMVar done ()",
+      "main :: IO ()",
+      "main = do",
+      "  v <- newEmptyMVar",
+      "  done <- newEmptyMVar",
+      "  forkIO (child v done)",
+      "  putMVar v (42 :: Int)",
+      "  takeMVar done",
+      "  pure ()",
+      "",
+    ].join("\n"),
+    probe: "globalThis.$hsMVar",
+    expect: 42,
+  },
+  {
+    name: "Double: arithmetic and division",
+    source: "module Main where\nmain :: Double\nmain = (1.5 + 2.25) * 2.0 / 3.0\n",
+    expect: 2.5,
+  },
+  {
+    // GHC's `round` is round-half-to-EVEN. 2.5 and 3.5 both round to an even
+    // number, in opposite directions; half-up would give 3 and 4.
+    name: "Double: round is half-to-even, and floor/ceiling/truncate",
+    source: [
+      "module Main where",
+      "main :: Int",
+      "main = round (2.5 :: Double) * 1000",
+      "     + round (3.5 :: Double) * 100",
+      "     + floor (0 - 1.5 :: Double) * 10",
+      "     + ceiling (1.2 :: Double)",
+      "",
+    ].join("\n"),
+    expect: 2000 + 400 - 20 + 2,
+  },
+  {
+    name: "Double: realToFrac and fromIntegral cross Int and Double",
+    source: [
+      "module Main where",
+      "main :: Double",
+      "main = realToFrac (3 :: Int) + fromIntegral (4 :: Int) + realToFrac (0.5 :: Double)",
+      "",
+    ].join("\n"),
+    expect: 7.5,
+  },
+  {
+    // The ordering `Data.Map` guarantees is the reason it is a balanced search
+    // tree rather than a JS `Map`: the keys go in scrambled and come back
+    // ascending, and a delete and a re-insert do not disturb that.
+    name: "Data.Map: toList is ascending by key, through insert and delete",
+    source: [
+      "module Main where",
+      "import qualified Data.Map as M",
+      "main :: [Char]",
+      "main = show (M.toList (M.insert 1 10 (M.delete 3 (M.fromList [(3,30),(1,1),(2,20),(5,50),(4,40)])))",
+      "          == [(1,10),(2,20),(4,40),(5,50)])",
+      "",
+    ].join("\n"),
+    expect: "True",
+  },
+  {
+    name: "Data.Map: lookup, size, elems, keys and findWithDefault",
+    source: [
+      "module Main where",
+      "import qualified Data.Map as M",
+      "main :: [Char]",
+      "main = show (M.lookup 2 m == Just 20)",
+      "    ++ show (M.lookup 9 m == Nothing)",
+      "    ++ show (M.size m == 3)",
+      "    ++ show (M.elems m == [1,20,30])",
+      "    ++ show (M.keys m == [1,2,3])",
+      "    ++ show (M.findWithDefault 0 9 m == 0)",
+      "    ++ show (M.toDescList m == [(3,30),(2,20),(1,1)])",
+      "m = M.fromList [(3,30),(1,1),(2,20)]",
+      "",
+    ].join("\n"),
+    expect: "TrueTrueTrueTrueTrueTrueTrue",
+  },
+  {
+    // A tree that is not rebalanced degenerates into a list on sorted input:
+    // 64 ascending inserts would then be 64 deep. This bound passes for a
+    // balanced tree and fails for a list.
+    name: "Data.Map: sorted inserts stay balanced",
+    source: [
+      "module Main where",
+      "import qualified Data.Map as M",
+      "depth :: M.Map Int Int -> Int",
+      "depth M.Tip = 0",
+      "depth (M.Bin _ _ _ l r) = 1 + max (depth l) (depth r)",
+      "main :: Int",
+      "main = depth (M.fromList (map (\\k -> (k, k)) (enumTo 64)))",
+      "enumTo :: Int -> [Int]",
+      "enumTo n = if n <= 0 then [] else enumTo (n - 1) ++ [n]",
+      "",
+    ].join("\n"),
+    // 64 keys in a perfectly balanced tree are 7 levels deep; an unbalanced
+    // one would be 64.
+    expect: 7,
+  },
+  {
+    name: "Data.Set and Data.IntMap ride on the same tree",
+    source: [
+      "module Main where",
+      "import qualified Data.Set as S",
+      "import qualified Data.IntMap.Strict as IM",
+      "main :: [Char]",
+      "main = show (S.toList (S.insert 0 (S.fromList [3,1,2,1])) == [0,1,2,3])",
+      "    ++ show (S.member 2 (S.fromList [1,2]))",
+      "    ++ show (IM.lookup 2 (IM.fromList [(1,10),(2,20)]) == Just 20)",
+      "    ++ show (IM.elems (IM.insertWith (+) 1 5 (IM.fromList [(1,10)])) == [15])",
+      "",
+    ].join("\n"),
+    expect: "TrueTrueTrueTrue",
+  },
+  {
+    // A MisoString is a JavaScript string: `==`, `<>` and `intercalate` are
+    // the JavaScript operations, not a fold over [Char].
+    name: "Data.JSString: pack/unpack round trip and the FFI-backed operations",
+    source: [
+      "module Main where",
+      "import qualified Data.JSString as J",
+      "main :: [Char]",
+      'main = J.unpack (J.intercalate (J.pack ", ") [J.pack "ab", J.toUpper (J.pack "cd"), J.replicate 2 (J.pack "x")])',
+      '    ++ show (J.pack "ab" == J.pack "ab")',
+      '    ++ show (J.pack "ab" < J.pack "b")',
+      '    ++ J.unpack (J.pack "hi" <> J.pack "!")',
+      '    ++ concatMap J.unpack (J.splitOn (J.pack ",") (J.pack "a,b,c"))',
+      '    ++ show (J.length (J.pack "abc") == 3)',
+      "",
+    ].join("\n"),
+    expect: "ab, CD, xxTrueTruehi!abcTrue",
+  },
+  {
+    // A Char is a code point, so an astral character must survive as ONE Char
+    // even though JavaScript stores it as two UTF-16 code units.
+    name: "Data.JSString: unpack yields code points, not UTF-16 units",
+    source: [
+      "module Main where",
+      "import qualified Data.JSString as J",
+      "main :: [Char]",
+      'main = show (length (J.unpack (J.pack "a\\120163b")) == 3)',
+      '    ++ show (J.unpack (J.pack (J.unpack (J.pack "a\\120163b"))) == "a\\120163b")',
+      "",
+    ].join("\n"),
+    expect: "TrueTrue",
+  },
+  {
+    name: "Data.Char classification and Data.List sort/foldl'",
+    source: [
+      "module Main where",
+      "import qualified Data.Char as C",
+      "import qualified Data.List as L",
+      "main :: [Char]",
+      "main = show (C.isUpper (chr 65) && C.isLower (chr 97) && C.isSpace (chr 32))",
+      "    ++ show (C.toLower (chr 81) == chr 113 && C.digitToInt (chr 55) == 7)",
+      "    ++ show (L.sort [3,1,2] == [1,2,3] && L.sortOn negate [1,3,2] == [3,2,1])",
+      "    ++ show (L.foldl' (+) 0 [1,2,3] == 6 && L.nub [1,2,1] == [1,2])",
+      "",
+    ].join("\n"),
+    expect: "TrueTrueTrueTrue",
+  },
+  {
+    name: "list comprehensions, including a refutable generator",
+    source: [
+      "module Main where",
+      "main :: [Char]",
+      'main = [ c | (n, c) <- zip [1,2,3,4,5] "abcde", n > 2, Just d <- [Just c] ]',
+      "",
+    ].join("\n"),
+    expect: "cde",
+  },
+  {
+    // A callback is a JavaScript function that starts a Haskell thread. The
+    // proof is that JavaScript calls it with a value and the Haskell action
+    // runs with that value: `c(77)` in, 77 out.
+    name: "asyncCallback1: JavaScript calls in and the Haskell action runs",
+    threaded: true,
+    source: [
+      "module Main where",
+      "import GHC.JS.Prim",
+      "import GHC.JS.Foreign.Callback",
+      'foreign import javascript unsafe "((x) => { globalThis.$hsCb = x; return 0; })" record :: JSValPrim -> IntPrim',
+      'foreign import javascript unsafe "((c) => { c(77); return 0; })" invoke :: CallbackPrim -> IntPrim',
+      "recordIO :: JSVal -> IO ()",
+      "recordIO (JSVal x) = IO (\\s -> recordStep s x)",
+      "recordStep :: RealWorld -> JSValPrim -> IOResult ()",
+      "recordStep s x = case record x of",
+      "  _ -> IOResult s ()",
+      "fire :: Callback a -> IO ()",
+      "fire (Callback c) = IO (\\s -> fireStep s c)",
+      "fireStep :: RealWorld -> CallbackPrim -> IOResult ()",
+      "fireStep s c = case invoke c of",
+      "  _ -> IOResult s ()",
+      "main :: IO ()",
+      "main = do",
+      "  cb <- asyncCallback1 recordIO",
+      "  fire cb",
+      "  pure ()",
+      "",
+    ].join("\n"),
+    probe: "globalThis.$hsCb",
+    expect: 77,
+  },
+  {
+    // `Ord` is defined by mutual defaults - `compare` from `(<=)` and `(<=)`
+    // from `compare` - so an instance that supplies neither loops forever
+    // rather than failing to compile. These are the ones that supply one.
+    name: "Ord on lists, strings and Maybe is lexicographic",
+    source: [
+      "module Main where",
+      "main :: [Char]",
+      'main = show (compare [1,2] [1,3] == LT && compare "ab" "a" == GT',
+      '          && compare "a" "b" == LT && Just 1 < Just 2 && max "a" "b" == "b" && () == ())',
+      "",
+    ].join("\n"),
+    expect: "True",
+  },
+  {
+    // `seq` here is a `case` on an application, which is the only shape this
+    // frontend evaluates. If it did not evaluate, this would return 1.
+    name: "seq forces its first argument",
+    source: 'module Main where\nmain :: Int\nmain = seq (error "forced") 1\n',
+    throws: "Prelude.error",
+  },
   {
     // An action built but never run must have no effect: that is the whole
     // point of representing `IO` as a function rather than as a value.
@@ -677,7 +1008,7 @@ for (const program of cases) {
   for (const d of compiled.diagnostics) console.log(`        ${formatDiagnostic(d)}`);
   if (show) console.log(`--- ${program.name} (${compiled.symbol}) ---\n${compiled.emitted}\n`);
   try {
-    const result = run(compiled.emitted, compiled.symbol, program.probe);
+    const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded);
     if (program.throws !== undefined) {
       console.log(`  FAIL  ${program.name}: expected a \`${program.throws}\` exception, got ${JSON.stringify(result)}`);
       failures++;

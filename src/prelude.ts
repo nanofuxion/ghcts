@@ -39,6 +39,14 @@ export const PRELUDE_SOURCE = `module GHCTS.Prelude where
 data Bool = False | True
 data Int = I IntPrim
 data Char = C CharPrim
+-- \`Double\` is a one-field box for the same reason \`Int\` is \`I IntPrim\`:
+-- the backend unboxes a one-constructor, one-Number-field type (Double is in
+-- \`unboxableTyCons\`), so a \`DoubleBox 2.5\` IS the JS number 2.5, exactly as
+-- GHC's \`D# 2.5##\` is. The name is deliberately not \`D\`: data constructors
+-- live in one global namespace here, so a Prelude constructor takes its name
+-- away from every program that declares one, and \`data C = A | B | D\` is a
+-- thing people write.
+data Double = DoubleBox DoublePrim
 data Ordering = LT | EQ | GT
 data Maybe a = Nothing | Just a
 data Either a b = Left a | Right b
@@ -76,6 +84,23 @@ class Num a where
   (*) :: a -> a -> a
   negate :: a -> a
   fromInteger :: IntPrim -> a
+
+class Num a => Fractional a where
+  (/) :: a -> a -> a
+  fromRational :: DoublePrim -> a
+
+-- The one method each of \`Real\`/\`RealFrac\`/\`Integral\` this frontend needs.
+-- GHC routes \`realToFrac\` through \`Rational\`; there is no \`Integer\` and no
+-- \`Ratio\` here, and \`DoublePrim\` is the widest exact type, so it stands in for
+-- the intermediate. Every conversion this admits is one GHC would agree with.
+class Num a => Real a where
+  toDoublePrim :: a -> DoublePrim
+
+class Fractional a => RealFrac a where
+  fracToDoublePrim :: a -> DoublePrim
+
+class Num a => Integral a where
+  toIntPrim :: a -> IntPrim
 
 class Show a where
   show :: a -> [Char]
@@ -176,6 +201,38 @@ instance Num Int where
 instance Show Int where
   show n = showInt n
 
+instance Real Int where
+  toDoublePrim (I n) = primIntToDouble n
+
+instance Integral Int where
+  toIntPrim (I n) = n
+
+instance Eq Double where
+  (==) (DoubleBox a) (DoubleBox b) = primDoubleEq a b
+
+instance Ord Double where
+  (<) (DoubleBox a) (DoubleBox b) = primDoubleLt a b
+  (<=) (DoubleBox a) (DoubleBox b) = primDoubleLe a b
+  (>) (DoubleBox a) (DoubleBox b) = primDoubleGt a b
+  (>=) (DoubleBox a) (DoubleBox b) = primDoubleGe a b
+
+instance Num Double where
+  (+) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleAdd a b)
+  (-) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleSub a b)
+  (*) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleMul a b)
+  negate (DoubleBox a) = DoubleBox (primDoubleNeg a)
+  fromInteger n = DoubleBox (primIntToDouble n)
+
+instance Fractional Double where
+  (/) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleDiv a b)
+  fromRational d = DoubleBox d
+
+instance Real Double where
+  toDoublePrim (DoubleBox d) = d
+
+instance RealFrac Double where
+  fracToDoublePrim (DoubleBox d) = d
+
 instance Enum Int where
   toEnum n = n
   fromEnum n = n
@@ -198,8 +255,17 @@ instance Show Ordering where
 instance Eq a => Eq [a] where
   (==) xs ys = eqList (==) xs ys
 
+instance Ord a => Ord [a] where
+  compare xs ys = compareList compare xs ys
+
 instance Eq a => Eq (Maybe a) where
   (==) a b = eqMaybe (==) a b
+
+instance Ord a => Ord (Maybe a) where
+  compare a b = compareMaybe compare a b
+
+instance Eq () where
+  (==) a b = True
 
 instance (Eq a, Eq b) => Eq (Either a b) where
   (==) a b = eqEither (==) (==) a b
@@ -340,7 +406,16 @@ runMainIO m = unsafePerformIO m
 
 -- ------------------------------------------------------------- functions ---
 
-foreign import javascript unsafe "((s) => { throw new Error('Prelude.error'); })" error :: [Char] -> a
+-- The wrapper is not ceremony. A *saturated* foreign call is inlined as a
+-- primitive operation (see \`foreignOps\` in src/desugar.ts), and a primitive
+-- operation in an argument position is evaluated there rather than thunked -
+-- so \`f (errorPrim s)\` would raise before \`f\` ever ran. As an ordinary
+-- Haskell function, \`error s\` is a thunk in a lazy position, exactly as GHC's
+-- is, and only raises when something forces it.
+foreign import javascript unsafe "((s) => { throw new Error('Prelude.error'); })" errorPrim :: [Char] -> a
+
+error :: [Char] -> a
+error s = errorPrim s
 
 undefined :: a
 undefined = error "Prelude.undefined"
@@ -374,6 +449,20 @@ uncurry f p = case p of
 
 ($) :: (a -> b) -> a -> b
 ($) f x = f x
+
+-- \`case\` on a *var* is irrefutable and compiles to nothing, so the scrutinee
+-- here is an application: that is what makes the desugarer emit a real \`Case\`,
+-- and a real \`Case\` is what evaluates its scrutinee to WHNF. This is \`seq\`.
+forceValue :: a -> a
+forceValue x = x
+
+seq :: a -> b -> b
+seq x y = case forceValue x of
+  z -> y
+
+($!) :: (a -> b) -> a -> b
+($!) f x = case forceValue x of
+  y -> f y
 
 (&) :: a -> (a -> b) -> b
 (&) x f = f x
@@ -425,6 +514,92 @@ digitsOf n acc = if primIntLt n 10 then digitChar n : acc else digitsOf (primInt
 
 digitChar :: IntPrim -> Char
 digitChar n = C (primChr (primIntAdd n 48))
+
+-- ---------------------------------------------------------------- numeric ---
+
+-- The \`case\` is load-bearing, not style: it is what makes the machine result
+-- of a call an evaluated machine value before it becomes an argument. Written
+-- as \`fromInteger (toIntPrim x)\` the argument would be let-bound as a *thunk*,
+-- and \`I <thunk>\` is not an unboxed \`Int\`.
+fromIntegral :: (Integral a, Num b) => a -> b
+fromIntegral x = case toIntPrim x of
+  n -> fromInteger n
+
+realToFrac :: (Real a, Fractional b) => a -> b
+realToFrac x = case toDoublePrim x of
+  d -> fromRational d
+
+-- GHC's \`round\` is round-half-to-EVEN, not round-half-up; getting that wrong
+-- would be a silent one-pixel error rather than a crash, so it is spelled out.
+round :: (RealFrac a, Num b) => a -> b
+round x = case fracToDoublePrim x of
+  d -> case roundPrim d of
+    n -> fromInteger n
+
+roundPrim :: DoublePrim -> IntPrim
+roundPrim d = roundHalf (primDoubleToInt d) (primDoubleSub d (primIntToDouble (primDoubleToInt d)))
+
+-- \`n\` is \`d\` truncated towards zero and \`r\` is the signed remainder, so
+-- |r| < 1 and the only decisions left are the two halfway cases.
+roundHalf :: IntPrim -> DoublePrim -> IntPrim
+roundHalf n r = if primDoubleLt r (primDoubleNeg 0.5) then primIntSub n 1 else roundHalfUp n r
+
+roundHalfUp :: IntPrim -> DoublePrim -> IntPrim
+roundHalfUp n r = if primDoubleGt r 0.5 then primIntAdd n 1 else roundHalfTie n r
+
+roundHalfTie :: IntPrim -> DoublePrim -> IntPrim
+roundHalfTie n r = if primDoubleEq r 0.5 then evenOr n (primIntAdd n 1) else roundHalfTieDown n r
+
+roundHalfTieDown :: IntPrim -> DoublePrim -> IntPrim
+roundHalfTieDown n r = if primDoubleEq r (primDoubleNeg 0.5) then evenOr n (primIntSub n 1) else n
+
+evenOr :: IntPrim -> IntPrim -> IntPrim
+evenOr n alternative = if primIntEq (primIntRem n 2) 0 then n else alternative
+
+truncate :: (RealFrac a, Num b) => a -> b
+truncate x = case fracToDoublePrim x of
+  d -> case primDoubleToInt d of
+    n -> fromInteger n
+
+floor :: (RealFrac a, Num b) => a -> b
+floor x = case fracToDoublePrim x of
+  d -> case floorPrim d of
+    n -> fromInteger n
+
+floorPrim :: DoublePrim -> IntPrim
+floorPrim d = if primDoubleLt (primIntToDouble (primDoubleToInt d)) d then primDoubleToInt d else adjustFloor (primDoubleToInt d) d
+
+adjustFloor :: IntPrim -> DoublePrim -> IntPrim
+adjustFloor n d = if primDoubleEq (primIntToDouble n) d then n else primIntSub n 1
+
+ceiling :: (RealFrac a, Num b) => a -> b
+ceiling x = case fracToDoublePrim x of
+  d -> case ceilingPrim d of
+    n -> fromInteger n
+
+ceilingPrim :: DoublePrim -> IntPrim
+ceilingPrim d = primIntNeg (floorPrim (primDoubleNeg d))
+
+sqrt :: Double -> Double
+sqrt (DoubleBox d) = DoubleBox (primDoubleSqrt d)
+
+abs :: Double -> Double
+abs (DoubleBox d) = DoubleBox (primDoubleAbs d)
+
+compareChar :: Char -> Char -> Ordering
+compareChar (C a) (C b) = if primCharEq a b then EQ else (if primCharLt a b then LT else GT)
+
+ord :: Char -> Int
+ord (C c) = I (primCharOrd c)
+
+chr :: Int -> Char
+chr (I n) = C (primChr n)
+
+-- \`compare\`, not just \`(<)\`: the class defaults define \`compare\` from
+-- \`(<=)\` and \`(<=)\` from \`compare\`, so an instance that gives neither is an
+-- infinite loop rather than a missing method.
+instance Ord Char where
+  compare a b = compareChar a b
 
 -- ------------------------------------------------------- Maybe and Either --
 
@@ -511,6 +686,24 @@ eqEither f g p q = case p of
   Right y -> case q of
     Left u -> False
     Right v -> g y v
+
+-- Lexicographic, as GHC's is: the first difference decides, and a prefix is
+-- less than what it is a prefix of.
+compareList :: (a -> a -> Ordering) -> [a] -> [a] -> Ordering
+compareList cmp xs ys = case xs of
+  [] -> if nullList ys then EQ else LT
+  (a : as) -> case ys of
+    [] -> GT
+    (b : bs) -> if eqOrdering (cmp a b) EQ then compareList cmp as bs else cmp a b
+
+compareMaybe :: (a -> a -> Ordering) -> Maybe a -> Maybe a -> Ordering
+compareMaybe cmp p q = case p of
+  Nothing -> case q of
+    Nothing -> EQ
+    Just y -> LT
+  Just x -> case q of
+    Nothing -> GT
+    Just y -> cmp x y
 
 eqPair :: (a -> a -> Bool) -> (b -> b -> Bool) -> (a, b) -> (a, b) -> Bool
 eqPair f g p q = case p of

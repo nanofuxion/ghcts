@@ -49,7 +49,7 @@ const int = (value: number): Literal => ({ tag: "LitNumInt", value: BigInt(Math.
  * is wrapped into a real `Bool` constructor. Only ops the JS backend
  * implements appear here (see src/stg-js/prim.ts). */
 interface Prim {
-  op: string;
+  op: string | StgOp;
   arity: number;
   bool?: true;
 }
@@ -68,7 +68,49 @@ const primOps: Record<string, Prim> = {
   primIntGt: { op: "IntGtOp", arity: 2, bool: true },
   primIntGe: { op: "IntGeOp", arity: 2, bool: true },
   primChr: { op: "ChrOp", arity: 1 },
+  primCharOrd: { op: "OrdOp", arity: 1 },
   primCharEq: { op: "CharEqOp", arity: 2, bool: true },
+  primCharLt: { op: "CharLtOp", arity: 2, bool: true },
+  primDoubleAdd: { op: "DoubleAddOp", arity: 2 },
+  primDoubleSub: { op: "DoubleSubOp", arity: 2 },
+  primDoubleMul: { op: "DoubleMulOp", arity: 2 },
+  primDoubleDiv: { op: "DoubleDivOp", arity: 2 },
+  primDoubleNeg: { op: "DoubleNegOp", arity: 1 },
+  primDoubleAbs: { op: "DoubleFabsOp", arity: 1 },
+  primDoubleEq: { op: "DoubleEqOp", arity: 2, bool: true },
+  primDoubleLt: { op: "DoubleLtOp", arity: 2, bool: true },
+  primDoubleLe: { op: "DoubleLeOp", arity: 2, bool: true },
+  primDoubleGt: { op: "DoubleGtOp", arity: 2, bool: true },
+  primDoubleGe: { op: "DoubleGeOp", arity: 2, bool: true },
+  primDoubleSqrt: { op: "DoubleSqrtOp", arity: 1 },
+  primDoubleLog: { op: "DoubleLogOp", arity: 1 },
+  primDoubleExp: { op: "DoubleExpOp", arity: 1 },
+  primDoublePower: { op: "DoublePowerOp", arity: 2 },
+  primIntToDouble: { op: "IntToDoubleOp", arity: 1 },
+  // Truncates towards zero, as GHC's `double2Int#` does.
+  primDoubleToInt: { op: "DoubleToIntOp", arity: 1 },
+  // `IORef` is GHC's `MutVar#`: a one-field JS object whose read and write are
+  // a property read and a property write (rts/js/mem.js). Writing this in
+  // Haskell instead would be a slower cell with identical semantics.
+  primNewMutVar: { op: "NewMutVarOp", arity: 1 },
+  primReadMutVar: { op: "ReadMutVarOp", arity: 1 },
+  primWriteMutVar: { op: "WriteMutVarOp", arity: 2 },
+  // `MVar` is NOT a cell: `takeMVar` on an empty one blocks the *thread*, and
+  // only the RTS can do that (rts/js/thread.js). These map onto the same
+  // primops GHC's `Control.Concurrent.MVar` uses, so a take that must block
+  // does block instead of silently reading a hole.
+  //
+  // `NewMVarOp` ignores its argument slot; the argument is the state token, and
+  // it is there only so the call is not a CAF - a nullary primop would be one
+  // top-level `MVar` shared by every `newEmptyMVar` in the program.
+  primNewMVar: { op: "NewMVarOp", arity: 1 },
+  primTakeMVar: { op: "TakeMVarOp", arity: 1 },
+  primPutMVar: { op: "PutMVarOp", arity: 2 },
+  primReadMVar: { op: "ReadMVarOp", arity: 1 },
+  primTryPutMVar: { op: "TryPutMVarOp", arity: 2, bool: true },
+  primIsEmptyMVar: { op: "IsEmptyMVarOp", arity: 1, bool: true },
+  primFork: { op: "ForkOp", arity: 1 },
+  primDelay: { op: "DelayOp", arity: 1 },
 };
 
 /** What a name resolves to. Locals shadow top levels, which shadow
@@ -86,6 +128,16 @@ class Desugarer {
   /** Names introduced by a `class` declaration, so a use of one can say
    * "dictionary elaboration" instead of "not in scope". */
   readonly classMethods = new Set<string>();
+  /** Foreign imports, by name, so a *saturated* call becomes the foreign call
+   * itself rather than a call to the wrapper closure.
+   *
+   * This is not an optimisation. A `foreign import javascript unsafe` consumes
+   * machine values, and the wrapper is an ordinary Haskell function whose
+   * arguments are therefore thunks: `len (hello 0)` handed the JS function a
+   * thunk object instead of the string. Inlining the call puts the argument in
+   * a primop's strict position, where `src/core-to-stg.ts` binds it with a
+   * `case` - which is exactly what GHC does by inlining the same wrapper. */
+  readonly foreignOps = new Map<string, Prim>();
 
   constructor(private readonly file: string) {}
 
@@ -115,6 +167,8 @@ class Desugarer {
     switch (e.tag) {
       case "int":
         return { tag: "Lit", lit: int(e.value) };
+      case "double":
+        return { tag: "Lit", lit: { tag: "LitDouble", value: e.value } };
       case "string":
         // A `String` is `[Char]`, so a literal is the list it denotes. The
         // backend's `LitString` is an address, which is a different type.
@@ -210,7 +264,7 @@ class Desugarer {
   }
 
   saturateOp(prim: Prim, args: CoreExpr[]): CoreExpr {
-    const op: StgOp = { tag: "StgPrimOp", op: prim.op };
+    const op: StgOp = typeof prim.op === "string" ? { tag: "StgPrimOp", op: prim.op } : prim.op;
     const call = (as: CoreExpr[]): CoreExpr => {
       const raw: CoreExpr = { tag: "Op", op, arity: prim.arity, args: as };
       // GHC's `tagToEnum#`: the machine comparison yields 0 or 1, and the
@@ -251,6 +305,13 @@ class Desugarer {
       const shortCut = this.overloadedLit(head.name, lowered);
       if (shortCut) return shortCut;
     }
+    if (head.tag === "var") {
+      // A foreign import IS in scope (it is a top-level binding), so this test
+      // is that the name still means that binding and has not been shadowed.
+      const foreign = this.foreignOps.get(head.name);
+      if (foreign && scope.get(head.name) === this.top.get(head.name) && lowered.length >= foreign.arity)
+        return this.saturateOp(foreign, lowered);
+    }
     if (head.tag === "var" && !scope.has(head.name)) {
       const con = this.cons.get(head.name);
       if (con) return this.saturateCon(con, lowered);
@@ -271,13 +332,20 @@ class Desugarer {
    * `Int` instance the way GHC's `intDataCon` names its constructor, so the
    * type is recoverable here without a type checker. */
   overloadedLit(head: string, args: CoreExpr[]): CoreExpr | undefined {
-    if (head !== "fromInteger" || args.length !== 2) return undefined;
+    if (args.length !== 2) return undefined;
     const [dict, lit] = args;
+    if (dict.tag !== "Var") return undefined;
     // Binder identity, not just the name: only the module's own `$fNumInt`
     // pins the type down to `Int`.
-    if (dict.tag !== "Var" || dict.binder !== this.top.get("$fNumInt")) return undefined;
-    if (lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return undefined;
-    return { tag: "Con", con: this.lookupCon("I", 1), args: [lit] };
+    if (head === "fromInteger" && dict.binder === this.top.get("$fNumInt")) {
+      if (lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return undefined;
+      return { tag: "Con", con: this.lookupCon("I", 1), args: [lit] };
+    }
+    if (head === "fromRational" && dict.binder === this.top.get("$fFractionalDouble")) {
+      if (lit.tag !== "Lit" || lit.lit.tag !== "LitDouble") return undefined;
+      return { tag: "Con", con: this.lookupCon("DoubleBox", 1), args: [lit] };
+    }
+    return undefined;
   }
 
   /** `case` and `\case` alternatives; guards inside an alternative fall
@@ -562,12 +630,14 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
   for (const decl of foreigns) {
     // A foreign import is a saturated foreign call under enough lambdas to
     // consume its declared arguments; `arity` comes from the signature's
-    // top-level arrows.
+    // top-level arrows. The wrapper is still emitted for an unsaturated use;
+    // a saturated call goes straight to the foreign call (see `foreignOps`).
     const params = Array.from({ length: decl.arity }, (_, i) => mkBinder(`ffi${i}`));
     const op: StgOp = {
       tag: "StgFCallOp",
       target: { javascript: decl.javascript, safety: "unsafe" },
     };
+    d.foreignOps.set(decl.name, { op, arity: decl.arity });
     binds.push({
       tag: "NonRec",
       binder: d.top.get(decl.name)!,
