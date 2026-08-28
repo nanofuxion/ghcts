@@ -1541,11 +1541,24 @@ function newtypeMethod(
     return inner.length > 0 && !inner.some(mentions) && coercible(innerResult) ? "under" : "bad";
   });
   if (how.includes("bad")) return undefined;
+  /** `Parser a`, `Either String a`: the class variable is the *last argument*
+   * of the result, and nothing else in it mentions the variable. GHC coerces
+   * straight through such a result for free; here the newtype is a real
+   * one-field constructor, so the only way through is `fmap`, which costs a
+   * `Functor` constraint GHC does not need and an allocation GHC does not
+   * make. For a lawful `Functor` it is the same value, and the alternative is
+   * no instance at all - `newtype KeyCode = KeyCode Int deriving FromJSON`
+   * needs exactly this. Where the `Functor` instance is missing, the ordinary
+   * missing-instance diagnostic says so, which is no worse than refusing. */
+  const underFunctor = ((): boolean => {
+    const p = prune(result);
+    return p.tag === "app" && !mentions(p.fn) && coercible(p.arg);
+  })();
   const wrapResult = coercible(result);
-  if (!wrapResult && mentions(result)) return undefined;
+  if (!wrapResult && !underFunctor && mentions(result)) return undefined;
   // Nothing to move: the class variable is not in this method's type at all,
   // so there is no way to say which instance the inner call should use.
-  if (!how.some((h) => h !== "no") && !wrapResult) return undefined;
+  if (!how.some((h) => h !== "no") && !wrapResult && !underFunctor) return undefined;
   const inner = applyAll(
     variable(method.name, span),
     names.map((name, i): Expr => {
@@ -1567,10 +1580,12 @@ function newtypeMethod(
       };
     }),
   );
-  return valueDecl(
-    method.name,
-    names.map((name): Pattern => ({ tag: "var", name, span })),
-    wrapResult
+  // No ascription is needed in the `fmap` case: the constructor's own field
+  // type is what fixes the inner call's instance, so `fmap KeyCode (parseJSON
+  // v)` already reads `parseJSON` at `Int`.
+  const body = underFunctor
+    ? applyAll(variable("fmap", span), [variable(con, span), inner])
+    : wrapResult
       ? apply(
           variable(con, span),
           // With no argument at the wrapped type, only the ascription says
@@ -1578,9 +1593,8 @@ function newtypeMethod(
           // very instance and loops.
           how.some((h) => h !== "no") ? inner : { tag: "annot", expr: inner, type: wrapped, span },
         )
-      : inner,
-    span,
-  );
+      : inner;
+  return valueDecl(method.name, names.map((name): Pattern => ({ tag: "var", name, span })), body, span);
 }
 
 const valueDecl = (name: string, patterns: Pattern[], body: Expr, span: Span = NOWHERE): ValueDeclaration => ({

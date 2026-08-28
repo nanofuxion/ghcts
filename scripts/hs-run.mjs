@@ -2972,6 +2972,30 @@ const programs = [
     ].join("\n"),
     expect: 10,
   },
+  {
+    // GeneralizedNewtypeDeriving where the class variable is the *last
+    // argument of the result*: `Either [Char] a`, miso's `Parser a`. GHC
+    // coerces through it for free; a real one-field constructor has to `fmap`,
+    // and the constructor's own field type is what reads the inner call at the
+    // wrapped type without any ascription.
+    name: "deriving newtype through a functor-shaped result",
+    source: [
+      "module Main where",
+      "",
+      "class Parse a where parseIt :: [Char] -> Either [Char] a",
+      "instance Parse Int where parseIt s = Right (length s)",
+      "",
+      "newtype Code = Code Int deriving Parse",
+      "",
+      "unCode :: Code -> Int",
+      "unCode (Code n) = n",
+      "",
+      "main :: IO Int",
+      "main = pure (either (\\_ -> 0) unCode (parseIt \"abcd\"))",
+      "",
+    ].join("\n"),
+    expect: 4,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
