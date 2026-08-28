@@ -1659,10 +1659,22 @@ class Parser {
   private floatStaticForm(body: Expr, span: Span): Expr {
     const name = `$static${this.staticForms.length}`;
     const [k1, k2, k3, k4] = staticPtrFingerprint("main", this.moduleName, this.staticForms.length);
-    const key: Expr = [k1, k2, k3, k4].reduce<Expr>(
-      (fn, value) => ({ tag: "app", fn, arg: { tag: "int", value, span }, span }),
-      { tag: "var", name: "StaticKey", span },
-    );
+    // `Fingerprint` is two `Word64` halves and `word64FromHalves` takes the
+    // two 32-bit words `md5` produced for each, so the four numbers reach the
+    // key in the same order and mean the same bits they always did. They are
+    // `IntPrim` arguments, so the literals stay raw machine integers rather
+    // than being boxed and re-read.
+    const half = (hi: number, lo: number): Expr =>
+      [hi, lo].reduce<Expr>(
+        (fn, value) => ({ tag: "app", fn, arg: { tag: "int", value, span }, span }),
+        { tag: "var", name: "word64FromHalves", span },
+      );
+    const key: Expr = {
+      tag: "app",
+      fn: { tag: "app", fn: { tag: "var", name: "Fingerprint", span }, arg: half(k1, k2), span },
+      arg: half(k3, k4),
+      span,
+    };
     const ptr: Expr = {
       tag: "app",
       fn: { tag: "app", fn: { tag: "var", name: "StaticPtr", span }, arg: key, span },

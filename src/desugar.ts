@@ -389,10 +389,11 @@ class Desugarer {
   }
 
   application(head: Expr, args: Expr[], scope: Scope): CoreExpr {
-    const lowered = args.map((arg) => this.expr(arg, scope));
+    let lowered = args.map((arg) => this.expr(arg, scope));
     if (head.tag === "var") {
       const shortCut = this.overloadedLit(head.name, lowered);
       if (shortCut) return shortCut;
+      lowered = this.boxIntegerLit(head.name, lowered);
     }
     if (head.tag === "var") {
       // A foreign import IS in scope (it is a top-level binding), so this test
@@ -419,22 +420,46 @@ class Desugarer {
    *
    * Elaboration has already picked the dictionary, and `$fNumInt` names the
    * `Int` instance the way GHC's `intDataCon` names its constructor, so the
-   * type is recoverable here without a type checker. */
+   * type is recoverable here without a type checker.
+   *
+   * When the short-cut does NOT fire the call is still rewritten, because
+   * `fromInteger :: Integer -> a` and the elaborator hands over the machine
+   * literal untouched (src/elaborate.ts `rewriteBinding`). `integerFromIntPrim`
+   * is what turns it into the `Integer` the instance destructures - the same
+   * boxing GHC's `mkIntegerExpr` does for the literals `shortCutLit` declines.
+   *
+   * The literal itself is a JS number, so a source literal above 2^53 has
+   * already lost bits in the lexer; every value below that reaches `Integer`
+   * exactly. */
   overloadedLit(head: string, args: CoreExpr[]): CoreExpr | undefined {
     if (args.length !== 2) return undefined;
     const [dict, lit] = args;
     if (dict.tag !== "Var") return undefined;
+    if (head === "fromRational" && dict.binder === this.top.get("$fFractionalDouble")) {
+      if (lit.tag !== "Lit" || lit.lit.tag !== "LitDouble") return undefined;
+      return { tag: "Con", con: this.lookupCon("DoubleBox", 1), args: [lit] };
+    }
     // Binder identity, not just the name: only the module's own `$fNumInt`
     // pins the type down to `Int`.
     if (head === "fromInteger" && dict.binder === this.top.get("$fNumInt")) {
       if (lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return undefined;
       return { tag: "Con", con: this.lookupCon("I", 1), args: [lit] };
     }
-    if (head === "fromRational" && dict.binder === this.top.get("$fFractionalDouble")) {
-      if (lit.tag !== "Lit" || lit.lit.tag !== "LitDouble") return undefined;
-      return { tag: "Con", con: this.lookupCon("DoubleBox", 1), args: [lit] };
-    }
     return undefined;
+  }
+
+  /** The other half of `overloadedLit`: a `fromInteger` the short-cut declined
+   * still has a machine literal where its `Integer` argument belongs, so the
+   * literal is boxed here. Everything else about the call is left alone. */
+  boxIntegerLit(head: string, args: CoreExpr[]): CoreExpr[] {
+    if (head !== "fromInteger" || args.length !== 2) return args;
+    const lit = args[1]!;
+    // A dictionary in the first slot is what says this is the elaborated class
+    // method and not something else the source happened to call `fromInteger`.
+    if (args[0]!.tag !== "Var" || lit.tag !== "Lit" || lit.lit.tag !== "LitNumInt") return args;
+    const box = this.top.get("integerFromIntPrim");
+    if (!box) return args;
+    return [args[0]!, { tag: "App", fn: { tag: "Var", binder: box }, arg: lit }];
   }
 
   /** `case` and `\case` alternatives; guards inside an alternative fall

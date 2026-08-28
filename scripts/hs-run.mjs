@@ -1806,7 +1806,7 @@ const programs = [
       "ptr :: StaticPtr Int",
       "ptr = static answer",
       "main :: IO Int",
-      "main = unsafeLookupStaticPtr (StaticKey 1 2 3 4) >>= (\\m -> case m of",
+      "main = unsafeLookupStaticPtr (Fingerprint 1 2) >>= (\\m -> case m of",
       "  Nothing -> pure 1",
       "  Just p -> pure (deRefStaticPtr p))",
       "",
@@ -2569,6 +2569,172 @@ const programs = [
     expect: 63,
   },
   {
+    // `Integer` is GHC's arbitrary-precision integer, and here it is a JS
+    // `BigInt` behind `data Integer = Integer JSValPrim` - the move
+    // `Data.ByteString` makes for a `Uint8Array`. What that buys is exactness
+    // at every width: 2^60 + 1 is a value a JS *number* cannot hold, and 2^200
+    // is one no 64-bit carrier could. `round`/`truncate` land here too, since
+    // they now decide on a `Double` and convert once at the end instead of
+    // truncating through a 32-bit `Int` on the way out.
+    name: "Integer is arbitrary precision, not a JS number",
+    source: [
+      "module Main where",
+      "import Data.Int (Int64)",
+      "",
+      "twoTo :: Int -> Integer",
+      "twoTo n = if n == 0 then 1 else 2 * twoTo (n - 1)",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if twoTo 60 + 1 - twoTo 60 == 1 then 1 else 0",
+      "  , if length (show (twoTo 60 + 1)) == 19 then 2 else 0",
+      "  , if twoTo 100 * twoTo 100 == twoTo 200 then 4 else 0",
+      "  , if twoTo 200 > twoTo 199 then 8 else 0",
+      "  , if round (1152921504606846976.0 :: Double) == twoTo 60 then 16 else 0",
+      "  , if truncate (1152921504606846976.0 :: Double) == twoTo 60 then 32 else 0",
+      "  , if fromIntegral (4611686018427387904 :: Int64) == twoTo 62 then 64 else 0",
+      "  , if show (negate (twoTo 64)) == \"-18446744073709551616\" then 128 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 255,
+  },
+  {
+    // `Int64`/`Word64` ride the same `BigInt` carrier and differ only in the
+    // wrap after every operation - `BigInt.asIntN` / `asUintN` at 64 bits. So
+    // they hold every value GHC's do and overflow where GHC's do: maxBound + 1
+    // is minBound, 2^64 as a `Word64` is 0, and 2^62 + 1 - 2^62 is 1 rather
+    // than 0, which is what a JS number would have made it.
+    name: "Int64 and Word64 wrap at 64 bits, and are exact below it",
+    source: [
+      "module Main where",
+      "import Data.Int (Int64)",
+      "import Data.Word (Word64)",
+      "",
+      "pow2i :: Int -> Int64",
+      "pow2i n = if n == 0 then 1 else 2 * pow2i (n - 1)",
+      "",
+      "pow2w :: Int -> Word64",
+      "pow2w n = if n == 0 then 1 else 2 * pow2w (n - 1)",
+      "",
+      "maxI64 :: Int64",
+      "maxI64 = pow2i 62 - 1 + pow2i 62",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if maxI64 + 1 == negate maxI64 - 1 then 1 else 0",
+      "  , if pow2i 63 == negate (pow2i 62) - pow2i 62 then 2 else 0",
+      "  , if pow2w 64 == 0 then 4 else 0",
+      "  , if (0 - 1 :: Word64) > pow2w 63 then 8 else 0",
+      "  , if show (pow2w 63) == \"9223372036854775808\" then 16 else 0",
+      "  , if show maxI64 == \"9223372036854775807\" then 32 else 0",
+      "  , if pow2i 62 + 1 - pow2i 62 == 1 then 64 else 0",
+      "  , if show (maxI64 + 1) == \"-9223372036854775808\" then 128 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 255,
+  },
+  {
+    // GHC's `Fingerprint` is two `Word64` halves, and so is this one now that
+    // there is a `Word64`. `Show` is sixteen zero-padded hex digits each, and
+    // `Numeric.readHex` reads a half back at `Word64` - which is what miso's
+    // `FromMisoString Fingerprint` writes, and what a `readHex` fixed at `Int`
+    // could not have done.
+    name: "Fingerprint is GHC's two Word64 halves",
+    source: [
+      "module Main where",
+      "import GHC.Fingerprint (Fingerprint(Fingerprint), fingerprint0)",
+      "import Data.Word (Word64)",
+      "import Numeric (readHex)",
+      "",
+      "parseHex :: [Char] -> Word64",
+      "parseHex h = case readHex h of",
+      "  [] -> 0",
+      "  ((w, rest) : more) -> w",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if show fingerprint0 == \"00000000000000000000000000000000\" then 1 else 0",
+      "  , if show (Fingerprint 1 1) == \"00000000000000010000000000000001\" then 2 else 0",
+      "  , if parseHex \"deadbeefcafebabe\" == parseHex \"DEADBEEFCAFEBABE\" then 4 else 0",
+      "  , if show (Fingerprint (parseHex \"deadbeefcafebabe\") (parseHex \"0123456789abcdef\")) == \"deadbeefcafebabe0123456789abcdef\" then 8 else 0",
+      "  , if fingerprint0 == Fingerprint 0 0 then 16 else 0",
+      "  , if fingerprint0 == Fingerprint 0 1 then 0 else 32",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 63,
+  },
+  {
+    // `Natural` shares `Integer`'s carrier and stays a distinct type, because
+    // the two hold different value sets - the same test `Data.ByteString` uses
+    // to justify sharing one type for strict and lazy bytes.
+    name: "Natural converts to and from Integer",
+    source: [
+      "module Main where",
+      "import GHC.Natural (Natural, naturalToInteger, naturalFromInteger)",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if naturalToInteger (naturalFromInteger 7) == 7 then 1 else 0",
+      "  , if show (naturalFromInteger 12345) == \"12345\" then 2 else 0",
+      "  , if naturalFromInteger 3 < naturalFromInteger 4 then 4 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 7,
+  },
+  {
+    // A rank-2 argument, which is miso's `Miso.Lens.fromVL`. `VL` is used at
+    // TWO functors in one body - `Const` to read and `Identity` to write - so
+    // its `Functor f` cannot be hoisted to one `f` for the whole signature.
+    // The half that matters at run time is the elaboration: `toVL` takes its
+    // dictionary as a parameter, so `fromVL (toVL l)` has to hand over a
+    // dictionary-TAKING function rather than one already applied to a
+    // dictionary. Getting the typing right and that wrong would typecheck and
+    // mis-run; 39 is what says it did not.
+    name: "a rank-2 argument used at two functors in one body",
+    source: [
+      "module Main where",
+      "",
+      "data Const a b = Const a",
+      "data Identity a = Identity a",
+      "data Lens s a = Lens (s -> a) (a -> s -> s)",
+      "data P = P Int Int",
+      "",
+      "getConst :: Const a b -> a",
+      "getConst (Const a) = a",
+      "",
+      "runIdentity :: Identity a -> a",
+      "runIdentity (Identity a) = a",
+      "",
+      "instance Functor (Const a) where",
+      "  fmap f (Const x) = Const x",
+      "",
+      "instance Functor Identity where",
+      "  fmap f (Identity a) = Identity (f a)",
+      "",
+      "type VL s a = forall f. Functor f => (a -> f a) -> s -> f s",
+      "",
+      "toVL :: Lens s a -> VL s a",
+      "toVL (Lens g st) = \\f s -> fmap (\\a -> st a s) (f (g s))",
+      "",
+      "fromVL :: VL s a -> Lens s a",
+      "fromVL l = Lens (\\s -> getConst (l Const s)) (\\a s -> runIdentity (l (\\_ -> Identity a) s))",
+      "",
+      "fstL :: Lens P Int",
+      "fstL = Lens (\\p -> case p of P a b -> a) (\\x p -> case p of P a b -> P x b)",
+      "",
+      "main :: IO Int",
+      "main = case fromVL (toVL fstL) of",
+      "  Lens g st -> case st 30 (P 1 2) of",
+      "    P a b -> pure (g (P 7 0) + a + b)",
+      "",
+    ].join("\n"),
+    expect: 39,
+  },
+  {
     // `Float` is single precision, and the only thing that says so on a backend
     // where every number is a JS double is the `Math.fround` each `Float*Op`
     // ends with. 0.1 + 0.2 at single precision is exactly the float nearest
@@ -2825,14 +2991,15 @@ const programs = [
     // rejected promise's value - miso's `await` throws its result - and with no
     // `Exception` class here the throwable shape is `SomeException`, which is
     // already the JavaScript value that was thrown. `GHC.Fingerprint`'s
-    // `Fingerprint` is this compiler's `StaticKey`: the same 128 bits under a
-    // different field split, and the same 32-hex-digit `Show` as GHC's.
+    // `Fingerprint` is this compiler's `StaticKey`: GHC's own two `Word64`
+    // halves, and the same 32-hex-digit `Show` as GHC's - zero padded, so a
+    // half that needs one digit still prints sixteen.
     name: "mkJSException builds a SomeException, and Fingerprint is StaticKey",
     source: [
       "module Main where",
       "import GHC.JS.Prim (jsNull, mkJSException)",
-      "import GHC.Fingerprint (Fingerprint)",
-      "import GHC.StaticPtr (StaticKey(StaticKey))",
+      "import GHC.Fingerprint (Fingerprint(Fingerprint))",
+      "import GHC.StaticPtr (StaticKey)",
       "import Control.Exception (SomeException)",
       "",
       "wrapped :: SomeException -> Int",
@@ -2844,7 +3011,7 @@ const programs = [
       "main :: IO Int",
       "main = do",
       "  e <- mkJSException jsNull",
-      "  pure (wrapped e + length (show (same (StaticKey 1 2 3 4))) + length (show e))",
+      "  pure (wrapped e + length (show (same (Fingerprint 1 2))) + length (show e))",
       "",
     ].join("\n"),
     // 1 + 32 hex digits + `null`

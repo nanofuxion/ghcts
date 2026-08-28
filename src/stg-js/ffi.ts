@@ -119,8 +119,19 @@ function takeGen(g: Generator<JStgExpr>, n: number): JStgExpr[] {
 const targetExprs = (ctx: ExprCtx): JStgExpr[] => ctxTarget(ctx).flatMap((t) => t.expr);
 
 /** GHCJS's `$1`/`$r` splices would silently render as garbage here, since the
- * whole string becomes a JS identifier. Reject them with the reason. */
+ * whole string becomes a JS identifier and `"$r = $1 === $2;"` is not an
+ * expression at all, let alone one denoting a function. Reject those with the
+ * reason.
+ *
+ * A `$1` is NOT by itself a splice. `$1` is a legal JavaScript identifier, and
+ * miso's `Miso.DSL.FFI` writes `"(($1,$2) => { return $1 === $2; })"` for GHC's
+ * own JS backend - which compiles it, because `parseFFIPattern'` never looks at
+ * the string and a lambda may name its parameters whatever it likes. So the
+ * test is on the SHAPE: an import that already is a parenthesised expression is
+ * taken at its word, exactly as GHC takes it, and only a string that could not
+ * be one is rejected. */
 function rejectHoles(pat: string): void {
+  if (/^\s*\(/.test(pat)) return;
   if (/\$(r|\d)/.test(pat)) {
     throw new Error(
       `genForeignCall: GHCJS-style FFI pattern ${JSON.stringify(pat)} is not supported. ` +

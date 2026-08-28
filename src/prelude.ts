@@ -98,16 +98,19 @@ class Num a where
   (-) :: a -> a -> a
   (*) :: a -> a -> a
   negate :: a -> a
-  fromInteger :: IntPrim -> a
+  fromInteger :: Integer -> a
 
 class Num a => Fractional a where
   (/) :: a -> a -> a
   fromRational :: DoublePrim -> a
 
 -- The one method each of \`Real\`/\`RealFrac\`/\`Integral\` this frontend needs.
--- GHC routes \`realToFrac\` through \`Rational\`; there is no \`Integer\` and no
--- \`Ratio\` here, and \`DoublePrim\` is the widest exact type, so it stands in for
--- the intermediate. Every conversion this admits is one GHC would agree with.
+-- GHC routes \`realToFrac\` through \`Rational\`; there is no \`Ratio\` here, and
+-- \`DoublePrim\` is the widest exact type a \`Fractional\` can be reached from, so
+-- it stands in for the intermediate. \`Integral\` is GHC's own \`toInteger\`,
+-- because \`Integer\` IS the widest exact type on the integral side: routing
+-- \`fromIntegral\` through \`IntPrim\` would truncate every \`Int64\` and \`Word64\`
+-- to 32 bits on the way out.
 class Num a => Real a where
   toDoublePrim :: a -> DoublePrim
 
@@ -115,7 +118,7 @@ class Fractional a => RealFrac a where
   fracToDoublePrim :: a -> DoublePrim
 
 class Num a => Integral a where
-  toIntPrim :: a -> IntPrim
+  toInteger :: a -> Integer
 
 -- GHC's own three methods and their mutual defaults. \`showsPrec\` is what
 -- makes nesting print right - a field is shown at precedence 11, so
@@ -244,7 +247,11 @@ instance Num Int where
   (-) (I a) (I b) = I (primIntSub a b)
   (*) (I a) (I b) = I (primIntMul a b)
   negate (I a) = I (primIntNeg a)
-  fromInteger n = I n
+  -- Matching \`Integer b\` rather than calling a conversion is what keeps the
+  -- machine value machine: a primitive call in an argument or a field is
+  -- evaluated where it stands, but a Haskell function's result there is a
+  -- THUNK - and \`I\` is an unboxed constructor, so the field would BE it.
+  fromInteger (Integer b) = I (primIntegerToInt b)
 
 instance Show Int where
   -- GHC's \`showSignedInt\`: a negative number is parenthesised at any
@@ -327,7 +334,7 @@ instance Real Int where
   toDoublePrim (I n) = primIntToDouble n
 
 instance Integral Int where
-  toIntPrim (I n) = n
+  toInteger (I n) = Integer (primIntegerFromInt n)
 
 instance Eq Double where
   (==) (DoubleBox a) (DoubleBox b) = primDoubleEq a b
@@ -343,7 +350,7 @@ instance Num Double where
   (-) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleSub a b)
   (*) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleMul a b)
   negate (DoubleBox a) = DoubleBox (primDoubleNeg a)
-  fromInteger n = DoubleBox (primIntToDouble n)
+  fromInteger (Integer b) = DoubleBox (primIntegerToDouble b)
 
 instance Fractional Double where
   (/) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleDiv a b)
@@ -369,7 +376,7 @@ instance Num Float where
   (-) (FloatBox a) (FloatBox b) = FloatBox (primFloatSub a b)
   (*) (FloatBox a) (FloatBox b) = FloatBox (primFloatMul a b)
   negate (FloatBox a) = FloatBox (primFloatNeg a)
-  fromInteger n = FloatBox (primDoubleToFloat (primIntToDouble n))
+  fromInteger (Integer b) = FloatBox (primDoubleToFloat (primIntegerToDouble b))
 
 instance Fractional Float where
   (/) (FloatBox a) (FloatBox b) = FloatBox (primFloatDiv a b)
@@ -788,78 +795,218 @@ digitsOf n acc = if primIntLt n 10 then digitChar n : acc else digitsOf (primInt
 digitChar :: IntPrim -> Char
 digitChar n = C (primChr (primIntAdd n 48))
 
+-- --------------------------------------------- Integer, Int64 and Word64 ---
+--
+-- GHC's \`Integer\` is \`ghc-bignum\`'s \`IS Int# | IP BigNat# | IN BigNat#\` over
+-- the \`h$ghcbn_*\` primitives, and \`Int64\`/\`Word64\` are \`I64# Int64#\`/
+-- \`W64# Word64#\` over a two-slot unboxed value. Both carriers live in the
+-- backend. What is reachable from the frontend alone is a \`foreign import\`,
+-- and the platform already has an exact integer of unbounded width: a JS
+-- \`BigInt\`. So the box holds one, exactly as \`data ByteString = ByteString
+-- JSValPrim\` holds a real \`Uint8Array\`.
+--
+-- That is honest by the test \`Data.ByteString\` states: a \`BigInt\` can hold
+-- every value an \`Integer\` can, which is what \`Int64\` aliased to \`Int\` could
+-- never have said. \`Int64\` and \`Word64\` ride the same carrier and differ only
+-- in the wrap applied after every operation - \`BigInt.asIntN\` / \`asUintN\` at
+-- 64 bits - which is what makes them wrap at their own width rather than grow.
+--
+-- They are declared here, and not in \`Data.Int\`/\`Data.Word\`, because
+-- \`Fingerprint\` is two \`Word64\` halves and \`Fingerprint\` is wired in: \`static\`
+-- is a keyword form that needs no import (see StaticPtr, below).
+data Integer = Integer JSValPrim
+data Int64 = I64 JSValPrim
+data Word64 = W64 JSValPrim
+
+foreign import javascript unsafe "((n) => BigInt(n))" primIntegerFromInt :: IntPrim -> JSValPrim
+-- GHC's \`integerToInt#\` keeps the low bits of a machine word, and the machine
+-- word on this backend is 32 bits wide (see \`Literal\` in src/stg.ts).
+foreign import javascript unsafe "((b) => Number(BigInt.asIntN(32, b)))" primIntegerToInt :: JSValPrim -> IntPrim
+-- \`Math.trunc\` first: \`BigInt\` refuses a Number with a fractional part
+-- outright, where \`truncate\`/\`round\` have already decided which whole number
+-- they mean.
+foreign import javascript unsafe "((d) => BigInt(Math.trunc(d)))" primIntegerFromDouble :: DoublePrim -> JSValPrim
+foreign import javascript unsafe "((b) => Number(b))" primIntegerToDouble :: JSValPrim -> DoublePrim
+foreign import javascript unsafe "((a,b) => a + b)" primBigIntAdd :: JSValPrim -> JSValPrim -> JSValPrim
+foreign import javascript unsafe "((a,b) => a - b)" primBigIntSub :: JSValPrim -> JSValPrim -> JSValPrim
+foreign import javascript unsafe "((a,b) => a * b)" primBigIntMul :: JSValPrim -> JSValPrim -> JSValPrim
+foreign import javascript unsafe "((b) => -b)" primBigIntNeg :: JSValPrim -> JSValPrim
+foreign import javascript unsafe "((a,b) => a === b)" primBigIntEq :: JSValPrim -> JSValPrim -> Bool
+foreign import javascript unsafe "((a,b) => a < b)" primBigIntLt :: JSValPrim -> JSValPrim -> Bool
+foreign import javascript unsafe "((a,b) => a <= b)" primBigIntLe :: JSValPrim -> JSValPrim -> Bool
+foreign import javascript unsafe "((a,b) => a > b)" primBigIntGt :: JSValPrim -> JSValPrim -> Bool
+foreign import javascript unsafe "((a,b) => a >= b)" primBigIntGe :: JSValPrim -> JSValPrim -> Bool
+foreign import javascript unsafe "((b) => b < 0n)" primBigIntIsNeg :: JSValPrim -> Bool
+foreign import javascript unsafe "((b) => b.toString())" primBigIntShow :: JSValPrim -> JSStringPrim
+foreign import javascript unsafe "((b) => BigInt.asIntN(64, b))" primNarrow64 :: JSValPrim -> JSValPrim
+foreign import javascript unsafe "((b) => BigInt.asUintN(64, b))" primMask64 :: JSValPrim -> JSValPrim
+
+-- What \`src/desugar.ts\` wraps a machine literal in when the \`fromInteger\` it
+-- feeds is not one of the shapes \`overloadedLit\` short-cuts.
+integerFromIntPrim :: IntPrim -> Integer
+integerFromIntPrim n = Integer (primIntegerFromInt n)
+
+integerFromDoublePrim :: DoublePrim -> Integer
+integerFromDoublePrim d = Integer (primIntegerFromDouble d)
+
+instance Eq Integer where
+  (==) (Integer a) (Integer b) = primBigIntEq a b
+
+instance Ord Integer where
+  (<) (Integer a) (Integer b) = primBigIntLt a b
+  (<=) (Integer a) (Integer b) = primBigIntLe a b
+  (>) (Integer a) (Integer b) = primBigIntGt a b
+  (>=) (Integer a) (Integer b) = primBigIntGe a b
+
+instance Num Integer where
+  (+) (Integer a) (Integer b) = Integer (primBigIntAdd a b)
+  (-) (Integer a) (Integer b) = Integer (primBigIntSub a b)
+  (*) (Integer a) (Integer b) = Integer (primBigIntMul a b)
+  negate (Integer a) = Integer (primBigIntNeg a)
+  fromInteger n = n
+
+instance Real Integer where
+  toDoublePrim (Integer b) = primIntegerToDouble b
+
+instance Integral Integer where
+  toInteger n = n
+
+instance Show Integer where
+  showsPrec d (Integer b) s = showsBigInt d b s
+
+-- A negative number is parenthesised at any precedence above 6, exactly as
+-- \`showSignedInt\` does it for \`Int\`.
+showsBigInt :: Int -> JSValPrim -> [Char] -> [Char]
+showsBigInt d b s =
+  if primBigIntIsNeg b && d > 6 then '(' : jsAscii (primBigIntShow b) ++ (')' : s) else jsAscii (primBigIntShow b) ++ s
+
+instance Eq Int64 where
+  (==) (I64 a) (I64 b) = primBigIntEq a b
+
+instance Ord Int64 where
+  (<) (I64 a) (I64 b) = primBigIntLt a b
+  (<=) (I64 a) (I64 b) = primBigIntLe a b
+  (>) (I64 a) (I64 b) = primBigIntGt a b
+  (>=) (I64 a) (I64 b) = primBigIntGe a b
+
+instance Num Int64 where
+  (+) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntAdd a b))
+  (-) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntSub a b))
+  (*) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntMul a b))
+  negate (I64 a) = I64 (primNarrow64 (primBigIntNeg a))
+  fromInteger (Integer b) = I64 (primNarrow64 b)
+
+instance Real Int64 where
+  toDoublePrim (I64 b) = primIntegerToDouble b
+
+instance Integral Int64 where
+  toInteger (I64 b) = Integer b
+
+instance Show Int64 where
+  showsPrec d (I64 b) s = showsBigInt d b s
+
+instance Eq Word64 where
+  (==) (W64 a) (W64 b) = primBigIntEq a b
+
+instance Ord Word64 where
+  (<) (W64 a) (W64 b) = primBigIntLt a b
+  (<=) (W64 a) (W64 b) = primBigIntLe a b
+  (>) (W64 a) (W64 b) = primBigIntGt a b
+  (>=) (W64 a) (W64 b) = primBigIntGe a b
+
+instance Num Word64 where
+  (+) (W64 a) (W64 b) = W64 (primMask64 (primBigIntAdd a b))
+  (-) (W64 a) (W64 b) = W64 (primMask64 (primBigIntSub a b))
+  (*) (W64 a) (W64 b) = W64 (primMask64 (primBigIntMul a b))
+  negate (W64 a) = W64 (primMask64 (primBigIntNeg a))
+  fromInteger (Integer b) = W64 (primMask64 b)
+
+instance Real Word64 where
+  toDoublePrim (W64 b) = primIntegerToDouble b
+
+instance Integral Word64 where
+  toInteger (W64 b) = Integer b
+
+-- A \`Word64\` is masked to [0, 2^64), so it never prints a sign and never needs
+-- the parentheses \`Int64\` does.
+instance Show Word64 where
+  showsPrec d (W64 b) s = jsAscii (primBigIntShow b) ++ s
+
 -- ---------------------------------------------------------------- numeric ---
 
--- The \`case\` is load-bearing, not style: it is what makes the machine result
--- of a call an evaluated machine value before it becomes an argument. Written
--- as \`fromInteger (toIntPrim x)\` the argument would be let-bound as a *thunk*,
--- and \`I <thunk>\` is not an unboxed \`Int\`.
+-- GHC's own definition, method for method. The \`Integer\` in the middle is a
+-- lifted box, so nothing here has to force it into place - unlike the machine
+-- value this used to pass, which could not be a lazy constructor field.
 fromIntegral :: (Integral a, Num b) => a -> b
-fromIntegral x = case toIntPrim x of
-  n -> fromInteger n
+fromIntegral x = fromInteger (toInteger x)
 
 realToFrac :: (Real a, Fractional b) => a -> b
 realToFrac x = case toDoublePrim x of
   d -> fromRational d
 
+-- Every function below produces an \`Integer\`, so each one stays on
+-- \`DoublePrim\` for the whole rounding decision and converts once at the end.
+-- Truncating through \`IntPrim\` on the way - which is what these did while
+-- \`fromInteger\` took a machine int - throws away every value a \`Double\` holds
+-- exactly but a 32-bit \`Int\` cannot, and \`fromInteger . round\` at \`Int64\`,
+-- \`Word64\` and \`Integer\` is exactly the code that asks for those.
+foreign import javascript unsafe "((d) => Math.trunc(d))" primDoubleTrunc :: DoublePrim -> DoublePrim
+foreign import javascript unsafe "((d) => Math.floor(d))" primDoubleFloor :: DoublePrim -> DoublePrim
+foreign import javascript unsafe "((d) => Math.ceil(d))" primDoubleCeil :: DoublePrim -> DoublePrim
+foreign import javascript unsafe "((a,b) => a % b)" primDoubleRem :: DoublePrim -> DoublePrim -> DoublePrim
+
 -- GHC's \`round\` is round-half-to-EVEN, not round-half-up; getting that wrong
 -- would be a silent one-pixel error rather than a crash, so it is spelled out.
+--
+-- The inner \`case\` is load-bearing: \`roundPrim\` is a Haskell function, so its
+-- result in an argument position would be a THUNK, and \`integerFromDoublePrim\`
+-- takes a machine double. \`floor\`/\`ceiling\`/\`truncate\` below need no such
+-- \`case\` because what they pass is a primitive call, which the STG pass
+-- evaluates where it stands.
 round :: (RealFrac a, Num b) => a -> b
 round x = case fracToDoublePrim x of
   d -> case roundPrim d of
-    n -> fromInteger n
+    n -> fromInteger (integerFromDoublePrim n)
 
-roundPrim :: DoublePrim -> IntPrim
-roundPrim d = roundHalf (primDoubleToInt d) (primDoubleSub d (primIntToDouble (primDoubleToInt d)))
+roundPrim :: DoublePrim -> DoublePrim
+roundPrim d = roundHalf (primDoubleTrunc d) (primDoubleSub d (primDoubleTrunc d))
 
 -- \`n\` is \`d\` truncated towards zero and \`r\` is the signed remainder, so
 -- |r| < 1 and the only decisions left are the two halfway cases.
-roundHalf :: IntPrim -> DoublePrim -> IntPrim
-roundHalf n r = if primDoubleLt r (primDoubleNeg 0.5) then primIntSub n 1 else roundHalfUp n r
+roundHalf :: DoublePrim -> DoublePrim -> DoublePrim
+roundHalf n r = if primDoubleLt r (primDoubleNeg 0.5) then primDoubleSub n 1.0 else roundHalfUp n r
 
-roundHalfUp :: IntPrim -> DoublePrim -> IntPrim
-roundHalfUp n r = if primDoubleGt r 0.5 then primIntAdd n 1 else roundHalfTie n r
+roundHalfUp :: DoublePrim -> DoublePrim -> DoublePrim
+roundHalfUp n r = if primDoubleGt r 0.5 then primDoubleAdd n 1.0 else roundHalfTie n r
 
-roundHalfTie :: IntPrim -> DoublePrim -> IntPrim
-roundHalfTie n r = if primDoubleEq r 0.5 then evenOr n (primIntAdd n 1) else roundHalfTieDown n r
+roundHalfTie :: DoublePrim -> DoublePrim -> DoublePrim
+roundHalfTie n r = if primDoubleEq r 0.5 then evenOr n (primDoubleAdd n 1.0) else roundHalfTieDown n r
 
-roundHalfTieDown :: IntPrim -> DoublePrim -> IntPrim
-roundHalfTieDown n r = if primDoubleEq r (primDoubleNeg 0.5) then evenOr n (primIntSub n 1) else n
+roundHalfTieDown :: DoublePrim -> DoublePrim -> DoublePrim
+roundHalfTieDown n r = if primDoubleEq r (primDoubleNeg 0.5) then evenOr n (primDoubleSub n 1.0) else n
 
-evenOr :: IntPrim -> IntPrim -> IntPrim
-evenOr n alternative = if primIntEq (primIntRem n 2) 0 then n else alternative
+evenOr :: DoublePrim -> DoublePrim -> DoublePrim
+evenOr n alternative = if primDoubleEq (primDoubleRem n 2.0) 0.0 then n else alternative
 
 -- \\\`properFraction x\\\` is \\\`(truncate x, x - fromIntegral (truncate x))\\\`: the
 -- integer part towards zero and the *signed* remainder, so the two add back to
 -- \\\`x\\\` for a negative argument as well.
 properFraction :: (RealFrac a, Num b) => a -> (b, a)
 properFraction x = case fracToDoublePrim x of
-  d -> case primDoubleToInt d of
-    n -> (fromInteger n, fromRational (primDoubleSub d (primIntToDouble n)))
+  d -> case primDoubleTrunc d of
+    n -> (fromInteger (integerFromDoublePrim n), fromRational (primDoubleSub d n))
 
 truncate :: (RealFrac a, Num b) => a -> b
 truncate x = case fracToDoublePrim x of
-  d -> case primDoubleToInt d of
-    n -> fromInteger n
+  d -> fromInteger (integerFromDoublePrim (primDoubleTrunc d))
 
 floor :: (RealFrac a, Num b) => a -> b
 floor x = case fracToDoublePrim x of
-  d -> case floorPrim d of
-    n -> fromInteger n
-
-floorPrim :: DoublePrim -> IntPrim
-floorPrim d = if primDoubleLt (primIntToDouble (primDoubleToInt d)) d then primDoubleToInt d else adjustFloor (primDoubleToInt d) d
-
-adjustFloor :: IntPrim -> DoublePrim -> IntPrim
-adjustFloor n d = if primDoubleEq (primIntToDouble n) d then n else primIntSub n 1
+  d -> fromInteger (integerFromDoublePrim (primDoubleFloor d))
 
 ceiling :: (RealFrac a, Num b) => a -> b
 ceiling x = case fracToDoublePrim x of
-  d -> case ceilingPrim d of
-    n -> fromInteger n
-
-ceilingPrim :: DoublePrim -> IntPrim
-ceilingPrim d = primIntNeg (floorPrim (primDoubleNeg d))
+  d -> fromInteger (integerFromDoublePrim (primDoubleCeil d))
 
 sqrt :: Double -> Double
 sqrt (DoubleBox d) = DoubleBox (primDoubleSqrt d)
@@ -1339,12 +1486,25 @@ zipWithM_ f xs ys = sequence_ (zipWith f xs ys)
 -- what is declared here. \`src/parser.ts\` floats each \`static e\` into its own
 -- top-level binding and fills in the fingerprint.
 --
--- GHC's key is \`Fingerprint Word64 Word64\`. There is no \`Word64\` here, and
--- the static pointer table's own interface is four 32-bit words anyway -
--- \`h$hs_spt_insert(k1,k2,k3,k4,ref)\` - so that is the shape, in the order GHC's
--- \`StgToJS.StaticPtr\` passes them: the high and low halves of each \`Word64\`.
-data StaticKey = StaticKey Int Int Int Int
+-- GHC's key is \`Fingerprint Word64 Word64\`, and so is this one now that
+-- \`Word64\` exists. The static pointer table's own interface is still four
+-- 32-bit words - \`h$hs_spt_insert(k1,k2,k3,k4,ref)\` - so each half is split at
+-- the call, in the order GHC's \`StgToJS.StaticPtr\` passes them: high then low.
+data Fingerprint = Fingerprint Word64 Word64
+type StaticKey = Fingerprint
 data StaticPtr a = StaticPtr StaticKey a
+
+-- What \`src/parser.ts\` builds each \`static\` form's key out of: the two halves
+-- of one \`Word64\`, as \`md5\` hands them over.
+word64FromHalves :: IntPrim -> IntPrim -> Word64
+word64FromHalves hi lo = W64 (primWord64FromHalves hi lo)
+
+foreign import javascript unsafe "((hi,lo) => (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0))" primWord64FromHalves :: IntPrim -> IntPrim -> JSValPrim
+-- Unsigned, because that is what \`h$hs_spt_insert\` was given when the key was
+-- four \`Int\`s and what the table's keys are still compared as.
+foreign import javascript unsafe "((b) => Number(BigInt.asUintN(32, b >> 32n)))" primWord64Hi :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((b) => Number(BigInt.asUintN(32, b)))" primWord64Lo :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((b) => b.toString(16).padStart(16, '0'))" primWord64Hex :: JSValPrim -> JSStringPrim
 
 deRefStaticPtr :: StaticPtr a -> a
 deRefStaticPtr p = case p of
@@ -1354,31 +1514,22 @@ staticKey :: StaticPtr a -> StaticKey
 staticKey p = case p of
   StaticPtr k v -> k
 
-instance Eq StaticKey where
-  (==) a b = eqStaticKey a b
+instance Eq Fingerprint where
+  (==) a b = eqFingerprint a b
 
-eqStaticKey :: StaticKey -> StaticKey -> Bool
-eqStaticKey (StaticKey a b c d) (StaticKey w x y z) = a == w && b == x && c == y && d == z
+eqFingerprint :: Fingerprint -> Fingerprint -> Bool
+eqFingerprint (Fingerprint a b) (Fingerprint w x) = a == w && b == x
 
 -- GHC's \`Show Fingerprint\` is the two \`Word64\` halves as sixteen zero-padded
--- hex digits each, which is these four words as eight digits each.
-instance Show StaticKey where
-  show k = showStaticKey k
+-- hex digits each.
+instance Show Fingerprint where
+  show k = showFingerprint k
 
-showStaticKey :: StaticKey -> [Char]
-showStaticKey (StaticKey a b c d) = hex8 a ++ (hex8 b ++ (hex8 c ++ hex8 d))
+showFingerprint :: Fingerprint -> [Char]
+showFingerprint (Fingerprint a b) = hex16 a ++ hex16 b
 
-hex8 :: Int -> [Char]
-hex8 (I n) = hexDigits 8 n []
-
-hexDigits :: IntPrim -> IntPrim -> [Char] -> [Char]
-hexDigits width n acc =
-  if primIntEq width 0
-    then acc
-    else hexDigits (primIntSub width 1) (primIntQuot n 16) (hexDigit (primIntRem n 16) : acc)
-
-hexDigit :: IntPrim -> Char
-hexDigit n = if primIntLt n 10 then C (primChr (primIntAdd n 48)) else C (primChr (primIntAdd n 87))
+hex16 :: Word64 -> [Char]
+hex16 (W64 b) = jsAscii (primWord64Hex b)
 
 -- The static pointer table is the RTS's (rts/js/staticpointer.js), not a
 -- Haskell \`Map\`: \`unsafeLookupStaticPtr\` has to find an entry that a *different*
@@ -1397,8 +1548,9 @@ sptRegister p = IO (\\s -> sptRegisterStep s p)
 sptRegisterStep :: RealWorld -> StaticPtr a -> IOResult ()
 sptRegisterStep s p = case p of
   StaticPtr k v -> case k of
-    StaticKey (I a) (I b) (I c) (I d) -> case primSptInsert a b c d p of
-      _ -> IOResult s ()
+    Fingerprint (W64 a) (W64 b) ->
+      case primSptInsert (primWord64Hi a) (primWord64Lo a) (primWord64Hi b) (primWord64Lo b) p of
+        _ -> IOResult s ()
 
 -- What \`src/elaborate.ts\` puts in front of \`main\`. It is a plain function and
 -- not \`sptRegister p >> m\` because it is built after elaboration, where \`>>\`
@@ -1412,8 +1564,11 @@ sptRegisterThenStep s p m = case sptRegisterStep s p of
 
 unsafeLookupStaticPtr :: StaticKey -> IO (Maybe (StaticPtr a))
 unsafeLookupStaticPtr k = case k of
-  StaticKey (I a) (I b) (I c) (I d) ->
-    if primIntEq (primSptHas a b c d) 0 then pure Nothing else sptFetch a b c d
+  Fingerprint (W64 x) (W64 y) ->
+    sptLookup (primWord64Hi x) (primWord64Lo x) (primWord64Hi y) (primWord64Lo y)
+
+sptLookup :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> IO (Maybe (StaticPtr a))
+sptLookup a b c d = if primIntEq (primSptHas a b c d) 0 then pure Nothing else sptFetch a b c d
 
 -- Split from the test above because the miss returns \`null\`, and \`null\` in a
 -- position something may enter is not a value - it is the crash one step later.

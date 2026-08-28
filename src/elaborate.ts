@@ -88,7 +88,17 @@ type Type =
   | { tag: "con"; name: string }
   | { tag: "app"; fn: Type; arg: Type }
   /** Only inside a `Scheme`; instantiation replaces these with fresh vars. */
-  | { tag: "gen"; index: number };
+  | { tag: "gen"; index: number }
+  /** A rank-2 *argument*: miso's `type Lens' s a = forall f. Functor f =>
+   * (a -> f a) -> s -> f s` used as the parameter of `fromVL`, kept where it
+   * was written instead of hoisted to the enclosing signature's quantifier.
+   * Hoisting is right in a RESULT position - that is GHC's deep instantiation -
+   * and wrong here, because one hoisted `f` has to be both `Const` and
+   * `Identity` in the same body.
+   *
+   * `bound` holds its own variables as ordinary `TVar`s rather than `gen`
+   * indices, so they can never collide with an enclosing scheme's numbering. */
+  | { tag: "poly"; bound: TVar[]; constraints: Constraint[]; type: Type };
 
 /** `MonadState s m` is `{ cls: "MonadState", types: [s, m] }`: the argument
  * list is what makes a class multi-parameter, and every consumer here - given,
@@ -138,6 +148,7 @@ function occurs(v: TVar, t: Type): boolean {
   const p = prune(t);
   if (p.tag === "var") return p.v === v;
   if (p.tag === "app") return occurs(v, p.fn) || occurs(v, p.arg);
+  if (p.tag === "poly") return occurs(v, p.type) || p.constraints.some((c) => c.types.some((t) => occurs(v, t)));
   return false;
 }
 
@@ -156,6 +167,21 @@ function unify(a: Type, b: Type): boolean {
   if (y.tag === "var") return unify(y, x);
   if (x.tag === "con" && y.tag === "con") return x.name === y.name;
   if (x.tag === "app" && y.tag === "app") return unify(x.fn, y.fn) && unify(x.arg, y.arg);
+  // Two rank-2 types match when they match up to the naming of their own
+  // quantified variables, which is what alpha-equivalence is.
+  if (x.tag === "poly" && y.tag === "poly") {
+    if (x.bound.length !== y.bound.length || x.constraints.length !== y.constraints.length) return false;
+    const rename = new Map(y.bound.map((v, i) => [v, varType(x.bound[i]!)] as const));
+    return (
+      unify(x.type, applySubst(y.type, rename)) &&
+      x.constraints.every(
+        (c, i) =>
+          c.cls === y.constraints[i]!.cls &&
+          c.types.length === y.constraints[i]!.types.length &&
+          c.types.every((t, j) => unify(t, applySubst(y.constraints[i]!.types[j]!, rename))),
+      )
+    );
+  }
   return false;
 }
 
@@ -166,6 +192,15 @@ function typeVars(t: Type, out: TVar[] = []): TVar[] {
     typeVars(p.fn, out);
     typeVars(p.arg, out);
   }
+  // A rank-2 type's own variables are bound by it, so they are not free in
+  // whatever contains it - quantifying or skolemising them out there would
+  // fix the one `f` this node exists to keep separate.
+  if (p.tag === "poly") {
+    const inner: TVar[] = [];
+    typeVars(p.type, inner);
+    for (const c of p.constraints) for (const t_ of c.types) typeVars(t_, inner);
+    for (const v of inner) if (!p.bound.includes(v) && !out.includes(v)) out.push(v);
+  }
   return out;
 }
 
@@ -175,6 +210,8 @@ const sameType = (a: Type, b: Type): boolean => {
   if (x.tag === "var" || y.tag === "var") return x.tag === "var" && y.tag === "var" && x.v === y.v;
   if (x.tag === "con" && y.tag === "con") return x.name === y.name;
   if (x.tag === "app" && y.tag === "app") return sameType(x.fn, y.fn) && sameType(x.arg, y.arg);
+  if (x.tag === "poly" && y.tag === "poly")
+    return x.bound.length === y.bound.length && sameType(x.type, applySubst(y.type, new Map(y.bound.map((v, i) => [v, varType(x.bound[i]!)] as const))));
   return false;
 };
 
@@ -191,7 +228,20 @@ function substGens(t: Type, images: Type[]): Type {
   const p = prune(t);
   if (p.tag === "gen") return images[p.index] ?? freshVar();
   if (p.tag === "app") return tapp(substGens(p.fn, images), substGens(p.arg, images));
+  if (p.tag === "poly") return mapPoly(p, (t) => substGens(t, images));
   return p;
+}
+
+/** Rebuild a rank-2 node with `f` applied to its body and its constraints; the
+ * bound variables are carried through untouched, which is what makes every
+ * substitution here capture-avoiding without renaming anything. */
+function mapPoly(p: Extract<Type, { tag: "poly" }>, f: (t: Type) => Type): Type {
+  return {
+    tag: "poly",
+    bound: p.bound,
+    constraints: p.constraints.map((c) => ({ cls: c.cls, types: c.types.map(f) })),
+    type: f(p.type),
+  };
 }
 
 /** `given` supplies the images of the *leading* quantified variables, in the
@@ -218,6 +268,7 @@ function quantify(vars: TVar[], type: Type, constraints: Constraint[]): Scheme {
       return i === undefined ? p : { tag: "gen", index: i };
     }
     if (p.tag === "app") return tapp(go(p.fn), go(p.arg));
+    if (p.tag === "poly") return mapPoly(p, go);
     return p;
   };
   return { gens: vars.length, type: go(type), constraints: constraints.map((c) => ({ cls: c.cls, types: c.types.map(go) })) };
@@ -317,12 +368,44 @@ class TypeParser {
   }
 
   fun(): Type {
+    // A context parked while parsing what turns out to be a function ARGUMENT
+    // belongs to that argument, not to the enclosing signature. `fromVL ::
+    // Lens' record field -> Lens record field` is the case: hoisting the
+    // synonym's `Functor f` gives the whole signature one `f`, and `fromVL`'s
+    // body needs it to be `Const` in one place and `Identity` in another.
+    // In a RESULT position the hoist is right - it is GHC's deep instantiation
+    // - so nothing is taken back when no `->` follows.
+    const mark = expandedContext.length;
     const left = this.operators();
     if (this.tokens[this.index] === "->") {
       this.index++;
-      return tfun(left, this.fun());
+      const own = expandedContext.splice(mark);
+      return tfun(own.length ? this.rank2(own, left) : left, this.fun());
     }
     return left;
+  }
+
+  /** Wrap an argument in its own quantifier. Its variables are the ones the
+   * context mentions that the *signature* never named - which for a synonym is
+   * exactly what the synonym's own `forall` bound, since a synonym's
+   * right-hand side parses against a private variable map. A constraint over
+   * the signature's own variables has nothing to quantify and goes back to
+   * where it came from. */
+  private rank2(own: Constraint[], left: Type): Type {
+    const outer = new Set<TVar>();
+    for (const t of this.vars.values()) for (const v of typeVars(t)) outer.add(v);
+    const bound: TVar[] = [];
+    const kept: Constraint[] = [];
+    for (const c of own) {
+      const vars = c.types.flatMap((t) => typeVars(t)).filter((v) => !outer.has(v));
+      if (vars.length === 0) {
+        expandedContext.push(c);
+        continue;
+      }
+      kept.push(c);
+      for (const v of vars) if (!bound.includes(v)) bound.push(v);
+    }
+    return kept.length ? { tag: "poly", bound, constraints: kept, type: left } : left;
   }
 
   /** `f :*: g` is `(:*:) f g`. Right-associative, as `GHC.Generics` declares
@@ -516,7 +599,10 @@ function resolveGenericRep(context: Constraint[], type: Type): { context: Constr
     const p = prune(t);
     if (p.tag === "var") return `v${p.v}`;
     if (p.tag === "app") return `(${key(p.fn)} ${key(p.arg)})`;
-    return p.tag === "con" ? `c${p.name}` : `g${p.index}`;
+    if (p.tag === "con") return `c${p.name}`;
+    // A rank-2 argument holds no `Rep a` this pass can solve for, so it is one
+    // opaque key: distinct nodes are distinct types, which is all `key` owes.
+    return p.tag === "gen" ? `g${p.index}` : `p${key(p.type)}`;
   };
   const reps = new Map<string, { arg: Type; rep: Type }>();
   const repOf = (arg: Type): Type => {
@@ -721,6 +807,7 @@ function applySubst(t: Type, subst: ReadonlyMap<TVar, Type>): Type {
   const p = prune(t);
   if (p.tag === "var") return subst.get(p.v) ?? p;
   if (p.tag === "app") return tapp(applySubst(p.fn, subst), applySubst(p.arg, subst));
+  if (p.tag === "poly") return mapPoly(p, (x) => applySubst(x, subst));
   return p;
 }
 
@@ -738,6 +825,10 @@ function freshen(t: Type, subst: Map<TVar, Type>): Type {
     return made;
   }
   if (p.tag === "app") return tapp(freshen(p.fn, subst), freshen(p.arg, subst));
+  if (p.tag === "poly") {
+    for (const v of p.bound) if (!subst.has(v)) subst.set(v, varType(v));
+    return mapPoly(p, (x) => freshen(x, subst));
+  }
   return p;
 }
 
@@ -745,6 +836,8 @@ function showType(t: Type): string {
   const p = prune(t);
   if (p.tag === "con") return p.name;
   if (p.tag === "app") return `(${showType(p.fn)} ${showType(p.arg)})`;
+  if (p.tag === "poly")
+    return `(forall ${p.bound.map((v) => `t${v.id}`).join(" ")}. ${p.constraints.map((c) => showConstraint(c.cls, c.types)).join(", ")} => ${showType(p.type)})`;
   return p.tag === "var" ? `t${p.v.id}` : `g${p.index}`;
 }
 
@@ -839,6 +932,9 @@ class Elaborator {
    * being inferred right now.  A stack, because a given from one alternative's
    * pattern must not discharge a constraint in a sibling's body. */
   private patternGivens: Given[] = [];
+  /** Argument expressions that stand at a rank-2 parameter, and the dictionary
+   * parameters `rewriteBinding` has to abstract them over. */
+  readonly rank2Args = new Map<Expr, string[]>();
   private nextPatternDict = 0;
   private current?: Binding;
   /** What to blame when no binding is under check. Building an instance's
@@ -1057,6 +1153,8 @@ class Elaborator {
       }
       case "app": {
         const fnType = this.infer(e.fn, env);
+        const rank2 = polyParam(fnType);
+        if (rank2) return this.checkRank2(e, rank2.param, rank2.result, env);
         const argType = this.infer(e.arg, env);
         const result = freshVar();
         if (!unify(fnType, tfun(argType, result))) this.report(`type mismatch in application: \`${showType(fnType)}\` applied to \`${showType(argType)}\``, e.span);
@@ -1116,7 +1214,18 @@ class Elaborator {
   private inferVar(e: Extract<Expr, { tag: "var" }>, env: Env, typeArgs: readonly Type[] = []): Type {
     const entry = env.get(e.name);
     if (entry) {
-      if (entry.tag === "mono") return entry.type;
+      if (entry.tag === "mono") {
+        const p = prune(entry.type);
+        if (p.tag !== "poly") return entry.type;
+        // A rank-2 parameter is used at a FRESH instantiation each time, and
+        // the dictionaries its context wants become arguments at this
+        // occurrence - which is precisely why the caller has to hand over a
+        // dictionary-taking function rather than an already-applied one.
+        const subst = new Map(p.bound.map((v) => [v, freshVar()] as const));
+        const constraints = p.constraints.map((c) => ({ cls: c.cls, types: c.types.map((t) => applySubst(t, subst)) }));
+        this.addUse({ kind: "apply", node: e, emit: e.name, constraints });
+        return applySubst(p.type, subst);
+      }
       if (entry.tag === "group") {
         this.addUse({ kind: "group", node: e, target: entry.name });
         return entry.type;
@@ -1138,6 +1247,38 @@ class Elaborator {
     }
     this.report(`\`${e.name}\` is not in scope`, e.span);
     return freshVar();
+  }
+
+  /** Check an argument against a rank-2 parameter, GHC's `tcCheckPolyExpr`.
+   *
+   * Three things happen here and each one is load-bearing:
+   *
+   *   - the parameter's own variables become SKOLEMS, so an argument that only
+   *     works at one functor - `\_ s -> Identity s` - fails to unify instead of
+   *     fixing the caller's `f`;
+   *   - its context becomes a local given, so a constraint the argument raises
+   *     (`toVL`'s own `Functor f`) is solved by a dictionary *parameter* and
+   *     not by whichever instance the skolem happened to look like;
+   *   - the argument node is recorded as needing that parameter, and
+   *     `rewriteBinding` wraps it in the lambda that binds it.
+   *
+   * Without the third, the argument would be elaborated with its dictionary
+   * already applied while the callee applies one of its own: it would
+   * typecheck and mis-run, which is worse than the error it replaces. */
+  private checkRank2(e: Extract<Expr, { tag: "app" }>, param: Extract<Type, { tag: "poly" }>, result: Type, env: Env): Type {
+    const subst = new Map(param.bound.map((v) => [v, tcon(`%r${this.nextPatternDict}${v.id}`)] as const));
+    const constraints = param.constraints.map((c) => ({ cls: c.cls, types: c.types.map((t) => applySubst(t, subst)) }));
+    const names = constraints.map(() => `$dr${this.nextPatternDict++}`);
+    const bound: Given[] = constraints.map((c, i) => ({ cls: c.cls, types: c.types, name: names[i]! }));
+    this.rank2Args.set(e.arg, names);
+    const depth = this.patternGivens.length;
+    this.patternGivens.push(...bound);
+    this.current?.patternGivens.push(...bound);
+    const argType = this.infer(e.arg, env);
+    this.patternGivens.length = depth;
+    if (!unify(argType, applySubst(param.type, subst)))
+      this.report(`type mismatch in application: \`${showType(applySubst(param.type, subst))}\` applied to \`${showType(argType)}\``, e.span);
+    return result;
   }
 
   private inferAlternatives(alts: CaseAlternative[], scrutinee: Type, result: Type, env: Env, span: Span): void {
@@ -1645,6 +1786,18 @@ const applyAll = (fn: Expr, args: Expr[]): Expr => args.reduce(apply, fn);
 const errorExpr = (span: Span): Expr => ({ tag: "var", name: "$dictionaryNotFound", span });
 const spanOf = (e: Expr): Span => e.span;
 const varType = (v: TVar): Type => ({ tag: "var", v });
+
+/** `t` as `poly -> result`, when its first parameter is a rank-2 type. */
+function polyParam(t: Type): { param: Extract<Type, { tag: "poly" }>; result: Type } | undefined {
+  const p = prune(t);
+  if (p.tag !== "app") return undefined;
+  const fn = prune(p.fn);
+  if (fn.tag !== "app") return undefined;
+  const head = prune(fn.fn);
+  if (head.tag !== "con" || head.name !== "->") return undefined;
+  const param = prune(fn.arg);
+  return param.tag === "poly" ? { param, result: p.arg } : undefined;
+}
 
 /** A type's top-level arrow spine. */
 function splitFun(t: Type): { args: Type[]; result: Type } {
@@ -2532,6 +2685,12 @@ export function elaborateProgram(
       .slice(prelude.module.ast.declarations.length)
       .flatMap((d) => (d.tag === "value" || d.tag === "foreign" ? [d.name] : [])),
   );
+  // `integerFromIntPrim` is reachable from no *source* occurrence: the
+  // desugarer introduces it, after this pass, around every machine literal
+  // whose `fromInteger` it could not short-cut (see `boxIntegerLit`). Without
+  // it here the closure drops the one binding the emitted code will call, and
+  // the program fails at run time rather than at compile time.
+  roots.add("integerFromIntPrim");
   return {
     module: { ...user, declarations: reachable(out, roots) },
     diagnostics: elaborator.diagnostics,
@@ -2678,6 +2837,7 @@ function substituteVar(type: Type, from: Type, to: Type): Type {
     const p = prune(t);
     if (p.tag === "var" && target.tag === "var" && p.v === target.v) return to;
     if (p.tag === "app") return tapp(go(p.fn), go(p.arg));
+    if (p.tag === "poly") return mapPoly(p, go);
     return p;
   };
   return go(type);
@@ -3003,6 +3163,17 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
     if (use.kind === "apply") renames.set(use.node, use.emit);
   }
   const rewriteExpr = (e: Expr): Expr => {
+    // An argument standing at a rank-2 parameter is abstracted over the
+    // dictionaries that parameter's context named, so what the callee receives
+    // is a function it can apply at ITS choice of instantiation. Doing this at
+    // the argument node - the same node `checkRank2` recorded - is what keeps
+    // `fromVL (toVL l)` from handing over a `toVL` whose dictionary is spent.
+    const abstract = elaborator.rank2Args.get(e);
+    return abstract === undefined || abstract.length === 0
+      ? rewriteNode(e)
+      : abstract.reduceRight<Expr>((body, parameter) => ({ tag: "lambda", parameter, body, span: e.span }), rewriteNode(e));
+  };
+  const rewriteNode = (e: Expr): Expr => {
     const args = dicts.get(e);
     switch (e.tag) {
       case "var": {

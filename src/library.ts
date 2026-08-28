@@ -648,11 +648,6 @@ splitAt n s =
 reverseSeq :: Seq a -> Seq a
 reverseSeq s = fromList (reverse (seqToList s))
 
-seqToList :: Seq a -> [a]
-seqToList s = case s of
-  Empty -> []
-  (y :<| ys) -> y : seqToList ys
-
 instance Functor Seq where
   fmap f s = case s of
     Empty -> Empty
@@ -685,18 +680,21 @@ instance Monoid (Seq a) where
   "Numeric": `module Numeric where
 
 -- GHC's \\\`readHex\\\` is a \\\`ReadS\\\`: it returns the value and the unconsumed
--- input, and the empty list when the first character is not a hex digit.
-readHex :: [Char] -> [(Int, [Char])]
+-- input, and the empty list when the first character is not a hex digit. Its
+-- type is \\\`(Eq a, Num a) => ReadS a\\\`, and the accumulator's type is the whole
+-- point here: miso reads a \\\`Fingerprint\\\` half as \\\`[(Word64, String)]\\\`, so the
+-- shifting has to happen at 64 bits rather than at \\\`Int\\\` and then widen.
+readHex :: Num a => [Char] -> [(a, [Char])]
 readHex cs = case hexDigit cs of
   Nothing -> []
   Just _ -> readHexGo 0 cs
 
-readHexGo :: Int -> [Char] -> [(Int, [Char])]
+readHexGo :: Num a => a -> [Char] -> [(a, [Char])]
 readHexGo acc cs = case cs of
   [] -> (acc, []) : []
   (c : rest) -> case hexDigit (c : rest) of
     Nothing -> (acc, c : rest) : []
-    Just d -> readHexGo (acc * 16 + d) rest
+    Just d -> readHexGo (acc * 16 + fromIntegral d) rest
 
 hexDigit :: [Char] -> Maybe Int
 hexDigit cs = case cs of
@@ -726,6 +724,34 @@ quotInt (I a) (I b) = I (primIntQuot a b)
 
 remInt :: Int -> Int -> Int
 remInt (I a) (I b) = I (primIntRem a b)
+`,
+  // GHC's \`Natural\` is \`ghc-bignum\`'s own arbitrary-precision unsigned
+  // integer. Here it rides the same \`BigInt\` carrier \`Integer\` does, and stays
+  // a DISTINCT type for the reason \`Data.ByteString\` gives: the two hold
+  // different value sets. A \`Natural\` is never negative, and
+  // \`naturalFromInteger\` is the one place that is enforced - as it is in GHC.
+  "GHC.Natural": `module GHC.Natural (Natural, naturalToInteger, naturalFromInteger) where
+
+data Natural = Natural JSValPrim
+
+naturalToInteger :: Natural -> Integer
+naturalToInteger (Natural b) = Integer b
+
+naturalFromInteger :: Integer -> Natural
+naturalFromInteger (Integer b) =
+  if primBigIntIsNeg b then error "naturalFromInteger: negative" else Natural b
+
+instance Eq Natural where
+  (==) (Natural a) (Natural b) = primBigIntEq a b
+
+instance Ord Natural where
+  (<) (Natural a) (Natural b) = primBigIntLt a b
+  (<=) (Natural a) (Natural b) = primBigIntLe a b
+  (>) (Natural a) (Natural b) = primBigIntGt a b
+  (>=) (Natural a) (Natural b) = primBigIntGe a b
+
+instance Show Natural where
+  showsPrec d (Natural b) s = jsAscii (primBigIntShow b) ++ s
 `,
   // \`Ix\` is a class in GHC; every use miso makes of it is \`inRange\` on a pair
   // of \`Char\`s or \`Int\`s, so the class is the one method those two need.
@@ -1480,7 +1506,7 @@ class Generic a rep | a -> rep where
   // source location of the form) and \`staticPtrKeys\` are not here: nothing in
   // miso reads either, and \`StaticPtrInfo\` would put three strings in every
   // entry to be shown by nothing.
-  "GHC.StaticPtr": `module GHC.StaticPtr (StaticPtr, StaticKey, StaticKey(StaticKey), deRefStaticPtr, staticKey, unsafeLookupStaticPtr, IsStatic) where
+  "GHC.StaticPtr": `module GHC.StaticPtr (StaticPtr, StaticKey, Fingerprint, Fingerprint(Fingerprint), deRefStaticPtr, staticKey, unsafeLookupStaticPtr, IsStatic) where
 
 -- GHC's \\\`IsStatic\\\` is what \\\`static\\\` elaborates through when
 -- \\\`-XExtendedLiterals\\\`-style overloading is in play; the identity instance is
@@ -1491,16 +1517,15 @@ class IsStatic p where
 instance IsStatic StaticPtr where
   fromStaticPtr p = p
 `,
-  // GHC's key is `Fingerprint Word64 Word64`; this frontend's is
-  // `StaticKey Int Int Int Int` (src/prelude.ts says why), and they are the
-  // same 128 bits with the same `Show`. Naming it here is what lets miso's
-  // `instance ToJSVal Fingerprint` land on the key the compiler actually makes.
-  // Only the type: a `Fingerprint w1 w2` written against GHC's two `Word64`
-  // halves still fails, loudly, which is the honest answer while there is no
-  // `Word64`.
-  "GHC.Fingerprint": `module GHC.Fingerprint (Fingerprint) where
+  // GHC's key is `Fingerprint Word64 Word64` and so is this one; `StaticKey`
+  // is the synonym for it, the way GHC has them (src/prelude.ts declares both,
+  // because `static e` needs no import). Naming it here is what lets miso's
+  // `instance ToJSVal Fingerprint` land on the key the compiler actually makes,
+  // and `Fingerprint w1 w2` now builds and matches the same 128 bits GHC's does.
+  "GHC.Fingerprint": `module GHC.Fingerprint (Fingerprint, Fingerprint(Fingerprint), fingerprint0) where
 
-type Fingerprint = StaticKey
+fingerprint0 :: Fingerprint
+fingerprint0 = Fingerprint 0 0
 `,
   "GHC.JS.Prim": `module GHC.JS.Prim where
 import Control.Exception (SomeException(..))
@@ -1783,9 +1808,11 @@ import Foreign.StablePtr
   // Every intermediate stays inside 32 bits (two 16-bit factors reach 2^30),
   // so nothing here rounds.
   //
-  // `Int64` is deliberately absent: it does not fit a JavaScript number, and
-  // aliasing it to `Int` would be wrong without saying so.
-  "Data.Int": `module Data.Int (Int8, Int16, Int32) where
+  // `Int64` is declared in `src/prelude.ts` - a JS `BigInt` behind
+  // `I64 JSValPrim`, wrapped with `BigInt.asIntN` after every operation -
+  // because `Fingerprint` is two `Word64` halves and `Fingerprint` is wired in.
+  // This module is the one that names it, as `GHC.StaticPtr` names `StaticKey`.
+  "Data.Int": `module Data.Int (Int8, Int16, Int32, Int64) where
 
 data Int8 = I8 IntPrim
 data Int16 = I16 IntPrim
@@ -1823,7 +1850,7 @@ instance Num Int8 where
     n -> I8 n
   negate (I8 a) = case narrow8 (primIntNeg a) of
     n -> I8 n
-  fromInteger n = case narrow8 n of
+  fromInteger (Integer b) = case narrow8 (primIntegerToInt b) of
     m -> I8 m
 
 instance Real Int8 where
@@ -1850,7 +1877,7 @@ instance Num Int16 where
     n -> I16 n
   negate (I16 a) = case narrow16 (primIntNeg a) of
     n -> I16 n
-  fromInteger n = case narrow16 n of
+  fromInteger (Integer b) = case narrow16 (primIntegerToInt b) of
     m -> I16 m
 
 instance Real Int16 where
@@ -1873,7 +1900,7 @@ instance Num Int32 where
   (-) (I32 a) (I32 b) = I32 (primIntSub a b)
   (*) (I32 a) (I32 b) = I32 (primIntMul a b)
   negate (I32 a) = I32 (primIntNeg a)
-  fromInteger n = I32 n
+  fromInteger (Integer b) = I32 (primIntegerToInt b)
 
 instance Real Int32 where
   toDoublePrim (I32 a) = primIntToDouble a
@@ -1887,8 +1914,8 @@ instance Show Int32 where
   // number in [0, 2^32), which is why the comparisons and the conversion to
   // \`Double\` need nothing further. \`Word8\`/\`Word16\` narrow after every step.
   //
-  // \`Word64\` is deliberately absent, for the reason \`Int64\` is.
-  "Data.Word": `module Data.Word (Word, Word8, Word16, Word32) where
+  // \`Word64\` is declared in \`src/prelude.ts\`, for the reason \`Int64\` is.
+  "Data.Word": `module Data.Word (Word, Word8, Word16, Word32, Word64) where
 
 data Word = W WordPrim
 data Word8 = W8 WordPrim
@@ -1915,7 +1942,7 @@ instance Num Word where
   (-) (W a) (W b) = W (primWordSub a b)
   (*) (W a) (W b) = W (primWordMul a b)
   negate (W a) = W (primWordSub (primIntToWord 0) a)
-  fromInteger n = W (primIntToWord n)
+  fromInteger (Integer b) = W (primIntToWord (primIntegerToInt b))
 
 instance Real Word where
   toDoublePrim (W a) = primWordToDouble a
@@ -1938,7 +1965,7 @@ instance Num Word8 where
     n -> W8 n
   negate (W8 a) = case mask8 (primWordSub (primIntToWord 0) a) of
     n -> W8 n
-  fromInteger n = case mask8 (primIntToWord n) of
+  fromInteger (Integer b) = case mask8 (primIntToWord (primIntegerToInt b)) of
     m -> W8 m
 
 instance Real Word8 where
@@ -1962,7 +1989,7 @@ instance Num Word16 where
     n -> W16 n
   negate (W16 a) = case mask16 (primWordSub (primIntToWord 0) a) of
     n -> W16 n
-  fromInteger n = case mask16 (primIntToWord n) of
+  fromInteger (Integer b) = case mask16 (primIntToWord (primIntegerToInt b)) of
     m -> W16 m
 
 instance Real Word16 where
@@ -1982,7 +2009,7 @@ instance Num Word32 where
   (-) (W32 a) (W32 b) = W32 (primWordSub a b)
   (*) (W32 a) (W32 b) = W32 (primWordMul a b)
   negate (W32 a) = W32 (primWordSub (primIntToWord 0) a)
-  fromInteger n = W32 (primIntToWord n)
+  fromInteger (Integer b) = W32 (primIntToWord (primIntegerToInt b))
 
 instance Real Word32 where
   toDoublePrim (W32 a) = primWordToDouble a
