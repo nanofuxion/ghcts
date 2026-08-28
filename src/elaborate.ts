@@ -66,10 +66,19 @@ import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { classMethodNames, renameDeclarations, renameValue, resolveProgram, type Scopes } from "./modules.js";
 import { error } from "./diagnostics.js";
 import { constructorTable, derivedEqMethod, derivedGenericSource, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
-import { PRELUDE_SOURCE } from "./prelude.js";
+import { PRELUDE_SOURCE, RTS_SEATS } from "./prelude.js";
 import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
 import type { Diagnostic } from "./types.js";
+
+/** The name this pass gives the user's own `main` once it wraps it.
+ *
+ * GHC has two bindings here - `Main.main`, the user's, and `:Main.main`, the
+ * `runMainIO` wrapper the RTS enters - and they live in different modules.
+ * Elaboration produces one flat namespace, so the two need distinct names;
+ * `src/build.ts` puts them back into GHC's two modules, where the user's is
+ * called `main` again. */
+export const USER_MAIN = "$mainIO";
 
 export interface ElaborateResult {
   module: Module;
@@ -2663,7 +2672,7 @@ export function elaborateProgram(
       out.push(decl);
       continue;
     }
-    out.push({ ...decl, name: "$mainIO" });
+    out.push({ ...decl, name: USER_MAIN });
     // GHC registers the static pointer table from module initialisers, which
     // run before `main`. The JS backend's initialisers are emitted by the
     // *code generator*, which this frontend does not reach, so the same
@@ -2675,7 +2684,7 @@ export function elaborateProgram(
     const body = staticEntries.reduceRight<Expr>(
       (rest, name) =>
         apply(apply(variable("sptRegisterThen", decl.span), variable(name, decl.span)), rest),
-      variable("$mainIO", decl.span),
+      variable(USER_MAIN, decl.span),
     );
     out.push(valueDecl("main", [], apply(variable("runMainIO", decl.span), body), decl.span));
   }
@@ -2691,6 +2700,10 @@ export function elaborateProgram(
   // it here the closure drops the one binding the emitted code will call, and
   // the program fails at run time rather than at compile time.
   roots.add("integerFromIntPrim");
+  // The RTS seats are reachable from no Haskell occurrence at all - the JS RTS
+  // is the only thing that names them, and only once `h$main` runs, which is
+  // only when there is an entry point to wrap.
+  if (wrapMain) for (const seat of RTS_SEATS) roots.add(seat.binding);
   return {
     module: { ...user, declarations: reachable(out, roots) },
     diagnostics: elaborator.diagnostics,

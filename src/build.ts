@@ -14,15 +14,19 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { parseModule } from "./parser.js";
-import { elaborateProgram } from "./elaborate.js";
+import { elaborateProgram, USER_MAIN } from "./elaborate.js";
+import { RTS_SEATS } from "./prelude.js";
 import { desugarModule } from "./desugar.js";
 import { coreToStg } from "./core-to-stg.js";
-import { stgToJS } from "./stg-js/codegen.js";
-import { link } from "./linker/linker.js";
-import { defaultStgToJSConfig } from "./stg-js/types.js";
+import { genUnits, stgToJS } from "./stg-js/codegen.js";
+import { link, type ModuleCode } from "./linker/linker.js";
+import { runG, type IdCache } from "./stg-js/monad.js";
+import { defaultStgToJSConfig, type StgToJSConfig } from "./stg-js/types.js";
 import { error } from "./diagnostics.js";
 import type { Diagnostic, GhctsConfig } from "./types.js";
 import type { Module } from "./ast.js";
+import type { StgBinding } from "./stg.js";
+import type { Ident } from "./js/ident.js";
 
 export interface BuildResult {
   diagnostics: Diagnostic[];
@@ -96,6 +100,79 @@ export async function loadProgram(
   return { modules, diagnostics };
 }
 
+/** Put the program back into the modules GHC keeps its pieces in.
+ *
+ * GHC compiles `Main.hs` to a module `Main` and *also* generates a hidden
+ * module literally named `:Main`, holding one binding,
+ * `:Main.main = runMainIO Main.main`. That wrapper is what the RTS enters:
+ * `runMainJS` is `h$main(h$mainZCZCMainzimain)`, and `ZCZCMain` is
+ * `zEncode("main") ++ "ZC" ++ zEncode(":Main")`. Emitting the whole program as
+ * one module called `Main` therefore names the wrapper `h$mainZCMainzimain`
+ * and leaves the entry line pointing at nothing - the program links but cannot
+ * start. The same is true of `RTS_SEATS`, the ghc-internal closures `h$main`
+ * and `h$Thread` name outright.
+ *
+ * Elaboration produces one flat namespace, so it builds the wrapper as `main`
+ * and renames the user's own action to `USER_MAIN`; the split hands both names
+ * back, `Main.main` being the user's, exactly as GHC has it.
+ *
+ * The subtlety is the reference *across* a split. `makeIdentForId` names every
+ * Id after the module being compiled, because a ghcts Binder carries no
+ * defining module ("GHC uses the Id's own defining module when it is
+ * exported"), so an independent second `stgToJS` call emits the wrapper's
+ * references to `Main`'s bindings as `h$mainZCZCMainzi...`, which nothing
+ * defines. Seeding the second run's Id cache with the one `Main`'s compilation
+ * built supplies exactly the missing fact: an Id already named while compiling
+ * `Main` keeps that name. `gsIdentMint` comes with it because it records the
+ * order symbols were interned in - process-wide in GHC - and that order decides
+ * how `globalOccs` sorts. */
+function ghcModules(config: StgToJSConfig, root: string, bindings: StgBinding[]): ModuleCode[] {
+  const mainMod = { unitId: "main", moduleName: root };
+  const named = (b: StgBinding, n: string): boolean => b.tag === "StgNonRec" && b.binder.name === n;
+  const rename = (b: StgBinding, n: string): StgBinding =>
+    b.tag === "StgNonRec" ? { ...b, binder: { ...b.binder, name: n } } : b;
+
+  // Where each binding goes and what GHC calls it once it is there.
+  const moved = [
+    { module: { unitId: "main", moduleName: ":Main" }, from: "main", name: "main" },
+    ...RTS_SEATS.map((s) => ({ module: { unitId: s.unitId, moduleName: s.moduleName }, from: s.binding, name: s.name })),
+  ].flatMap((m) => {
+    const binding = bindings.find((b) => named(b, m.from));
+    return binding ? [{ module: m.module, binding: rename(binding, m.name), from: m.from }] : [];
+  });
+
+  // Without the wrapper `main` is not an `IO` action, there is nothing for the
+  // RTS to enter, and the seats the elaborator leaves out are not needed.
+  if (!moved.some((m) => m.from === "main") || !bindings.some((b) => named(b, USER_MAIN))) {
+    return [{ module: mainMod, units: stgToJS(config, mainMod, bindings) }];
+  }
+
+  const program = bindings
+    .filter((b) => !moved.some((m) => named(b, m.from)))
+    .map((b) => (named(b, USER_MAIN) ? rename(b, "main") : b));
+
+  let idents: IdCache = new Map();
+  let mint: Map<Ident, number> = new Map();
+  const mainUnits = runG(config, mainMod, new Map(), (gs) => {
+    const units = genUnits(gs, mainMod, program);
+    idents = gs.gsIdents;
+    mint = gs.gsIdentMint;
+    return units;
+  });
+
+  return [
+    { module: mainMod, units: mainUnits },
+    ...moved.map((m) => ({
+      module: m.module,
+      units: runG(config, m.module, new Map(), (gs) => {
+        for (const [key, ident] of idents) gs.gsIdents.set(key, ident);
+        for (const [ident, order] of mint) gs.gsIdentMint.set(ident, order);
+        return genUnits(gs, m.module, [m.binding]);
+      }),
+    })),
+  ];
+}
+
 export async function build(options: {
   project: string;
   config: GhctsConfig;
@@ -125,8 +202,7 @@ export async function build(options: {
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
   const stg = coreToStg(desugared.program);
-  const units = stgToJS(stgConfig, { unitId: "main", moduleName: root }, stg.bindings);
-  const jsexe = link(stgConfig, [{ module: { unitId: "main", moduleName: root }, units }]);
+  const jsexe = link(stgConfig, ghcModules(stgConfig, root, stg.bindings));
 
   if (options.emit) {
     const out = join(project, config.outDir, "jsexe");

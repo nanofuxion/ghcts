@@ -30,6 +30,27 @@
  * returned in registers, so a bind step allocates nothing. See the comment on
  * the declaration below.
  */
+/** The ghc-internal closures GHC's JS RTS names by symbol, and the Prelude
+ * binding that fills each seat.
+ *
+ * A symbol is nothing but a unit, a module and a name (`mkJsSymbol`), so a
+ * ghcts binding emitted under GHC's module *is* GHC's closure as far as the
+ * RTS can tell. `src/build.ts` does the emitting and `src/elaborate.ts` keeps
+ * these bindings alive through the reachability pass, since nothing in the
+ * program refers to them - only the RTS does. */
+export const RTS_SEATS: ReadonlyArray<{
+  /** The Prelude binding that fills the seat. */
+  binding: string;
+  unitId: string;
+  moduleName: string;
+  name: string;
+}> = [
+  { binding: "rtsReportError", unitId: "ghc-internal", moduleName: "GHC.Internal.Conc.Sync", name: "reportError" },
+  { binding: "rtsTopHandler", unitId: "ghc-internal", moduleName: "GHC.Internal.TopHandler", name: "topHandler" },
+  { binding: "rtsHFlush", unitId: "ghc-internal", moduleName: "GHC.Internal.IO.Handle", name: "hFlush" },
+  { binding: "rtsStdout", unitId: "ghc-internal", moduleName: "GHC.Internal.IO.Handle.FD", name: "stdout" },
+];
+
 export const PRELUDE_SOURCE = `module GHCTS.Prelude where
 
 data Bool = False | True
@@ -599,11 +620,57 @@ unsafePerformIO :: IO a -> a
 unsafePerformIO m = case unIO m primRealWorld of
   IOResult s a -> a
 
--- GHC's real entry point is \`:Main.main = runMainIO Main.main\`, and
--- \`src/elaborate.ts\` emits that same wrapper, so \`h$main(...Main.main)\` -
--- plain entry - is what runs the program.
-runMainIO :: IO a -> a
-runMainIO m = unsafePerformIO m
+-- GHC's real entry point is \`:Main.main = runMainIO Main.main\`;
+-- \`src/elaborate.ts\` builds that wrapper and \`src/build.ts\` emits it as the
+-- \`:Main\` module the RTS names.
+--
+-- \`h$main\` does not merely *enter* the wrapper. It enters it and then applies
+-- the result with \`h$ap_1_0\` - one argument occupying no register - because
+-- GHC's \`IO a\` IS the state-token function and its token is a void type. So
+-- the wrapper has to leave a function of that shape behind: \`unIO\`, which
+-- peels ghcts's \`IO\` constructor, and not \`unsafePerformIO\`, which would run
+-- the action during entry and hand \`h$ap_1_0\` a value it cannot apply.
+--
+-- \`IOResult\` is an unboxed tuple whose token half is erased, so the applied
+-- call returns the action's result in R1, exactly as GHC's does.
+runMainIO :: IO a -> RealWorld -> IOResult a
+runMainIO m s = unIO m s
+
+-- GHC's JS RTS names four ghc-internal closures directly, as globals, and a
+-- reference to an undefined global is a ReferenceError rather than
+-- \`undefined\` - so a bundle that does not define them cannot even start.
+-- \`h$Thread\` seats \`Conc.Sync.reportError\` under the thread's top-level
+-- \`h$catch_e\` frame; outside a browser \`h$main\` replaces it with
+-- \`TopHandler.topHandler\` and pushes \`h$flushStdout\`, which is
+-- \`IO.Handle.hFlush\` applied to \`IO.Handle.FD.stdout\`. A ghcts program links
+-- no ghc-internal, so the seats are filled from Haskell here and
+-- \`src/build.ts\` emits each one under the module GHC keeps it in - a symbol
+-- being nothing but a module and a name.
+--
+-- Both handlers are the shape \`h$catch_e\` applies: the exception and the
+-- erased state token. \`topHandler\` is the one an uncaught exception reaches
+-- in a real program, and GHC's exits non-zero, so this one does too - by
+-- setting the exit code rather than calling \`h$exitProcess\`, which would cut
+-- the RTS off mid-unwind.
+foreign import javascript unsafe "((e) => { console.error('ghcts: uncaught exception:', e); return 0; })" primReportUncaught :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((e) => { console.error('ghcts: uncaught exception:', e); if (typeof process !== 'undefined') process.exitCode = 1; return 0; })" primDieUncaught :: JSValPrim -> IntPrim
+
+rtsReportError :: JSValPrim -> RealWorld -> IOResult ()
+rtsReportError e s = case primReportUncaught e of
+  _ -> IOResult s ()
+
+rtsTopHandler :: JSValPrim -> RealWorld -> IOResult ()
+rtsTopHandler e s = case primDieUncaught e of
+  _ -> IOResult s ()
+
+-- ghcts writes through \`console.log\`, which is not buffered, so there is
+-- nothing for \`hFlush\` to do; the seat still has to be the two-argument
+-- closure \`h$flushStdout_e\` applies to the handle and then to the token.
+rtsHFlush :: JSValPrim -> RealWorld -> IOResult ()
+rtsHFlush h s = IOResult s ()
+
+rtsStdout :: ()
+rtsStdout = ()
 
 -- ------------------------------------------------------------- functions ---
 

@@ -27,7 +27,7 @@ import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
 import { defaultStgToJSConfig } from "../dist/stg-js/types.js";
 import { parseModule } from "../dist/parser.js";
-import { elaborateProgram } from "../dist/elaborate.js";
+import { elaborateProgram, USER_MAIN } from "../dist/elaborate.js";
 import { desugarModule } from "../dist/desugar.js";
 import { coreToStg } from "../dist/core-to-stg.js";
 import { formatDiagnostic } from "../dist/diagnostics.js";
@@ -61,29 +61,39 @@ function h$runEntry(c) {
   while (c !== null) c = c();
   return h$testResult;
 }
+/** The runMainIO wrapper leaves a closure of GHC's own shape behind: entering
+ * it yields the IO action, which h$main then applies to one void argument with
+ * h$ap_1_0. These two frames are that, exactly as h$main and h$forkThread
+ * stack it - h$return loads the closure into R1 and hands control to h$ap_1_0.
+ * A program with no IO main has no wrapper and is entered directly. */
+function h$runWrapped(c) {
+  h$sp = 3;
+  h$stack[0] = h$stopFrame;
+  h$stack[1] = h$ap_1_0;
+  h$stack[2] = c;
+  h$stack[3] = h$return;
+  h$testResult = undefined;
+  for (var f = h$stack[h$sp]; f !== null; ) f = f();
+  // IOResult is an unboxed tuple, and matching one binds the result slot
+  // without entering it, so an action's result arrives as a thunk. GHC drops
+  // it - main is IO () - but a test wants to read it, so force it here.
+  var r = h$testResult;
+  return r !== null && typeof r === "object" ? h$forceClosure(r) : r;
+}
 /** A program that forks, blocks or delays needs the RTS's own scheduler, not
  * the bare trampoline above: only a real h$Thread can be put on an MVar's
  * wait queue and woken again. h$forkThread + h$mainLoop is exactly what
  * h$main does, minus base's top handler and stdout flush - neither of which
  * exists here. The thread constructor names ghc-internal's reportError
- * closure, which a ghcts program does not link, so it is stubbed. */
+ * closure; src/build.ts emits that seat, but this harness links one module
+ * rather than a bundle, so it is stubbed. */
 var h$ghczminternalZCGHCziInternalziConcziSynczireportError = null;
-/** h$forkThread starts a thread with h$ap_1_0, which applies its closure to
- * one void argument - right for GHC's main, whose type is State# -> (# #),
- * and wrong for this frontend's, which runMainIO has already reduced to a
- * plain thunk. So the start frame here simply ENTERS the closure. */
-function h$enterFrame() {
-  h$r1 = h$stack[h$sp - 1];
-  h$sp -= 2;
-  return h$r1.f;
-}
-h$enterFrame.f = h$enterFrame;
-h$o(h$enterFrame, -1, 0, 0, 0, null);
 function h$runThreaded(c) {
   var t = new h$Thread();
-  t.stack[4] = c;
-  t.stack[5] = h$enterFrame;
-  t.sp = 5;
+  t.stack[4] = h$ap_1_0;
+  t.stack[5] = c;
+  t.stack[6] = h$return;
+  t.sp = 6;
   h$wakeupThread(t);
   h$mainLoop();
   // The scheduler re-arms itself on a timer forever; without this the process
@@ -123,6 +133,8 @@ function compile(sources, file) {
   return {
     emitted,
     symbol: unit.luObjBlock.oiSymbols[0],
+    // An IO main is wrapped, and the wrapper is applied rather than entered.
+    wrapped: stg.bindings.some((b) => b.tag === "StgNonRec" && b.binder.name === USER_MAIN),
     diagnostics: [...elaborated.diagnostics, ...desugared.diagnostics],
   };
 }
@@ -131,10 +143,12 @@ function compile(sources, file) {
  * only way to observe an `IO ()`: its value carries nothing, so the proof that
  * it ran has to come from the effect it had. Property order in the object
  * literal is what sequences the two. */
-function run(emitted, symbol, probe, threaded) {
+function run(emitted, symbol, probe, threaded, wrapped) {
   const enter = threaded
     ? `h$runThreaded(${symbol})`
-    : `h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; })`;
+    : wrapped
+      ? `h$runWrapped(${symbol})`
+      : `h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; })`;
   // Indirect eval so the RTS's top-level `var h$...` land on globalThis.
   const entry = (0, eval)(
     `${rts}\n${bootstrap}\n${emitted}\n(function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
@@ -3553,7 +3567,7 @@ for (const program of cases) {
   for (const d of compiled.diagnostics) console.log(`        ${formatDiagnostic(d)}`);
   if (show) console.log(`--- ${program.name} (${compiled.symbol}) ---\n${compiled.emitted}\n`);
   try {
-    const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded);
+    const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded, compiled.wrapped);
     if (program.throws !== undefined) {
       console.log(`  FAIL  ${program.name}: expected a \`${program.throws}\` exception, got ${JSON.stringify(result)}`);
       failures++;
