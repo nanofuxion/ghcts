@@ -299,6 +299,7 @@ class Renamer {
       case "int":
       case "double":
       case "string":
+      case "char":
       case "unit":
       case "jsQuote":
         return expr;

@@ -169,6 +169,8 @@ class Desugarer {
         return { tag: "Lit", lit: int(e.value) };
       case "double":
         return { tag: "Lit", lit: { tag: "LitDouble", value: e.value } };
+      case "char":
+        return { tag: "Con", con: this.lookupCon("C", 1), args: [{ tag: "Lit", lit: { tag: "LitChar", value: e.value } }] };
       case "string":
         // A `String` is `[Char]`, so a literal is the list it denotes. The
         // backend's `LitString` is an address, which is a different type.
@@ -420,6 +422,13 @@ class Desugarer {
 
     const alts: CoreAlt[] = order.map(({ key, pattern }) => {
       const group = groups.get(key)!;
+      if (pattern.tag === "char") {
+        return {
+          con: { tag: "LitAlt", lit: { tag: "LitChar", value: pattern.value } },
+          binders: [],
+          body: this.matchGroup(subjects, group, column, [], scope, fallback),
+        };
+      }
       if (pattern.tag === "int") {
         return {
           con: { tag: "LitAlt", lit: int(pattern.value) },
@@ -568,7 +577,7 @@ function flattenApp(e: Expr): [Expr, Expr[]] {
  * report everything else it finds. */
 const isRefutable = (p: Pattern | undefined): boolean =>
   p !== undefined &&
-  (p.tag === "int" || p.tag === "string" || p.tag === "con" || p.tag === "record");
+  (p.tag === "int" || p.tag === "string" || p.tag === "char" || p.tag === "con" || p.tag === "record");
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
@@ -577,7 +586,7 @@ const patternSpan = (p: Pattern): Span => p.span;
 const patternConName = (p: Pattern): string => (p.tag === "con" ? p.name : p.tag === "record" ? p.name : "?");
 const patternArity = (p: Pattern): number => (p.tag === "con" ? p.args.length : 0);
 const patternKey = (p: Pattern): string =>
-  p.tag === "int" ? `#${p.value}` : p.tag === "string" ? `s${p.value}` : `c${patternConName(p)}`;
+  p.tag === "int" ? `#${p.value}` : p.tag === "string" ? `s${p.value}` : p.tag === "char" ? `q${p.value}` : `c${patternConName(p)}`;
 
 function bindingsOf(subjects: Binder[], patterns: Pattern[]): Array<[string, Binder]> {
   const out: Array<[string, Binder]> = [];

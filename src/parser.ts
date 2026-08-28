@@ -1423,7 +1423,8 @@ class Parser {
       return { tag: "int", value: Number(t.text), span: t.span };
     if (t.kind === "float")
       return { tag: "double", value: Number(t.text), span: t.span };
-    if (t.kind === "string" || t.kind === "char")
+    if (t.kind === "char") return { tag: "char", value: t.text, span: t.span };
+    if (t.kind === "string")
       return { tag: "string", value: t.text, span: t.span };
     if (t.kind === "quasiquote")
       return { tag: "jsQuote", body: t.text, quoter: t.quoter, span: t.span };
@@ -1891,7 +1892,8 @@ class Parser {
     }
     if (token.kind === "int")
       return { tag: "int", value: Number(token.text), span: token.span };
-    if (token.kind === "string" || token.kind === "char")
+    if (token.kind === "char") return { tag: "char", value: token.text, span: token.span };
+    if (token.kind === "string")
       return { tag: "string", value: token.text, span: token.span };
     if (token.kind === "ident") {
       if (token.text === "_") return { tag: "wild", span: token.span };

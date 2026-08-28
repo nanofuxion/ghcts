@@ -1036,6 +1036,697 @@ throwStep s e = case jsThrow e of
 `,
   "System.IO.Unsafe": `module System.IO.Unsafe (unsafePerformIO) where
 `,
+  // ------------------------------------------------------------------ mtl ---
+  //
+  // Every transformer below is ordinary Haskell, and deliberately so. A
+  // transformer has no representation worth speaking of - it is a newtype over
+  // a function - and its entire meaning is its \`Functor\`/\`Applicative\`/\`Monad\`
+  // instances: which effect runs before which, what \`>>=\` threads, and what a
+  // short circuit skips. None of that is expressible as a JavaScript shortcut,
+  // and anything written in JavaScript here would have to reimplement lazy
+  // evaluation to get it right.
+  //
+  // WHAT IS MISSING, AND WHY. mtl's \`MonadState\`/\`MonadReader\`/\`MonadWriter\`
+  // are multi-parameter classes with functional dependencies (\`m -> s\`), and
+  // \`src/elaborate.ts\` elaborates single-parameter classes only. So \`get\`,
+  // \`ask\` and \`tell\` here are ordinary functions at their own transformer,
+  // exactly as \`Control.Monad.Trans.State\` (transformers, not mtl) defines
+  // them. Code that is polymorphic in the monad - miso's own \`Miso.Lens\`
+  // operators, whose signatures read \`MonadState record m =>\` - therefore
+  // still does not typecheck; a class faked with one parameter would have to
+  // leave the state type free in the method signature, which the skolemised
+  // instance-method check correctly rejects.
+  //
+  // \`MonadTrans\` is missing for the same shape of reason: \`lift :: Monad m =>
+  // m a -> t m a\` puts a constraint on a *method*, which a class declaration
+  // here cannot carry. Nothing in miso calls \`lift\`.
+  "Data.Functor.Identity": `module Data.Functor.Identity (runIdentity) where
+
+newtype Identity a = Identity a
+
+runIdentity :: Identity a -> a
+runIdentity (Identity x) = x
+
+instance Functor Identity where
+  fmap f m = Identity (f (runIdentity m))
+
+instance Applicative Identity where
+  pure x = Identity x
+  (<*>) f m = Identity (runIdentity f (runIdentity m))
+
+-- \\\`k\\\` is applied to the *unforced* contents, so \\\`runIdentity (undefined >>= f)\\\`
+-- is \\\`f undefined\\\` and not bottom - which is what makes \\\`Identity\\\` the lazy
+-- base monad the pure \\\`State\\\`/\\\`Writer\\\`/\\\`RWS\\\` are defined over.
+instance Monad Identity where
+  (>>=) m k = k (runIdentity m)
+
+instance Eq a => Eq (Identity a) where
+  (==) a b = runIdentity a == runIdentity b
+`,
+  "Control.Monad.Identity": `module Control.Monad.Identity (module Data.Functor.Identity) where
+import Data.Functor.Identity
+`,
+  "Control.Monad.Reader": `module Control.Monad.Reader (runReaderT, runReader, ask, asks, reader, local, withReaderT) where
+import Data.Functor.Identity
+
+newtype ReaderT r m a = ReaderT (r -> m a)
+
+type Reader r = ReaderT r Identity
+
+runReaderT :: ReaderT r m a -> r -> m a
+runReaderT (ReaderT f) r = f r
+
+runReader :: Reader r a -> r -> a
+runReader m r = runIdentity (runReaderT m r)
+
+ask :: Monad m => ReaderT r m r
+ask = ReaderT (\\r -> pure r)
+
+asks :: Monad m => (r -> a) -> ReaderT r m a
+asks f = ReaderT (\\r -> pure (f r))
+
+reader :: Monad m => (r -> a) -> ReaderT r m a
+reader f = asks f
+
+local :: (r -> r) -> ReaderT r m a -> ReaderT r m a
+local f m = ReaderT (\\r -> runReaderT m (f r))
+
+withReaderT :: (r2 -> r) -> ReaderT r m a -> ReaderT r2 m a
+withReaderT f m = ReaderT (\\r -> runReaderT m (f r))
+
+instance Functor m => Functor (ReaderT r m) where
+  fmap f m = ReaderT (\\r -> fmap f (runReaderT m r))
+
+instance Applicative m => Applicative (ReaderT r m) where
+  pure x = ReaderT (\\r -> pure x)
+  (<*>) f m = ReaderT (\\r -> runReaderT f r <*> runReaderT m r)
+
+instance Monad m => Monad (ReaderT r m) where
+  (>>=) m k = ReaderT (\\r -> readerBind m k r)
+
+readerBind :: Monad m => ReaderT r m a -> (a -> ReaderT r m b) -> r -> m b
+readerBind m k r = runReaderT m r >>= (\\a -> runReaderT (k a) r)
+
+-- The environment is not an effect, so lifting is just ignoring it. What this
+-- instance buys is that a \\\`liftIO\\\` inside a \\\`ReaderT r IO\\\` runs at the point
+-- the \\\`do\\\` block reaches it, in the base monad's own order.
+instance MonadFail m => MonadFail (ReaderT r m) where
+  fail msg = ReaderT (\\r -> fail msg)
+
+instance MonadIO m => MonadIO (ReaderT r m) where
+  liftIO io = ReaderT (\\r -> liftIO io)
+`,
+  "Control.Monad.State": `module Control.Monad.State (runStateT, runState, evalState, execState, evalStateT, execStateT, get, put, state, gets, modify, modify', withState) where
+import Data.Functor.Identity
+
+newtype StateT s m a = StateT (s -> m (a, s))
+
+type State s = StateT s Identity
+
+runStateT :: StateT s m a -> s -> m (a, s)
+runStateT (StateT f) s = f s
+
+runState :: State s a -> s -> (a, s)
+runState m s = runIdentity (runStateT m s)
+
+evalState :: State s a -> s -> a
+evalState m s = fst (runState m s)
+
+execState :: State s a -> s -> s
+execState m s = snd (runState m s)
+
+evalStateT :: Monad m => StateT s m a -> s -> m a
+evalStateT m s = runStateT m s >>= (\\p -> pure (fst p))
+
+execStateT :: Monad m => StateT s m a -> s -> m s
+execStateT m s = runStateT m s >>= (\\p -> pure (snd p))
+
+get :: Monad m => StateT s m s
+get = StateT (\\s -> pure (s, s))
+
+put :: Monad m => s -> StateT s m ()
+put s = StateT (\\_ -> pure ((), s))
+
+state :: Monad m => (s -> (a, s)) -> StateT s m a
+state f = StateT (\\s -> pure (f s))
+
+gets :: Monad m => (s -> a) -> StateT s m a
+gets f = StateT (\\s -> pure (f s, s))
+
+-- Lazy, as GHC's is: the new state is a thunk, so \\\`modify (+1)\\\` on a state
+-- nobody looks at costs nothing and never diverges.
+modify :: Monad m => (s -> s) -> StateT s m ()
+modify f = StateT (\\s -> pure ((), f s))
+
+-- \\\`modify'\\\` differs from \\\`modify\\\` only in the \\\`seq\\\`, and that is the whole
+-- point of it: without forcing, a long fold leaves a chain of thunks in the
+-- state instead of a value.
+modify' :: Monad m => (s -> s) -> StateT s m ()
+modify' f = StateT (\\s -> modifyStrictStep (f s))
+
+modifyStrictStep :: Monad m => s -> m ((), s)
+modifyStrictStep s = seq s (pure ((), s))
+
+withState :: (s -> s) -> StateT s m a -> StateT s m a
+withState f m = StateT (\\s -> runStateT m (f s))
+
+instance Functor m => Functor (StateT s m) where
+  fmap f m = StateT (\\s -> fmap (\\p -> stateMapStep f p) (runStateT m s))
+
+stateMapStep :: (a -> b) -> (a, s) -> (b, s)
+stateMapStep f p = case p of
+  (a, s) -> (f a, s)
+
+-- Written through the base monad's \\\`>>=\\\` rather than as \\\`ap\\\`, so the
+-- \\\`Applicative\\\` dictionary does not have to reach back through the \\\`Monad\\\`
+-- one that names it as a superclass.
+instance Monad m => Applicative (StateT s m) where
+  pure x = StateT (\\s -> pure (x, s))
+  (<*>) f m = StateT (\\s -> stateAp f m s)
+
+stateAp :: Monad m => StateT s m (a -> b) -> StateT s m a -> s -> m (b, s)
+stateAp f m s = runStateT f s >>= (\\p -> stateApStep m p)
+
+stateApStep :: Monad m => StateT s m a -> (a -> b, s) -> m (b, s)
+stateApStep m p = case p of
+  (g, s) -> runStateT m s >>= (\\q -> stateApFinish g q)
+
+stateApFinish :: Monad m => (a -> b) -> (a, s) -> m (b, s)
+stateApFinish g q = case q of
+  (a, s) -> pure (g a, s)
+
+-- The state threads left to right: \\\`m\\\` runs on the incoming state and \\\`k\\\`
+-- runs on what \\\`m\\\` left. Matching the pair is what orders them.
+instance Monad m => Monad (StateT s m) where
+  (>>=) m k = StateT (\\s -> stateBind m k s)
+
+stateBind :: Monad m => StateT s m a -> (a -> StateT s m b) -> s -> m (b, s)
+stateBind m k s = runStateT m s >>= (\\p -> stateBindStep k p)
+
+stateBindStep :: Monad m => (a -> StateT s m b) -> (a, s) -> m (b, s)
+stateBindStep k p = case p of
+  (a, s) -> runStateT (k a) s
+
+instance MonadFail m => MonadFail (StateT s m) where
+  fail msg = StateT (\\s -> fail msg)
+
+instance MonadIO m => MonadIO (StateT s m) where
+  liftIO io = StateT (\\s -> stateLiftIO io s)
+
+stateLiftIO :: MonadIO m => IO a -> s -> m (a, s)
+stateLiftIO io s = liftIO io >>= (\\a -> pure (a, s))
+`,
+  "Control.Monad.Writer": `module Control.Monad.Writer (runWriterT, runWriter, execWriter, execWriterT, writer, tell, listen, censor) where
+import Data.Functor.Identity
+
+newtype WriterT w m a = WriterT (m (a, w))
+
+type Writer w = WriterT w Identity
+
+runWriterT :: WriterT w m a -> m (a, w)
+runWriterT (WriterT m) = m
+
+runWriter :: Writer w a -> (a, w)
+runWriter m = runIdentity (runWriterT m)
+
+execWriter :: Writer w a -> w
+execWriter m = snd (runWriter m)
+
+execWriterT :: Monad m => WriterT w m a -> m w
+execWriterT m = runWriterT m >>= (\\p -> pure (snd p))
+
+writer :: Applicative m => (a, w) -> WriterT w m a
+writer p = WriterT (pure p)
+
+tell :: Applicative m => w -> WriterT w m ()
+tell w = WriterT (pure ((), w))
+
+listen :: Monad m => WriterT w m a -> WriterT w m (a, w)
+listen m = WriterT (runWriterT m >>= (\\p -> listenStep p))
+
+listenStep :: Monad m => (a, w) -> m ((a, w), w)
+listenStep p = case p of
+  (a, w) -> pure ((a, w), w)
+
+censor :: Monad m => (w -> w) -> WriterT w m a -> WriterT w m a
+censor f m = WriterT (runWriterT m >>= (\\p -> censorStep f p))
+
+censorStep :: Monad m => (w -> w) -> (a, w) -> m (a, w)
+censorStep f p = case p of
+  (a, w) -> pure (a, f w)
+
+instance Functor m => Functor (WriterT w m) where
+  fmap f m = WriterT (fmap (\\p -> writerMapStep f p) (runWriterT m))
+
+writerMapStep :: (a -> b) -> (a, w) -> (b, w)
+writerMapStep f p = case p of
+  (a, w) -> (f a, w)
+
+instance (Monoid w, Monad m) => Applicative (WriterT w m) where
+  pure x = WriterT (pure (x, mempty))
+  (<*>) f m = WriterT (writerAp f m)
+
+writerAp :: (Monoid w, Monad m) => WriterT w m (a -> b) -> WriterT w m a -> m (b, w)
+writerAp f m = runWriterT f >>= (\\p -> writerApStep m p)
+
+writerApStep :: (Monoid w, Monad m) => WriterT w m a -> (a -> b, w) -> m (b, w)
+writerApStep m p = case p of
+  (g, w) -> runWriterT m >>= (\\q -> writerApFinish g w q)
+
+writerApFinish :: (Monoid w, Monad m) => (a -> b) -> w -> (a, w) -> m (b, w)
+writerApFinish g w q = case q of
+  (a, w2) -> pure (g a, w <> w2)
+
+-- The output is appended in the order the actions ran, which is the only thing
+-- a \\\`Writer\\\` promises and the only thing that makes \\\`tell\\\` useful: miso reads
+-- back the \\\`[Schedule]\\\` an \\\`Effect\\\` accumulated and runs it in that order.
+instance (Monoid w, Monad m) => Monad (WriterT w m) where
+  (>>=) m k = WriterT (writerBind m k)
+
+writerBind :: (Monoid w, Monad m) => WriterT w m a -> (a -> WriterT w m b) -> m (b, w)
+writerBind m k = runWriterT m >>= (\\p -> writerBindStep k p)
+
+writerBindStep :: (Monoid w, Monad m) => (a -> WriterT w m b) -> (a, w) -> m (b, w)
+writerBindStep k p = case p of
+  (a, w) -> runWriterT (k a) >>= (\\q -> writerBindFinish w q)
+
+writerBindFinish :: (Monoid w, Monad m) => w -> (b, w) -> m (b, w)
+writerBindFinish w q = case q of
+  (b, w2) -> pure (b, w <> w2)
+
+instance (Monoid w, MonadFail m) => MonadFail (WriterT w m) where
+  fail msg = WriterT (fail msg)
+
+instance (Monoid w, MonadIO m) => MonadIO (WriterT w m) where
+  liftIO io = WriterT (writerLiftIO io)
+
+writerLiftIO :: (Monoid w, MonadIO m) => IO a -> m (a, w)
+writerLiftIO io = liftIO io >>= (\\a -> pure (a, mempty))
+`,
+  "Control.Monad.RWS": `module Control.Monad.RWS (runRWST, runRWS, evalRWS, execRWS, evalRWST, execRWST, rws, ask, asks, local, get, put, state, gets, modify, modify', tell, listen, censor) where
+import Data.Functor.Identity
+
+-- One pass, not \\\`ReaderT r (WriterT w (StateT s m))\\\`: miso's \\\`Effect\\\` is an
+-- \\\`RWS\\\`, and the fused form is what \\\`execRWS\\\` can take apart in one \\\`case\\\`.
+newtype RWST r w s m a = RWST (r -> s -> m (a, s, w))
+
+type RWS r w s = RWST r w s Identity
+
+runRWST :: RWST r w s m a -> r -> s -> m (a, s, w)
+runRWST (RWST f) r s = f r s
+
+runRWS :: RWS r w s a -> r -> s -> (a, s, w)
+runRWS m r s = runIdentity (runRWST m r s)
+
+evalRWS :: RWS r w s a -> r -> s -> (a, w)
+evalRWS m r s = evalRWSStep (runRWS m r s)
+
+evalRWSStep :: (a, s, w) -> (a, w)
+evalRWSStep t = case t of
+  (a, s, w) -> (a, w)
+
+execRWS :: RWS r w s a -> r -> s -> (s, w)
+execRWS m r s = execRWSStep (runRWS m r s)
+
+execRWSStep :: (a, s, w) -> (s, w)
+execRWSStep t = case t of
+  (a, s, w) -> (s, w)
+
+evalRWST :: Monad m => RWST r w s m a -> r -> s -> m (a, w)
+evalRWST m r s = runRWST m r s >>= (\\t -> pure (evalRWSStep t))
+
+execRWST :: Monad m => RWST r w s m a -> r -> s -> m (s, w)
+execRWST m r s = runRWST m r s >>= (\\t -> pure (execRWSStep t))
+
+rws :: Monad m => (r -> s -> (a, s, w)) -> RWST r w s m a
+rws f = RWST (\\r s -> pure (f r s))
+
+ask :: (Monoid w, Monad m) => RWST r w s m r
+ask = RWST (\\r s -> pure (r, s, mempty))
+
+asks :: (Monoid w, Monad m) => (r -> a) -> RWST r w s m a
+asks f = RWST (\\r s -> pure (f r, s, mempty))
+
+local :: (r -> r) -> RWST r w s m a -> RWST r w s m a
+local f m = RWST (\\r s -> runRWST m (f r) s)
+
+get :: (Monoid w, Monad m) => RWST r w s m s
+get = RWST (\\r s -> pure (s, s, mempty))
+
+put :: (Monoid w, Monad m) => s -> RWST r w s m ()
+put s = RWST (\\r _ -> pure ((), s, mempty))
+
+state :: (Monoid w, Monad m) => (s -> (a, s)) -> RWST r w s m a
+state f = RWST (\\r s -> rwsStateStep (f s))
+
+rwsStateStep :: (Monoid w, Monad m) => (a, s) -> m (a, s, w)
+rwsStateStep p = case p of
+  (a, s) -> pure (a, s, mempty)
+
+gets :: (Monoid w, Monad m) => (s -> a) -> RWST r w s m a
+gets f = RWST (\\r s -> pure (f s, s, mempty))
+
+modify :: (Monoid w, Monad m) => (s -> s) -> RWST r w s m ()
+modify f = RWST (\\r s -> pure ((), f s, mempty))
+
+modify' :: (Monoid w, Monad m) => (s -> s) -> RWST r w s m ()
+modify' f = RWST (\\r s -> rwsModifyStrict (f s))
+
+rwsModifyStrict :: (Monoid w, Monad m) => s -> m ((), s, w)
+rwsModifyStrict s = seq s (pure ((), s, mempty))
+
+tell :: Monad m => w -> RWST r w s m ()
+tell w = RWST (\\r s -> pure ((), s, w))
+
+listen :: (Monoid w, Monad m) => RWST r w s m a -> RWST r w s m (a, w)
+listen m = RWST (\\r s -> runRWST m r s >>= (\\t -> rwsListenStep t))
+
+rwsListenStep :: (Monoid w, Monad m) => (a, s, w) -> m ((a, w), s, w)
+rwsListenStep t = case t of
+  (a, s, w) -> pure ((a, w), s, w)
+
+censor :: (Monoid w, Monad m) => (w -> w) -> RWST r w s m a -> RWST r w s m a
+censor f m = RWST (\\r s -> runRWST m r s >>= (\\t -> rwsCensorStep f t))
+
+rwsCensorStep :: (Monoid w, Monad m) => (w -> w) -> (a, s, w) -> m (a, s, w)
+rwsCensorStep f t = case t of
+  (a, s, w) -> pure (a, s, f w)
+
+instance Functor m => Functor (RWST r w s m) where
+  fmap f m = RWST (\\r s -> fmap (\\t -> rwsMapStep f t) (runRWST m r s))
+
+rwsMapStep :: (a -> b) -> (a, s, w) -> (b, s, w)
+rwsMapStep f t = case t of
+  (a, s, w) -> (f a, s, w)
+
+instance (Monoid w, Monad m) => Applicative (RWST r w s m) where
+  pure x = RWST (\\r s -> pure (x, s, mempty))
+  (<*>) f m = RWST (\\r s -> rwsAp f m r s)
+
+rwsAp :: (Monoid w, Monad m) => RWST r w s m (a -> b) -> RWST r w s m a -> r -> s -> m (b, s, w)
+rwsAp f m r s = runRWST f r s >>= (\\t -> rwsApStep m r t)
+
+rwsApStep :: (Monoid w, Monad m) => RWST r w s m a -> r -> (a -> b, s, w) -> m (b, s, w)
+rwsApStep m r t = case t of
+  (g, s, w) -> runRWST m r s >>= (\\u -> rwsApFinish g w u)
+
+rwsApFinish :: (Monoid w, Monad m) => (a -> b) -> w -> (a, s, w) -> m (b, s, w)
+rwsApFinish g w u = case u of
+  (a, s, w2) -> pure (g a, s, w <> w2)
+
+-- State threads forward and output appends, both in the order the actions run.
+-- \\\`Effect\\\` is this monad, so \\\`value += 1\\\` followed by \\\`io_ act\\\` has to leave
+-- the new model *and* the scheduled action, in that order.
+instance (Monoid w, Monad m) => Monad (RWST r w s m) where
+  (>>=) m k = RWST (\\r s -> rwsBind m k r s)
+
+rwsBind :: (Monoid w, Monad m) => RWST r w s m a -> (a -> RWST r w s m b) -> r -> s -> m (b, s, w)
+rwsBind m k r s = runRWST m r s >>= (\\t -> rwsBindStep k r t)
+
+rwsBindStep :: (Monoid w, Monad m) => (a -> RWST r w s m b) -> r -> (a, s, w) -> m (b, s, w)
+rwsBindStep k r t = case t of
+  (a, s, w) -> runRWST (k a) r s >>= (\\u -> rwsBindFinish w u)
+
+rwsBindFinish :: (Monoid w, Monad m) => w -> (b, s, w) -> m (b, s, w)
+rwsBindFinish w u = case u of
+  (b, s, w2) -> pure (b, s, w <> w2)
+
+-- The base monad decides what failure means, exactly as transformers has it.
+-- A pure \`RWS\` is \`RWST ... Identity\`, and \`Identity\` has no \`MonadFail\`, so
+-- a refutable bind in a pure \`RWS\` is rejected here as GHC rejects it.
+instance (Monoid w, MonadFail m) => MonadFail (RWST r w s m) where
+  fail msg = RWST (\\r s -> fail msg)
+
+instance (Monoid w, MonadIO m) => MonadIO (RWST r w s m) where
+  liftIO io = RWST (\\r s -> rwsLiftIO io s)
+
+rwsLiftIO :: (Monoid w, MonadIO m) => IO a -> s -> m (a, s, w)
+rwsLiftIO io s = liftIO io >>= (\\a -> pure (a, s, mempty))
+`,
+  "Control.Monad.Trans.Maybe": `module Control.Monad.Trans.Maybe (runMaybeT, hoistMaybe) where
+
+newtype MaybeT m a = MaybeT (m (Maybe a))
+
+runMaybeT :: MaybeT m a -> m (Maybe a)
+runMaybeT (MaybeT m) = m
+
+hoistMaybe :: Applicative m => Maybe a -> MaybeT m a
+hoistMaybe x = MaybeT (pure x)
+
+instance Functor m => Functor (MaybeT m) where
+  fmap f m = MaybeT (fmap (\\r -> maybeMap f r) (runMaybeT m))
+
+instance Monad m => Applicative (MaybeT m) where
+  pure x = MaybeT (pure (Just x))
+  (<*>) f m = MaybeT (maybeTAp f m)
+
+maybeTAp :: Monad m => MaybeT m (a -> b) -> MaybeT m a -> m (Maybe b)
+maybeTAp f m = runMaybeT f >>= (\\r -> maybeTApStep m r)
+
+maybeTApStep :: Monad m => MaybeT m a -> Maybe (a -> b) -> m (Maybe b)
+maybeTApStep m r = case r of
+  Nothing -> pure Nothing
+  Just g -> runMaybeT (fmap g m)
+
+-- The short circuit is the point: once the base action has produced
+-- \\\`Nothing\\\`, \\\`k\\\` is never applied, so nothing after a failed step runs. A
+-- version that ran \\\`k\\\` anyway would typecheck and be silently wrong.
+instance Monad m => Monad (MaybeT m) where
+  (>>=) m k = MaybeT (maybeTBind m k)
+
+maybeTBind :: Monad m => MaybeT m a -> (a -> MaybeT m b) -> m (Maybe b)
+maybeTBind m k = runMaybeT m >>= (\\r -> maybeTBindStep k r)
+
+maybeTBindStep :: Monad m => (a -> MaybeT m b) -> Maybe a -> m (Maybe b)
+maybeTBindStep k r = case r of
+  Nothing -> pure Nothing
+  Just a -> runMaybeT (k a)
+
+-- A failed pattern bind in a \\\`do\\\` block calls \\\`fail\\\`, and in \\\`MaybeT\\\` that
+-- has to be the same short circuit rather than an error: \\\`Just x <- act\\\` is
+-- how miso's JSON decoder gives up on a field.
+instance Monad m => MonadFail (MaybeT m) where
+  fail s = MaybeT (pure Nothing)
+
+instance Monad m => Alternative (MaybeT m) where
+  empty = MaybeT (pure Nothing)
+  (<|>) a b = MaybeT (maybeTOr a b)
+
+maybeTOr :: Monad m => MaybeT m a -> MaybeT m a -> m (Maybe a)
+maybeTOr a b = runMaybeT a >>= (\\r -> maybeTOrStep b r)
+
+maybeTOrStep :: Monad m => MaybeT m a -> Maybe a -> m (Maybe a)
+maybeTOrStep b r = case r of
+  Nothing -> runMaybeT b
+  Just x -> pure (Just x)
+
+instance MonadIO m => MonadIO (MaybeT m) where
+  liftIO io = MaybeT (maybeTLiftIO io)
+
+maybeTLiftIO :: MonadIO m => IO a -> m (Maybe a)
+maybeTLiftIO io = liftIO io >>= (\\a -> pure (Just a))
+`,
+  // ----------------------------------------------------------- marshalling ---
+  "GHCJS.Types": `module GHCJS.Types (jsval) where
+import GHC.JS.Prim (JSVal)
+import Data.JSString (JSString)
+
+-- ghcjs-base's \\\`class IsJSVal a where jsval :: a -> JSVal\\\`. Every instance is
+-- a *representational* identity - the wrapped thing already IS the JavaScript
+-- value - so the conversion is JavaScript's identity function and not any
+-- Haskell work. The \\\`case\\\` is what keeps the unwrapped machine value out of a
+-- lazy constructor field.
+class IsJSVal a where
+  jsval :: a -> JSVal
+
+foreign import javascript unsafe "((x) => x)" jsIdentity :: JSStringPrim -> JSValPrim
+
+instance IsJSVal JSVal where
+  jsval x = x
+
+instance IsJSVal JSString where
+  jsval (JSString s) = case jsIdentity s of
+    v -> JSVal v
+`,
+  "GHCJS.Marshal": `module GHCJS.Marshal (toJSVal, fromJSVal, fromJSValUnchecked) where
+import GHC.JS.Prim
+import Data.JSString (JSString)
+
+-- THE JAVASCRIPT BOUNDARY, and therefore FFI rather than Haskell. Converting
+-- an \\\`Int\\\` to a JS number is not a computation with a Haskell meaning to
+-- preserve - it is the identity on the machine value - and a \\\`fromJSVal\\\` that
+-- inspected a Haskell mirror of the JS value would answer differently from one
+-- that asked JavaScript.
+--
+-- The class is named \\\`ToJSValue\\\`, not \\\`ToJSVal\\\`, on purpose: classes live in
+-- one global namespace in this frontend, and miso declares its own
+-- \\\`ToJSVal\\\`/\\\`FromJSVal\\\` in \\\`Miso.DSL\\\` (with a \\\`Generic\\\` default). Two
+-- declarations of one class name would merge into whichever came last, and
+-- miso's instances would lose their default method. The exported names are the
+-- ghcjs-base ones, which is what \\\`Marshal.toJSVal\\\` resolves to.
+class ToJSValue a where
+  toJSValue :: a -> IO JSVal
+
+class FromJSValue a where
+  fromJSValue :: JSVal -> IO (Maybe a)
+  fromJSValueUnchecked :: JSVal -> IO a
+  fromJSValueUnchecked x = fromJSValue x >>= forceJSValue
+
+forceJSValue :: Maybe a -> IO a
+forceJSValue m = case m of
+  Nothing -> error "GHCJS.Marshal.fromJSValUnchecked: type mismatch"
+  Just x -> pure x
+
+toJSVal :: ToJSValue a => a -> IO JSVal
+toJSVal x = toJSValue x
+
+fromJSVal :: FromJSValue a => JSVal -> IO (Maybe a)
+fromJSVal x = fromJSValue x
+
+fromJSValUnchecked :: FromJSValue a => JSVal -> IO a
+fromJSValUnchecked x = fromJSValueUnchecked x
+
+foreign import javascript unsafe "((b) => b)" boolToVal :: Bool -> JSValPrim
+foreign import javascript unsafe "((n) => n)" intToVal :: IntPrim -> JSValPrim
+foreign import javascript unsafe "((d) => d)" doubleToVal :: DoublePrim -> JSValPrim
+foreign import javascript unsafe "((s) => s)" stringToVal :: JSStringPrim -> JSValPrim
+foreign import javascript unsafe "((c) => String.fromCodePoint(c))" charToVal :: CharPrim -> JSValPrim
+foreign import javascript unsafe "((n) => [])" newArrayVal :: IntPrim -> JSValPrim
+foreign import javascript unsafe "((a,x) => { a.push(x); return 0; })" pushArrayVal :: JSValPrim -> JSValPrim -> IntPrim
+foreign import javascript unsafe "((x) => typeof x === 'boolean')" isBoolVal :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => typeof x === 'number')" isNumberVal :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => typeof x === 'string')" isStringVal :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => Array.isArray(x))" isArrayVal :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => x === null || x === undefined)" isNullishVal :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => x)" valToBool :: JSValPrim -> Bool
+foreign import javascript unsafe "((x) => x)" valToDouble :: JSValPrim -> DoublePrim
+foreign import javascript unsafe "((x) => x | 0)" valToInt :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((x) => x)" valToString :: JSValPrim -> JSStringPrim
+foreign import javascript unsafe "((x) => x.codePointAt(0))" valToChar :: JSValPrim -> CharPrim
+foreign import javascript unsafe "((x) => x.length)" arrayLengthVal :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((x,i) => x[i])" arrayIndexVal :: JSValPrim -> IntPrim -> JSValPrim
+
+-- Every one of these names its foreign result with a \\\`case\\\` before boxing it:
+-- a machine value in a lazy \\\`JSVal\\\` field would be a thunk, and the next
+-- JavaScript call on it would see a closure.
+pureVal :: JSValPrim -> IO JSVal
+pureVal v = IO (\\s -> IOResult s (JSVal v))
+
+instance ToJSValue JSVal where
+  toJSValue x = pure x
+
+instance ToJSValue Bool where
+  toJSValue b = case boolToVal b of
+    v -> pureVal v
+
+instance ToJSValue Int where
+  toJSValue (I n) = case intToVal n of
+    v -> pureVal v
+
+instance ToJSValue Double where
+  toJSValue (DoubleBox d) = case doubleToVal d of
+    v -> pureVal v
+
+instance ToJSValue Char where
+  toJSValue (C c) = case charToVal c of
+    v -> pureVal v
+
+instance ToJSValue JSString where
+  toJSValue (JSString s) = case stringToVal s of
+    v -> pureVal v
+
+instance ToJSValue () where
+  toJSValue x = pure jsNull
+
+-- \\\`Nothing\\\` is \\\`null\\\`, which is what makes the \\\`FromJSValue (Maybe a)\\\`
+-- instance below its inverse.
+instance ToJSValue a => ToJSValue (Maybe a) where
+  toJSValue m = case m of
+    Nothing -> pure jsNull
+    Just x -> toJSValue x
+
+instance ToJSValue a => ToJSValue [a] where
+  toJSValue xs = newArray >>= (\\a -> pushAll a xs)
+
+newArray :: IO JSVal
+newArray = case newArrayVal 0 of
+  v -> pureVal v
+
+pushAll :: ToJSValue a => JSVal -> [a] -> IO JSVal
+pushAll a xs = case xs of
+  [] -> pure a
+  (y : ys) -> toJSValue y >>= (\\v -> pushOne a v >> pushAll a ys)
+
+pushOne :: JSVal -> JSVal -> IO ()
+pushOne (JSVal a) (JSVal v) = IO (\\s -> pushStep s a v)
+
+pushStep :: RealWorld -> JSValPrim -> JSValPrim -> IOResult ()
+pushStep s a v = case pushArrayVal a v of
+  _ -> IOResult s ()
+
+instance FromJSValue JSVal where
+  fromJSValue x = pure (Just x)
+  fromJSValueUnchecked x = pure x
+
+instance FromJSValue Bool where
+  fromJSValue (JSVal x) = if isBoolVal x then fromBoolStep x else pure Nothing
+
+fromBoolStep :: JSValPrim -> IO (Maybe Bool)
+fromBoolStep x = case valToBool x of
+  b -> pure (Just b)
+
+instance FromJSValue Int where
+  fromJSValue (JSVal x) = if isNumberVal x then fromIntStep x else pure Nothing
+
+fromIntStep :: JSValPrim -> IO (Maybe Int)
+fromIntStep x = case valToInt x of
+  n -> pure (Just (I n))
+
+instance FromJSValue Double where
+  fromJSValue (JSVal x) = if isNumberVal x then fromDoubleStep x else pure Nothing
+
+fromDoubleStep :: JSValPrim -> IO (Maybe Double)
+fromDoubleStep x = case valToDouble x of
+  d -> pure (Just (DoubleBox d))
+
+instance FromJSValue JSString where
+  fromJSValue (JSVal x) = if isStringVal x then fromStringStep x else pure Nothing
+
+fromStringStep :: JSValPrim -> IO (Maybe JSString)
+fromStringStep x = case valToString x of
+  s -> pure (Just (JSString s))
+
+instance FromJSValue Char where
+  fromJSValue (JSVal x) = if isStringVal x then fromCharStep x else pure Nothing
+
+fromCharStep :: JSValPrim -> IO (Maybe Char)
+fromCharStep x = case valToChar x of
+  c -> pure (Just (C c))
+
+-- \\\`null\\\` and \\\`undefined\\\` both decode as \\\`Just Nothing\\\` - the conversion
+-- succeeded and produced an absence - which is what distinguishes this from
+-- the \\\`Nothing\\\` that means "not this type at all".
+instance FromJSValue a => FromJSValue (Maybe a) where
+  fromJSValue (JSVal x) = if isNullishVal x then pure (Just Nothing) else fromJustStep (JSVal x)
+
+fromJustStep :: FromJSValue a => JSVal -> IO (Maybe (Maybe a))
+fromJustStep x = fromJSValue x >>= (\\r -> pure (maybeMap Just r))
+
+instance FromJSValue a => FromJSValue [a] where
+  fromJSValue (JSVal x) = if isArrayVal x then fromArrayStep x 0 (arrayLengthVal x) else pure Nothing
+
+fromArrayStep :: FromJSValue a => JSValPrim -> IntPrim -> IntPrim -> IO (Maybe [a])
+fromArrayStep x i n =
+  if primIntGe i n then pure (Just []) else fromArrayAt x i n (arrayIndexVal x i)
+
+fromArrayAt :: FromJSValue a => JSValPrim -> IntPrim -> IntPrim -> JSValPrim -> IO (Maybe [a])
+fromArrayAt x i n e = fromJSValue (JSVal e) >>= (\\r -> fromArrayCons x i n r)
+
+fromArrayCons :: FromJSValue a => JSValPrim -> IntPrim -> IntPrim -> Maybe a -> IO (Maybe [a])
+fromArrayCons x i n r = case r of
+  Nothing -> pure Nothing
+  Just y -> fromArrayStep x (primIntAdd i 1) n >>= (\\rest -> pure (maybeMap (\\ys -> y : ys) rest))
+`,
 };
 
 /** Modules already provided by the project win; everything a library module

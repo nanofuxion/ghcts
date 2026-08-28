@@ -299,6 +299,11 @@ instance Alternative [] where
   (<|>) xs ys = append xs ys
   empty = []
 
+-- base has this one, and a refutable \`do\` bind now needs it: \`[x | ...]\`
+-- written as a \`do\` block drops a non-matching element rather than raising.
+instance MonadFail [] where
+  fail s = []
+
 instance Foldable [] where
   foldr f z xs = foldrList f z xs
   toList xs = xs

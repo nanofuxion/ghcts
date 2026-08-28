@@ -502,6 +502,8 @@ class Elaborator {
       }
       case "string":
         return tString;
+      case "char":
+        return tcon("Char");
       case "con": {
         const scheme = this.constructors.get(p.name);
         if (!scheme) {
@@ -542,6 +544,8 @@ class Elaborator {
       }
       case "string":
         return tString;
+      case "char":
+        return tcon("Char");
       case "unit":
         return tcon("()");
       case "var":
@@ -1591,6 +1595,11 @@ function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
   switch (p.tag) {
     case "int":
       return elaborator.boxedInt.has(p) ? { tag: "con", name: "I", args: [p], span: p.span } : p;
+    // A `Char` is `C CharPrim`, so matching one is matching that constructor
+    // and then the machine code point - the same two steps `I 0` takes for an
+    // `Int` literal pattern. The inner `char` pattern is the raw one.
+    case "char":
+      return { tag: "con", name: "C", args: [p], span: p.span };
     case "as":
       return { ...p, pattern: rewritePattern(elaborator, p.pattern) };
     case "con":

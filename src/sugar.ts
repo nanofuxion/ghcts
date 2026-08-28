@@ -64,6 +64,40 @@ class Sugar {
     return `$${prefix}${this.counter++}`;
   }
 
+  /** Can this pattern fail to match?  GHC asks exactly this before deciding
+   * that a `do` bind needs `MonadFail`: `(a, b) <- m` and `Model n <- m` match
+   * whatever they are given, so requiring `MonadFail` for them would reject
+   * programs GHC accepts.  A constructor this pass has never seen - a list
+   * cell, a literal - is refutable, which is the safe direction. */
+  private refutable(pattern: Pattern): boolean {
+    switch (pattern.tag) {
+      case "wild":
+      case "var":
+        return false;
+      case "as":
+        return this.refutable(pattern.pattern);
+      case "con":
+        return this.soleConstructor(pattern.name)
+          ? pattern.args.some((a) => this.refutable(a))
+          : true;
+      case "record":
+        return this.soleConstructor(pattern.name)
+          ? pattern.fields.some((f) => this.refutable(f.pattern))
+          : true;
+      default:
+        return true;
+    }
+  }
+
+  private soleConstructor(name: string): boolean {
+    if (/^\(,+\)$/.test(name)) return true;
+    const info = this.cons.get(name);
+    if (!info) return false;
+    let siblings = 0;
+    for (const other of this.cons.values()) if (other.typeName === info.typeName) siblings++;
+    return siblings === 1;
+  }
+
   decl(decl: ValueDeclaration): ValueDeclaration {
     return {
       ...decl,
@@ -184,15 +218,35 @@ class Sugar {
     const tail = this.doBlock(rest, span);
     if (head.tag === "let") return { tag: "let", bindings: head.bindings.map((b) => this.local(b)), body: tail, span };
     if (head.tag === "expr") return apply2(">>", this.expr(head.expr), tail, span);
-    // A refutable binder cannot fall through to `fail` here - there is no
-    // MonadFail - so it becomes a `case` whose non-match raises, which is what
-    // the pattern-match compiler already emits for every other partial match.
+    // A refutable binder falls through to `fail`, as the report says it must.
+    // That is not cosmetic: `fail` in `Maybe` and `MaybeT` is `Nothing`, so
+    // `Just x <- decodeField` is how a decoder gives up on a field. Raising
+    // instead - which is what this did while the Prelude had no `MonadFail` -
+    // turned a recoverable miss into an uncatchable pattern-match failure.
     const pattern = this.pattern(head.pattern);
     const name = pattern.tag === "var" ? pattern.name : this.fresh("bind");
+    const onFailure: CaseAlternative[] = this.refutable(pattern)
+      ? [
+          {
+            pattern: { tag: "wild", span },
+            body: {
+              tag: "app",
+              fn: variable("fail", span),
+              arg: { tag: "string", value: "Pattern match failure in do expression", span },
+              span,
+            },
+          },
+        ]
+      : [];
     const body: Expr =
       pattern.tag === "var" || pattern.tag === "wild"
         ? tail
-        : { tag: "case", subject: variable(name, span), alternatives: [{ pattern, body: tail }], span };
+        : {
+            tag: "case",
+            subject: variable(name, span),
+            alternatives: [{ pattern, body: tail }, ...onFailure],
+            span,
+          };
     return apply2(">>=", this.expr(head.source), { tag: "lambda", parameter: name, body, span }, span);
   }
 

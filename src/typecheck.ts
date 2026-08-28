@@ -1305,6 +1305,8 @@ class Inferencer {
         return { tag: "con", name: "Double" };
       case "string":
         return string;
+      case "char":
+        return { tag: "con", name: "Char" };
       case "unit":
         return { tag: "con", name: "()" };
       case "tuple": {
@@ -1510,6 +1512,9 @@ class Inferencer {
         return;
       case "string":
         this.unify(expected, string);
+        return;
+      case "char":
+        this.unify(expected, { tag: "con", name: "Char" });
         return;
       case "record": {
         let constructorType = instantiate(

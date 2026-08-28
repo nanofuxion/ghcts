@@ -68,6 +68,13 @@ export async function loadProgram(
     }
   }
 
+  // The CPP symbols the target selects. Without them every #ifdef in a
+  // dependency takes its #else branch, which for miso means compiling the
+  // neither-GHCJS-nor-native code - including the old `$r = $1` FFI dialect
+  // that GHC 9.12 does not accept. arch(javascript) is what this backend is,
+  // so GHCJS_BOTH and GHCJS_NEW come with it (miso.cabal:28-40).
+  const defines = new Set<string>(["GHCJS_BOTH", "GHCJS_NEW", ...(config.cpp ?? [])]);
+
   const modules = new Map<string, Module>();
   const diagnostics: Diagnostic[] = [];
   const queue = [config.entry.module];
@@ -80,7 +87,7 @@ export async function loadProgram(
     // A module we cannot find is reported by the elaborator as unresolved
     // names, which says more than a missing-file error would.
     if (!file) continue;
-    const parsed = parseModule(await readFile(file, "utf8"), relative(project, file));
+    const parsed = parseModule(await readFile(file, "utf8"), relative(project, file), defines);
     diagnostics.push(...parsed.diagnostics);
     if (!parsed.module?.ast) continue;
     modules.set(parsed.module.ast.name, parsed.module.ast);
