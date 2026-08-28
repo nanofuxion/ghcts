@@ -479,6 +479,9 @@ interface ClassMethod {
 
 interface ClassInfo {
   name: string;
+  /** The parameter names as written, positionally matching `variables`: what a
+   * default method's body may name in an expression ascription. */
+  parameters: string[];
   /** One per class parameter, in declaration order. A method's signature and
    * every superclass constraint are written over exactly these. */
   variables: TVar[];
@@ -507,6 +510,11 @@ interface InstanceInfo {
   /** The context as named parameters, shared by the dictionary CAF and by
    * every method implementation, so the two agree on argument order. */
   params: Given[];
+  /** The head's type variables by their written names. With
+   * ScopedTypeVariables - which miso uses - these scope over the method
+   * bodies, so `selName (M1 undefined :: S1 m f ())` inside
+   * `instance Selector m => GToFields (S1 m f)` means *this* instance's `m`. */
+  vars: ReadonlyMap<string, Type>;
   methods: Map<string, ValueDeclaration>;
   span: Span;
 }
@@ -656,7 +664,7 @@ type Env = Map<string, EnvEntry>;
  * real syntax only once constraint solving has finished. */
 type Use =
   | { kind: "apply"; node: Expr; emit: string; constraints: Constraint[] }
-  | { kind: "literal"; node: Expr; type: Type; cls: "Num" | "Fractional" }
+  | { kind: "literal"; node: Expr; type: Type; cls: "Num" | "Fractional" | "IsString" }
   | { kind: "group"; node: Expr; target: string };
 
 /** What a binding was told, or worked out, about its own constraints. */
@@ -677,6 +685,10 @@ interface Binding {
    * instantiate. The skolemised copy above is what the body is checked
    * against, and its rigid variables must never escape into a call site. */
   declaredScheme?: Scheme;
+  /** Type variables an expression ascription in this body may name, already
+   * skolemised. Empty for an ordinary top-level binding: without an explicit
+   * `forall` a signature's variables do not scope over its body in GHC either. */
+  tyvars: ReadonlyMap<string, Type>;
   givens: Given[];
   uses: Use[];
   intPatterns: Array<{ pattern: Extract<Pattern, { tag: "int" }>; type: Type }>;
@@ -774,6 +786,33 @@ class Elaborator {
         return tcon("()");
       case "var":
         return this.inferVar(e, env);
+      // `e :: ty`. The written type is unified with the inferred one, which is
+      // the whole point of the form in generic code: `conName (undefined ::
+      // C1 m f ())` never forces its argument and exists only so that the
+      // ascription picks the `Constructor m` dictionary.
+      //
+      // Variables the enclosing instance or class does not bind are fresh, and
+      // fresh per ascription - that is what instantiating the signature's
+      // implicit `forall` amounts to here. A context on the ascription is not
+      // turned into a local given; a constraint that only it could discharge
+      // therefore fails loudly at the use site rather than being assumed.
+      case "annot": {
+        const written = parseSignature(e.type, new Map(this.current?.tyvars ?? []));
+        // A string literal whose type is *written out* is `fromString` at that
+        // type - GHC's OverloadedStrings, for the one form where the type is
+        // not in doubt, and the form miso spells `"tag" :: MisoString`.
+        // Everywhere else a literal stays `[Char]`: picking an `IsString`
+        // instance by inference needs base's `instance a ~ Char => IsString
+        // [a]`, and there are no equality constraints here to write it with.
+        if (e.expr.tag === "string" && headCon(written.type) !== undefined && !sameType(written.type, tString)) {
+          this.current?.uses.push({ kind: "literal", node: e.expr, type: written.type, cls: "IsString" });
+          return written.type;
+        }
+        const t = this.infer(e.expr, env);
+        if (!unify(t, written.type))
+          this.report(`expression does not have the ascribed type \`${showType(written.type)}\``, e.span);
+        return t;
+      }
       case "app": {
         const fnType = this.infer(e.fn, env);
         const argType = this.infer(e.arg, env);
@@ -1183,6 +1222,89 @@ const errorExpr = (span: Span): Expr => ({ tag: "var", name: "$dictionaryNotFoun
 const spanOf = (e: Expr): Span => e.span;
 const varType = (v: TVar): Type => ({ tag: "var", v });
 
+/** A type's top-level arrow spine. */
+function splitFun(t: Type): { args: Type[]; result: Type } {
+  const args: Type[] = [];
+  let cursor = prune(t);
+  for (;;) {
+    if (cursor.tag !== "app") break;
+    const fn = prune(cursor.fn);
+    if (fn.tag !== "app") break;
+    const head = prune(fn.fn);
+    if (head.tag !== "con" || head.name !== "->") break;
+    args.push(fn.arg);
+    cursor = prune(cursor.arg);
+  }
+  return { args, result: cursor };
+}
+
+/** One method of a `deriving newtype` instance.
+ *
+ * A newtype is a real single-field data type here - nothing erases the
+ * constructor - so GND's `coerce` does not exist to be used. What does exist is
+ * the wrapper that GND's coercion stands for: the wrapped type's method with
+ * the constructor taken off the arguments and put back on the result. That is
+ * sound exactly where the class variable is a whole argument or the whole
+ * result; `undefined` (and a diagnostic from the caller) is the answer where it
+ * sits under another constructor, since moving a newtype through `[a]` or `f a`
+ * needs a coercion this compiler cannot perform.
+ *
+ * The divergence from GHC is strictness, and only that: unwrapping is a `case`,
+ * so a method that would not have forced its own argument becomes strict in it.
+ */
+function newtypeMethod(
+  method: ClassMethod,
+  classVar: TVar,
+  con: string,
+  wrapped: string,
+  span: Span,
+): ValueDeclaration | undefined {
+  const { args, result } = splitFun(method.type);
+  const isClassVar = (t: Type): boolean => {
+    const p = prune(t);
+    return p.tag === "var" && p.v === classVar;
+  };
+  const mentions = (t: Type): boolean => typeVars(t).includes(classVar);
+  if (![...args, result].every((t) => isClassVar(t) || !mentions(t))) return undefined;
+  const unwrap = args.map(isClassVar);
+  // Nothing to move: the class variable is not in this method's type at all,
+  // so there is no way to say which instance the inner call should use.
+  if (!unwrap.some(Boolean) && !isClassVar(result)) return undefined;
+  const names = args.map((_, i) => `$n${i}`);
+  const inner = applyAll(
+    variable(method.name, span),
+    names.map((name, i) =>
+      unwrap[i]
+        ? {
+            tag: "case",
+            subject: variable(name, span),
+            alternatives: [
+              {
+                pattern: { tag: "con", name: con, args: [{ tag: "var", name: `${name}$w`, span }], span },
+                body: variable(`${name}$w`, span),
+              },
+            ],
+            span,
+          }
+        : variable(name, span),
+    ),
+  );
+  return valueDecl(
+    method.name,
+    names.map((name): Pattern => ({ tag: "var", name, span })),
+    isClassVar(result)
+      ? apply(
+          variable(con, span),
+          // With no argument at the wrapped type, only the ascription says
+          // which instance the inner call means - otherwise it selects this
+          // very instance and loops.
+          unwrap.some(Boolean) ? inner : { tag: "annot", expr: inner, type: wrapped, span },
+        )
+      : inner,
+    span,
+  );
+}
+
 const valueDecl = (name: string, patterns: Pattern[], body: Expr, span: Span = NOWHERE): ValueDeclaration => ({
   tag: "value",
   name,
@@ -1349,7 +1471,15 @@ export function elaborateProgram(
       });
       if (own.has(member.name)) defaults.set(defaultImpl(decl.name, member.name), own.get(member.name)!);
     }
-    elaborator.classes.set(decl.name, { name: decl.name, variables, superclasses: supers, fundeps, methods, span: decl.span });
+    elaborator.classes.set(decl.name, {
+      name: decl.name,
+      parameters: decl.parameters,
+      variables,
+      superclasses: supers,
+      fundeps,
+      methods,
+      span: decl.span,
+    });
   }
 
   // A method's scheme is its declared signature plus its own class constraint,
@@ -1409,27 +1539,102 @@ export function elaborateProgram(
       emitCon,
       context,
       params: context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
+      vars,
       methods,
       span: decl.span,
     });
   }
 
-  // `deriving Eq` is an instance like any other: one constrained by `Eq` at
-  // each type parameter, whose `==` is the structural comparison.
-  for (const decl of datas) {
-    if (!decl.deriving.includes("Eq") || elaborator.instances.has(`Eq ${decl.name}`)) continue;
+  // --- deriving ----------------------------------------------------------
+  /** One derived instance, in whichever strategy asked for it. A hand-written
+   * instance at the same head wins; `build` returning `undefined` means the
+   * strategy could not produce one, and has said why. */
+  const deriveInstance = (
+    cls: string,
+    decl: DataDeclaration,
+    build: (vars: Type[]) => { context: Constraint[]; methods: Map<string, ValueDeclaration> } | undefined,
+  ): void => {
     const vars = decl.parameters.map(() => freshVar());
-    const context = vars.map((type) => ({ cls: "Eq", types: [type] }));
-    elaborator.addInstance(`Eq ${decl.name}`, {
-      cls: "Eq",
-      targets: [vars.reduce<Type>(tapp, tcon(decl.name))],
+    const target = vars.reduce<Type>(tapp, tcon(decl.name));
+    const emitCon = instanceKey([target]);
+    if (elaborator.instances.has(`${cls} ${emitCon}`)) return;
+    const built = build(vars);
+    if (!built) return;
+    elaborator.addInstance(`${cls} ${emitCon}`, {
+      cls,
+      targets: [target],
       targetCons: [decl.name],
-      emitCon: conKey(decl.name),
-      context,
-      params: context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
-      methods: new Map([["==", derivedEqMethod(decl)]]),
+      emitCon,
+      context: built.context,
+      params: built.context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
+      vars: new Map(decl.parameters.map((p, i) => [p, vars[i]!])),
+      methods: built.methods,
       span: decl.span,
     });
+  };
+
+  for (const decl of datas) {
+    // `deriving Eq` is an instance like any other: one constrained by `Eq` at
+    // each type parameter, whose `==` is the structural comparison.
+    if (decl.deriving.includes("Eq"))
+      deriveInstance("Eq", decl, (vars) => ({
+        context: vars.map((type) => ({ cls: "Eq", types: [type] })),
+        methods: new Map([["==", derivedEqMethod(decl)]]),
+      }));
+
+    // `deriving anyclass C` is the *empty* instance: every method comes from
+    // the class's own default, which is how `deriving anyclass (ToJSON)` picks
+    // up a `default toJSON` written over `Generic`.
+    for (const cls of decl.derivingAnyclass ?? []) {
+      const info = elaborator.classes.get(cls);
+      if (!info || info.variables.length !== 1) {
+        elaborator.report(
+          `\`deriving anyclass ${cls}\`: ${info ? "only a single-parameter class can be derived" : "unknown class"}`,
+          decl.span,
+        );
+        continue;
+      }
+      deriveInstance(cls, decl, (vars) => ({
+        // GHC infers this context from the default methods' own signatures. A
+        // constraint on each parameter is the same answer wherever the default
+        // is the `Generic` one - the case the strategy exists for - because
+        // that default reaches every field through the representation.
+        context: vars.map((type) => ({ cls, types: [type] })),
+        methods: new Map(),
+      }));
+    }
+
+    for (const cls of decl.derivingNewtype ?? []) {
+      const info = elaborator.classes.get(cls);
+      const con = decl.constructors[0];
+      const wrapped = con?.fieldTypes?.[0]?.replace(/^\s*!/, "").trim();
+      if (!info || info.variables.length !== 1 || decl.newtype !== true || decl.constructors.length !== 1 || con?.arity !== 1 || !wrapped) {
+        elaborator.report(
+          `\`deriving newtype ${cls}\`: needs a single-parameter class and a newtype whose wrapped type is written out`,
+          decl.span,
+        );
+        continue;
+      }
+      deriveInstance(cls, decl, (vars) => {
+        const scope = new Map(decl.parameters.map((p, i) => [p, vars[i]!] as const));
+        const underlying = parseType(wrapped, scope);
+        const methods = new Map<string, ValueDeclaration>();
+        for (const method of info.methods) {
+          const built = newtypeMethod(method, info.variables[0]!, con.name, wrapped, decl.span);
+          if (!built) {
+            elaborator.report(
+              `\`deriving newtype ${cls}\`: \`${method.name}\` mentions the class variable somewhere the newtype's constructor cannot be moved through`,
+              decl.span,
+            );
+            return undefined;
+          }
+          methods.set(method.name, built);
+        }
+        // GND's context is the constraint on the wrapped type, not on the
+        // parameters: `instance C (Maybe a) => C (Wrap a)`.
+        return { context: [{ cls, types: [underlying] }], methods };
+      });
+    }
   }
 
   // --- bindings to infer -------------------------------------------------
@@ -1448,6 +1653,7 @@ export function elaborateProgram(
     original: ValueDeclaration,
     signature?: { context: Constraint[]; type: Type },
     declared?: { context: Constraint[]; type: Type },
+    tyvars: ReadonlyMap<string, Type> = new Map(),
   ): void => {
     // `do`, records and record patterns are expanded here, at the one point
     // every value - top level, instance method and class default - passes.
@@ -1463,6 +1669,7 @@ export function elaborateProgram(
             declared.context,
           )
         : undefined,
+      tyvars,
       givens: [],
       uses: [],
       intPatterns: [],
@@ -1509,7 +1716,7 @@ export function elaborateProgram(
         type: substituteVars(method.type, info.variables, instance.targets),
       });
       const implName = methodImpl(instance.cls, instance.emitCon, method.name);
-      addBinding(implName, { ...decl, name: implName }, at);
+      addBinding(implName, { ...decl, name: implName }, at, undefined, skolemNames(instance.vars));
     }
   }
   for (const info of elaborator.classes.values()) {
@@ -1532,6 +1739,10 @@ export function elaborateProgram(
           ],
           type: at(method.defaultType ?? method.type),
         }),
+        undefined,
+        // The class's own parameters scope over its default methods' bodies,
+        // at the same skolems the synthesised signature above uses.
+        new Map(info.parameters.map((p, i) => [p, skolems[i] ?? freshVar()])),
       );
     }
   }
@@ -1757,6 +1968,18 @@ function skolemise(signature: { context: Constraint[]; type: Type }): { context:
   return { context, type };
 }
 
+/** The same substitution `skolemise` performs, read off by name. Both spell a
+ * skolem `%${v.id}`, so a scope's variables and the signature they were parsed
+ * with stay the same types without threading a substitution through. */
+function skolemNames(vars: ReadonlyMap<string, Type>): Map<string, Type> {
+  const out = new Map<string, Type>();
+  for (const [name, t] of vars) {
+    const p = prune(t);
+    if (p.tag === "var") out.set(name, tcon(`%${p.v.id}`));
+  }
+  return out;
+}
+
 /** Dependency order, so a binding's scheme (and therefore its dictionary
  * parameters) is known before anything that calls it is inferred. Mutually
  * recursive bindings are inferred together and monomorphically. */
@@ -1808,6 +2031,9 @@ function referencedNames(decl: ValueDeclaration): Set<string> {
     switch (e.tag) {
       case "var":
         names.add(e.name);
+        return;
+      case "annot":
+        expr(e.expr);
         return;
       case "app":
         expr(e.fn);
@@ -1948,8 +2174,16 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
     // at `instance ToJSON Colour` needs `Generic Colour rep` and `GToJSON rep`.
     // `rep` is not written anywhere, so the fundep has to supply it first -
     // improvement, then selection, exactly as an ordinary call site does.
+    //
+    // `freshen`, not `applySubst`: a `Rep a` in the default's context became a
+    // variable that `ClassInfo` holds *once*, so every instance deriving this
+    // method would otherwise improve the same variable and the second would
+    // report a fundep conflict with the first. Seeding the substitution with
+    // the class variables keeps `Generic a rep` and `GToJSON rep` sharing one
+    // `rep` within this instance while giving each instance its own.
+    const fresh = new Map(at);
     const extra = (method.defaultContext ?? []).map((c) => {
-      const at_ = c.types.map((t) => applySubst(t, at));
+      const at_ = c.types.map((t) => freshen(t, fresh));
       elaborator.improveOne({ cls: c.cls, types: at_ }, instance.params, instance.span);
       return elaborator.resolve(c.cls, at_, instance.params, instance.span) ?? errorExpr(instance.span);
     });
@@ -1987,6 +2221,12 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
         if (!args) return e;
         return args.length ? applyAll(variable("fromRational", e.span), [...args, e]) : e;
       }
+      // Only a literal with a written non-`[Char]` type has a dictionary; a
+      // plain `[Char]` literal is left exactly as it was.
+      case "string":
+        return args?.length ? applyAll(variable("fromString", e.span), [...args, e]) : e;
+      case "annot":
+        return { ...e, expr: rewriteExpr(e.expr) };
       case "app":
         return { ...e, fn: rewriteExpr(e.fn), arg: rewriteExpr(e.arg) };
       case "lambda":

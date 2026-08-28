@@ -330,6 +330,10 @@ class Renamer {
           base: this.expr(expr.base, shadow),
           fields: expr.fields.map((f) => ({ ...f, value: this.expr(f.value, shadow) })),
         };
+      // Only the expression is renamed: types live in one global namespace
+      // here, so the written type needs no qualification.
+      case "annot":
+        return { ...expr, expr: this.expr(expr.expr, shadow) };
       case "app":
         return { ...expr, fn: this.expr(expr.fn, shadow), arg: this.expr(expr.arg, shadow) };
       case "lambda": {

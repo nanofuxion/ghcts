@@ -1582,6 +1582,136 @@ const programs = [
     expect: "RedGreenint",
   },
   {
+    // The ascription is the only thing choosing an instance here: `2` on its
+    // own is an ambiguous `Num` wanted and defaults to `Int`. Delete the
+    // `:: Double` and this program still compiles - and answers "intint",
+    // which is what makes the case worth having.
+    name: "ascription: `:: Double` selects an instance defaulting would not",
+    source: [
+      "module Main where",
+      "class Which a where",
+      "  which :: a -> [Char]",
+      "instance Which Int where",
+      "  which n = \"int\"",
+      "instance Which Double where",
+      "  which n = \"double\"",
+      "main :: [Char]",
+      "main = which (2 :: Double) ++ which 2",
+      "",
+    ].join("\n"),
+    expect: "doubleint",
+  },
+  {
+    // A string literal whose type is written out goes through `fromString` at
+    // that type, which for a `JSString` means a real JavaScript string rather
+    // than the `[Char]` the literal starts as. `toUpper` is the JS one, so it
+    // could not have run on a list. This is the form miso spells everywhere as
+    // `"button" :: MisoString`; inference-driven OverloadedStrings is not here.
+    name: "ascription: a string literal at JSString is fromString at JSString",
+    source: [
+      "module Main where",
+      "import Data.JSString",
+      "main :: [Char]",
+      "main = unpack (toUpper (\"hi\" :: JSString))",
+      "",
+    ].join("\n"),
+    expect: "HI",
+  },
+  {
+    // `Miso.JSON`'s shape exactly: the method ignores its argument and reads
+    // the field name off a phantom whose type is written out. The `s` in the
+    // ascription is the *instance head's* `s`, so `Selector s` comes from the
+    // instance context - which is the only reason `selName` has a dictionary
+    // at all. Nothing forces the `undefined`.
+    name: "ascription: a phantom's type selects the Selector dictionary",
+    source: [
+      "module Main where",
+      "import GHC.Generics",
+      "data Point = Point { px :: Int, py :: Int }",
+      "  deriving (Generic)",
+      "class GNames f where",
+      "  gnames :: f p -> [Char]",
+      "instance GNames f => GNames (M1 D c f) where",
+      "  gnames (M1 x) = gnames x",
+      "instance GNames f => GNames (M1 C c f) where",
+      "  gnames (M1 x) = gnames x",
+      "instance (GNames f, GNames g) => GNames (f :*: g) where",
+      "  gnames (a :*: b) = gnames a ++ (\",\" ++ gnames b)",
+      "instance Selector s => GNames (M1 S s (K1 R a)) where",
+      "  gnames m = selName (M1 undefined :: S1 s (K1 R a) ())",
+      "names :: (Generic a, GNames (Rep a)) => a -> [Char]",
+      "names x = gnames (from x)",
+      "main :: [Char]",
+      "main = names (Point 3 4)",
+      "",
+    ].join("\n"),
+    expect: "px,py",
+  },
+  {
+    // `deriving anyclass` writes the *empty* instance, so `label Red` can only
+    // work by running the class's own `default label ::` implementation over
+    // the derived `Generic`. The counter's `Model` derives its `ToJSON` this
+    // way, down to the separate `stock`/`anyclass` clauses.
+    name: "deriving anyclass: the empty instance runs the class default",
+    source: [
+      "module Main where",
+      "import GHC.Generics",
+      "class GName f where",
+      "  gname :: f p -> [Char]",
+      "instance GName f => GName (M1 D c f) where",
+      "  gname (M1 x) = gname x",
+      "instance (GName f, GName g) => GName (f :+: g) where",
+      "  gname v = case v of",
+      "    L1 a -> gname a",
+      "    R1 b -> gname b",
+      "instance Constructor c => GName (M1 C c f) where",
+      "  gname m = conName m",
+      "class Label a where",
+      "  label :: a -> [Char]",
+      "  default label :: (Generic a, GName (Rep a)) => a -> [Char]",
+      "  label x = gname (from x)",
+      "data Colour = Red | Green",
+      "  deriving stock (Generic)",
+      "  deriving anyclass (Label)",
+      // Two anyclass derivations of one default: each needs its *own* `Rep`,
+      // and the `Generic` fundep improves each independently.
+      "data Shade = Dark | Light",
+      "  deriving stock (Generic)",
+      "  deriving anyclass (Label)",
+      "instance Label Int where",
+      "  label n = \"int\"",
+      "main :: [Char]",
+      "main = label Red ++ (label Green ++ (label Dark ++ label (1 :: Int)))",
+      "",
+    ].join("\n"),
+    expect: "RedGreenDarkint",
+  },
+  {
+    // `deriving newtype` must reach the *wrapped* type's instance in both
+    // directions: `tag` takes the newtype apart to call `Tag Int`'s method,
+    // and `base` - which mentions `a` only in its result - builds a `Count`
+    // out of `Tag Int`'s `41`. If either end picked `Count`'s own instance the
+    // derivation would be circular and this would not terminate.
+    name: "deriving newtype: the wrapped type's instance, both directions",
+    source: [
+      "module Main where",
+      "class Tag a where",
+      "  tag :: a -> [Char]",
+      "  base :: a",
+      "instance Tag Int where",
+      "  tag n = \"int:\" ++ show n",
+      "  base = 41",
+      "newtype Count = Count Int",
+      "  deriving newtype (Tag)",
+      "bump :: Count -> Count",
+      "bump (Count n) = Count (n + 1)",
+      "main :: [Char]",
+      "main = tag (bump base)",
+      "",
+    ].join("\n"),
+    expect: "int:42",
+  },
+  {
     // A string literal is not punctuation: `(","` is an open parenthesis and a
     // string, and `","` inside a list or a case alternative is a value.
     name: "a string literal whose text is punctuation",

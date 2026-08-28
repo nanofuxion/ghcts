@@ -177,6 +177,8 @@ class Sugar {
 
   expr(e: Expr): Expr {
     switch (e.tag) {
+      case "annot":
+        return { ...e, expr: this.expr(e.expr) };
       case "app":
         return { ...e, fn: this.expr(e.fn), arg: this.expr(e.arg) };
       case "lambda":

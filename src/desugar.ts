@@ -187,6 +187,10 @@ class Desugarer {
         );
       case "unit":
         return { tag: "Lit", lit: int(0) };
+      // The type has already done its work in `src/elaborate.ts`, and STG is
+      // type-erased, so the node is simply the expression it wraps.
+      case "annot":
+        return this.expr(e.expr, scope);
       case "var":
         return this.varRef(e.name, scope, e.span);
       case "app": {

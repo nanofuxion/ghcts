@@ -9,10 +9,20 @@ export interface CaseAlternative {
 export interface Guard { condition?: Expr; pattern?: Pattern; source?: Expr; body: Expr; }
 export type ListQualifier = { tag: 'guard'; condition: Expr } | { tag: 'generator'; pattern: Pattern; source: Expr };
 export type DoStatement = { tag: 'expr'; expr: Expr } | { tag: 'bind'; pattern: Pattern; source: Expr } | { tag: 'let'; bindings: LocalBinding[] };
-export type Expr = { tag: 'var'; name: string; span: Span } | { tag: 'int'; value: number; span: Span } | { tag: 'double'; value: number; span: Span } | { tag: 'string'; value: string; span: Span } | { tag: 'char'; value: string; span: Span } | { tag: 'unit'; span: Span } | { tag: 'tuple'; items: Expr[]; span: Span } | { tag: 'list'; items: Expr[]; span: Span } | { tag: 'listComp'; body: Expr; qualifiers: ListQualifier[]; span: Span } | { tag: 'jsQuote'; body: string; quoter?: string; span: Span } | { tag: 'record'; constructor: string; fields: Array<{ name: string; value: Expr }>; wildcard?: boolean; span: Span } | { tag: 'recordUpdate'; base: Expr; fields: Array<{ name: string; value: Expr }>; span: Span } | { tag: 'app'; fn: Expr; arg: Expr; span: Span } | { tag: 'lambda'; parameter: string; body: Expr; span: Span } | { tag: 'lambdaCase'; alternatives: CaseAlternative[]; span: Span } | { tag: 'let'; bindings: LocalBinding[]; body: Expr; span: Span } | { tag: 'do'; statements: DoStatement[]; span: Span } | { tag: 'if'; condition: Expr; thenBranch: Expr; elseBranch: Expr; span: Span } | { tag: 'case'; subject: Expr; alternatives: CaseAlternative[]; span: Span };
+export type Expr = { tag: 'var'; name: string; span: Span } | { tag: 'int'; value: number; span: Span } | { tag: 'double'; value: number; span: Span } | { tag: 'string'; value: string; span: Span } | { tag: 'char'; value: string; span: Span } | { tag: 'unit'; span: Span } | { tag: 'tuple'; items: Expr[]; span: Span } | { tag: 'list'; items: Expr[]; span: Span } | { tag: 'listComp'; body: Expr; qualifiers: ListQualifier[]; span: Span } | { tag: 'jsQuote'; body: string; quoter?: string; span: Span } | { tag: 'record'; constructor: string; fields: Array<{ name: string; value: Expr }>; wildcard?: boolean; span: Span } | { tag: 'recordUpdate'; base: Expr; fields: Array<{ name: string; value: Expr }>; span: Span } | { tag: 'app'; fn: Expr; arg: Expr; span: Span } | { tag: 'lambda'; parameter: string; body: Expr; span: Span } | { tag: 'lambdaCase'; alternatives: CaseAlternative[]; span: Span } | { tag: 'let'; bindings: LocalBinding[]; body: Expr; span: Span } | { tag: 'do'; statements: DoStatement[]; span: Span } | { tag: 'if'; condition: Expr; thenBranch: Expr; elseBranch: Expr; span: Span } | { tag: 'case'; subject: Expr; alternatives: CaseAlternative[]; span: Span } | { tag: 'annot'; expr: Expr; /** The written type, as source text; `src/elaborate.ts` parses it. */ type: string; span: Span };
 export interface LocalBinding { name: string; patterns: Pattern[]; value: Expr; guards?: Guard[]; whereBindings?: LocalBinding[]; span: Span; }
 export interface ValueDeclaration { tag: 'value'; name: string; equations: Array<{ patterns: Pattern[]; guards: Guard[]; whereBindings: LocalBinding[] }>; span: Span; }
-export interface DataDeclaration { tag: 'data'; name: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[] }>; deriving: string[]; newtype?: boolean; span: Span; }
+export interface DataDeclaration { tag: 'data'; name: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[] }>;
+  /** GHC's `deriving stock`, and a strategy-less clause, which means the same
+   * for the classes this compiler derives. */
+  deriving: string[];
+  /** `deriving anyclass (C)`: an empty instance, every method from the class's
+   * own defaults. */
+  derivingAnyclass?: string[];
+  /** `deriving newtype (C)`: the wrapped type's instance, lifted through the
+   * newtype's constructor. */
+  derivingNewtype?: string[];
+  newtype?: boolean; span: Span; }
 /** The signature is split at top-level arrows, preserving the declared Haskell types. */
 export interface ForeignDeclaration { tag: 'foreign'; name: string; javascript: string; signature: string[]; arity: number; span: Span; }
 /** `isDefault` marks GHC's DefaultSignatures form, `default f :: ty` in a class

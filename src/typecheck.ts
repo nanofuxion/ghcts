@@ -1299,6 +1299,10 @@ class Inferencer {
   }
   expr(expression: Expr, environment: Environment): Type {
     switch (expression.tag) {
+      // This checker has no reader for a written signature; the ascription is
+      // honoured by `src/elaborate.ts`, which is the pass on the compiler path.
+      case "annot":
+        return this.expr(expression.expr, environment);
       case "int":
         return int;
       case "double":

@@ -295,6 +295,8 @@ function expandExprQuotes(expr: Expr): Expr {
           value: expandExprQuotes(field.value),
         })),
       };
+    case "annot":
+      return { ...expr, expr: expandExprQuotes(expr.expr) };
     case "app":
       return {
         ...expr,
@@ -1018,8 +1020,14 @@ class Parser {
       }
       constructors.push({ name: constructor, arity, fields, fieldTypes });
     } while (this.accept("|"));
+    // The three GHC deriving strategies build three different instances, so
+    // they are kept apart: `stock` (and a strategy-less clause) is the one the
+    // compiler writes, `anyclass` is an empty instance, `newtype` lifts the
+    // wrapped type's.
     const deriving: string[] = [];
-    let inDeriving = false;
+    const derivingAnyclass: string[] = [];
+    const derivingNewtype: string[] = [];
+    let bucket: string[] | undefined;
     while (
       !this.at(";") &&
       !(this.at("}") && this.current().virtual) &&
@@ -1027,11 +1035,14 @@ class Parser {
     ) {
       const token = this.take();
       if (token.text === "deriving") {
-        inDeriving = true;
+        const strategy = this.current().text;
+        bucket =
+          strategy === "anyclass" ? derivingAnyclass : strategy === "newtype" ? derivingNewtype : deriving;
+        if (strategy === "anyclass" || strategy === "newtype" || strategy === "stock") this.take();
         continue;
       }
-      if (inDeriving && token.kind === "ident" && /^[A-Z]/.test(token.text))
-        deriving.push(token.text);
+      if (bucket && token.kind === "ident" && /^[A-Z]/.test(token.text))
+        bucket.push(token.text);
     }
     this.skipLines();
     return {
@@ -1040,6 +1051,8 @@ class Parser {
       parameters: [...new Set(parameters)],
       constructors,
       deriving: [...new Set(deriving)],
+      ...(derivingAnyclass.length ? { derivingAnyclass: [...new Set(derivingAnyclass)] } : {}),
+      ...(derivingNewtype.length ? { derivingNewtype: [...new Set(derivingNewtype)] } : {}),
       ...(isNewtype ? { newtype: true } : {}),
       span: start,
     };
@@ -1347,7 +1360,12 @@ class Parser {
         this.index === this.expressionStop ? undefined : this.currentOperator();
       fixity = operator && this.operatorFixity(operator);
     }
-    if (this.acceptTypeSignature()) this.skipTypeAnnotation();
+    // `::` binds looser than every operator, so an ascription is only taken at
+    // the outermost call - otherwise `a + b :: T` would ascribe `b`.
+    if (min === -1 && this.acceptTypeSignature()) {
+      const type = this.typeAnnotation();
+      if (type) return { tag: "annot", expr: left, type, span: left.span };
+    }
     return left;
   }
   /** `S.|>` lexes as ident `S.` plus symbol `|>`. Treat that pair as one operator. */
@@ -1961,7 +1979,7 @@ class Parser {
       if (this.accept(")"))
         return { tag: "con", name: "()", args: [], span: token.span };
       const left = this.pattern();
-      if (this.acceptTypeSignature()) this.skipTypeAnnotation();
+      if (this.acceptTypeSignature()) this.typeAnnotation();
       if (
         this.current().kind === "ident" &&
         this.current().text.endsWith(".") &&
@@ -2121,19 +2139,22 @@ class Parser {
     }
     return undefined;
   }
-  private skipTypeAnnotation() {
+  /** The tokens of a type annotation, as source text. Joined with spaces: the
+   * type parser re-lexes, so only token boundaries matter. */
+  private typeAnnotation(): string {
+    const parts: string[] = [];
     let depth = 0;
     while (this.current().kind !== "eof") {
       const token = this.current();
       if (token.text === "(" || token.text === "[") {
         depth++;
-        this.take();
+        parts.push(this.take().text);
         continue;
       }
       if (token.text === ")" || token.text === "]") {
-        if (!depth) return;
+        if (!depth) return parts.join(" ");
         depth--;
-        this.take();
+        parts.push(this.take().text);
         continue;
       }
       if (
@@ -2147,9 +2168,10 @@ class Parser {
           token.text === "in" ||
           token.text === "where")
       )
-        return;
-      this.take();
+        return parts.join(" ");
+      parts.push(this.take().text);
     }
+    return parts.join(" ");
   }
   private lambdaPattern(): import("./ast.js").Pattern {
     const token = this.current();
