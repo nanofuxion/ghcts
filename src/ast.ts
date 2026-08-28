@@ -15,7 +15,10 @@ export interface ValueDeclaration { tag: 'value'; name: string; equations: Array
 export interface DataDeclaration { tag: 'data'; name: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[] }>; deriving: string[]; newtype?: boolean; span: Span; }
 /** The signature is split at top-level arrows, preserving the declared Haskell types. */
 export interface ForeignDeclaration { tag: 'foreign'; name: string; javascript: string; signature: string[]; arity: number; span: Span; }
-export interface SignatureDeclaration { tag: 'signature'; name: string; type: string; span: Span; }
+/** `isDefault` marks GHC's DefaultSignatures form, `default f :: ty` in a class
+ * body: the type of the class's *default implementation* of `f`, which may be
+ * more constrained than `f`'s own. */
+export interface SignatureDeclaration { tag: 'signature'; name: string; type: string; isDefault?: true; span: Span; }
 export interface TypeAliasDeclaration { tag: 'typeAlias'; name: string; parameters: string[]; target: string; /** Empty only to keep declaration visitors exhaustive until Core gains aliases. */ equations: []; span: Span; }
 /** Class/instance headers and members are preserved instead of being skipped.
  * Dictionary construction is a later typed-Core phase, but interface and

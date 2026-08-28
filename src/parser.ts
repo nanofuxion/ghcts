@@ -12,6 +12,7 @@ import type {
   Span,
   ValueDeclaration,
 } from "./ast.js";
+import { createHash } from "node:crypto";
 import { error } from "./diagnostics.js";
 import { applyLayout, lex, type Token } from "./lexer.js";
 import type { Diagnostic } from "./types.js";
@@ -402,10 +403,41 @@ function tokenSpelling(token: Token): string {
     return `[${token.quoter ?? "js"}|${token.text}|]`;
   return token.text;
 }
+/** GHC's `mkStaticPtrFingerprint`: `fingerprintString "unit:module:index"`.
+ *
+ * The key has to be a *function of the source*, not of anything that happens at
+ * run time. A `static` form is looked up from a JavaScript context other than
+ * the one that built it - miso's main-thread scheduler derefs a pointer the
+ * worker only ever names - and the two contexts share nothing but the program
+ * text, so an allocation counter would give them two different keys for one
+ * value.
+ *
+ * `fingerprintString` hashes each `Char` as four big-endian bytes (not UTF-8),
+ * and `peekFingerprint` reads the 16-byte digest as two big-endian `Word64`s.
+ * Splitting those into four 32-bit words is what `h$hs_spt_insert` takes, and
+ * is the same order GHC's own `StgToJS.StaticPtr` passes them in. */
+function staticPtrFingerprint(unit: string, moduleName: string, index: number): [number, number, number, number] {
+  const text = `${unit}:${moduleName}:${index}`;
+  const bytes = new Uint8Array(text.length * 4);
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    bytes[i * 4] = (c >>> 24) & 0xff;
+    bytes[i * 4 + 1] = (c >>> 16) & 0xff;
+    bytes[i * 4 + 2] = (c >>> 8) & 0xff;
+    bytes[i * 4 + 3] = c & 0xff;
+  }
+  const digest = createHash("md5").update(bytes).digest();
+  return [digest.readUInt32BE(0), digest.readUInt32BE(4), digest.readUInt32BE(8), digest.readUInt32BE(12)];
+}
+
 class Parser {
   private index = 0;
   /** Exclusive token boundary used while parsing the operand of `(expr op)`. */
   private expressionStop = -1;
+  /** `static e` bindings floated out of this module's expressions, in source
+   * order - the order that fixes each one's fingerprint. */
+  private readonly staticForms: ValueDeclaration[] = [];
+  private moduleName = "Main";
   constructor(
     private readonly tokens: Token[],
     private readonly file: string,
@@ -420,30 +452,38 @@ class Parser {
   private skipLines() {
     while (
       this.current().kind === "newline" ||
-      this.current().text === ";"
+      this.at(";")
     )
       this.take();
   }
   private acceptLayoutOpen() {
-    return this.current().text === "{" ? !!this.take() : false;
+    return this.at("{") ? !!this.take() : false;
   }
   private acceptLayoutClose() {
-    return this.current().text === "}" ? !!this.take() : false;
+    return this.at("}") ? !!this.take() : false;
+  }
+  /** A token *is* the given punctuation or keyword. A string or character
+   * literal is not: `("," ++ xs)` holds a string whose text is a comma, and
+   * matching it as the tuple separator turns a legal expression into a syntax
+   * error. Only symbols and identifiers can be punctuation. */
+  private at(text: string, offset = 0): boolean {
+    const token = this.tokens[this.index + offset];
+    return token !== undefined && token.text === text && (token.kind === "symbol" || token.kind === "ident");
   }
   private accept(text: string) {
-    if (this.current().text === text) {
+    if (this.at(text)) {
       this.take();
       return true;
     }
     return false;
   }
   private acceptTypeSignature() {
-    if (this.current().text === "::") {
+    if (this.at("::")) {
       this.take();
       return true;
     }
     if (
-      this.current().text === ":" &&
+      this.at(":") &&
       this.tokens[this.index + 1]?.text === ":"
     ) {
       this.take();
@@ -473,9 +513,10 @@ class Parser {
     const exports: string[] = [];
     const reexports: string[] = [];
     const declarations: Declaration[] = [];
-    if (this.current().text === "module") {
+    if (this.at("module")) {
       this.take();
       name = this.take().text;
+      this.moduleName = name;
       // Export lists are an interface concern; retain module identity now and
       // leave export filtering to resolution.  They may span many layout
       // lines, unlike the old `module X where` assumption.
@@ -524,7 +565,7 @@ class Parser {
         this.skipLines();
         continue;
       }
-      if (this.current().text === "import") {
+      if (this.at("import")) {
         imports.push(this.importDeclaration());
         continue;
       }
@@ -542,7 +583,10 @@ class Parser {
       imports,
       exports: [...new Set(exports)],
       reexports: [...new Set(reexports)],
-      declarations,
+      // The floated `static` bindings belong to this module, so they are
+      // renamed and scoped with it (see src/modules.ts) - which is what keeps
+      // the closed expression's names resolving where they were written.
+      declarations: [...declarations, ...this.staticForms],
     };
   }
   private importDeclaration(): ImportDeclaration {
@@ -552,7 +596,7 @@ class Parser {
     let alias: string | undefined;
     if (this.accept("as")) alias = this.take().text;
     const hiding = this.accept("hiding");
-    const names = this.current().text === "(" ? this.importNames() : undefined;
+    const names = this.at("(") ? this.importNames() : undefined;
     this.lineEnd();
     return {
       module: imported,
@@ -598,7 +642,7 @@ class Parser {
         // indistinguishable during resolution.
         if (
           depth === 1 &&
-          this.current().text === "(" &&
+          this.at("(") &&
           this.tokens[this.index + 1]?.text === ".." &&
           this.tokens[this.index + 2]?.text === ")"
         ) {
@@ -616,7 +660,7 @@ class Parser {
   }
   private declaration(): Declaration | undefined {
     if (
-      this.current().text === "makeLenses" &&
+      this.at("makeLenses") &&
       this.tokens[this.index + 1]?.text === "''"
     ) {
       const start = this.take().span;
@@ -625,19 +669,19 @@ class Parser {
       this.skipLines();
       return { tag: "splice", name: "makeLenses", argument, span: start };
     }
-    if (this.current().text === "data" || this.current().text === "newtype")
+    if (this.at("data") || this.at("newtype"))
       return this.data();
-    if (this.current().text === "type") {
+    if (this.at("type")) {
       const start = this.take().span;
       const name = this.take().text;
       const parameters: string[] = [];
-      while (this.current().kind === "ident" && this.current().text !== "=")
+      while (this.current().kind === "ident" && !this.at("="))
         parameters.push(this.take().text);
       this.expect("=");
       const target: string[] = [];
       while (
-        this.current().text !== ";" &&
-        this.current().text !== "}" &&
+        !this.at(";") &&
+        !this.at("}") &&
         this.current().kind !== "eof"
       )
         target.push(this.take().text);
@@ -654,17 +698,17 @@ class Parser {
     if (["infix", "infixl", "infixr"].includes(this.current().text)) {
       this.take();
       while (
-        this.current().text !== ";" &&
-        this.current().text !== "}" &&
+        !this.at(";") &&
+        !this.at("}") &&
         this.current().kind !== "eof"
       )
         this.take();
       this.skipLines();
       return undefined;
     }
-    if (this.current().text === "class") return this.classDeclaration();
-    if (this.current().text === "instance") return this.instanceDeclaration();
-    if (this.current().text === "foreign") return this.foreign();
+    if (this.at("class")) return this.classDeclaration();
+    if (this.at("instance")) return this.instanceDeclaration();
+    if (this.at("foreign")) return this.foreign();
     // Haskell permits one type signature for a comma-separated binder group.
     // Retain the first name in the current AST (which has one signature node
     // per declaration) while consuming the entire group without cascading.
@@ -688,8 +732,8 @@ class Parser {
         this.acceptTypeSignature();
         const type: string[] = [];
         while (
-          this.current().text !== ";" &&
-          this.current().text !== "}" &&
+          !this.at(";") &&
+          !this.at("}") &&
           this.current().kind !== "eof"
         )
           type.push(this.take().text);
@@ -705,7 +749,7 @@ class Parser {
     // A top-level tuple pattern binding is valid (`(x, y) = action`).  It
     // needs Core pattern-binding support later, but parsing it as a synthetic
     // zero-argument value keeps following declarations recoverable.
-    if (this.current().text === "(") {
+    if (this.at("(")) {
       const start = this.current().span;
       let probe = this.index;
       let depth = 0;
@@ -739,7 +783,7 @@ class Parser {
     if (
       this.current().kind !== "ident" &&
       this.current().kind !== "symbol" &&
-      this.current().text !== "("
+      !this.at("(")
     ) {
       const t = this.take();
       this.diagnostics.push(
@@ -766,8 +810,8 @@ class Parser {
     if (this.acceptTypeSignature()) {
       const type: string[] = [];
       while (
-        this.current().text !== ";" &&
-        this.current().text !== "}" &&
+        !this.at(";") &&
+        !this.at("}") &&
         this.current().kind !== "eof"
       )
         type.push(this.take().text);
@@ -825,10 +869,21 @@ class Parser {
       span: start,
     } satisfies ValueDeclaration;
   }
+  /** A type or data constructor name, which may be an operator in parentheses:
+   * `data (:*:) f g p = (:*:) (f p) (g p)` declares both. */
+  private conName(): string {
+    if (this.at("(") && /^:/.test(this.tokens[this.index + 1]?.text ?? "") && this.tokens[this.index + 2]?.text === ")") {
+      this.take();
+      const operator = this.take().text;
+      this.take();
+      return operator;
+    }
+    return this.take().text;
+  }
   private data(): DataDeclaration {
-    const isNewtype = this.current().text === "newtype";
+    const isNewtype = this.at("newtype");
     const start = this.take().span;
-    const name = this.take().text;
+    const name = this.conName();
     // Declaration heads may contain kind signatures/applications, as in
     // `newtype Path (path :: Symbol) = ...`; find the top-level equals.
     let headerDepth = 0;
@@ -859,7 +914,7 @@ class Parser {
       //   `forall a. C a` and `(Eq a, Show a) => C a`.
       // Skip that type-level prefix without allowing its punctuation or class
       // name to become a bogus constructor binder.
-      if (this.current().text === "forall") {
+      if (this.at("forall")) {
         this.take();
         // The lexer keeps qualified identifiers intact and consequently also
         // represents `result.` (the common no-space forall spelling) as one
@@ -869,7 +924,7 @@ class Parser {
           if (variable.text === "." || variable.text.endsWith(".")) break;
         }
       }
-      if (this.current().text === "(") {
+      if (this.at("(")) {
         let probe = this.index;
         let depth = 0;
         do {
@@ -891,14 +946,14 @@ class Parser {
         if (this.tokens[probe]?.text === "=>")
           while (this.index <= probe) this.take();
       }
-      const constructor = this.take().text;
+      const constructor = this.conName();
       let arity = 0;
       let fields: string[] | undefined;
       let fieldTypes: string[] | undefined;
       if (this.accept("{")) {
         fields = [];
         fieldTypes = [];
-        while (this.current().text !== "}" && this.current().kind !== "eof") {
+        while (!this.at("}") && this.current().kind !== "eof") {
           const field = this.take();
           if (field.kind === "ident") {
             fields.push(field.text);
@@ -927,16 +982,16 @@ class Parser {
         // Stop only at a declaration-level constructor separator/deriving/layout.
         while (
           this.current().kind !== "eof" &&
-          this.current().text !== "|" &&
-          this.current().text !== "deriving" &&
-          this.current().text !== ";" &&
-          !(this.current().text === "}" && this.current().virtual)
+          !this.at("|") &&
+          !this.at("deriving") &&
+          !this.at(";") &&
+          !(this.at("}") && this.current().virtual)
         ) {
-          if (this.current().text === "!") {
+          if (this.at("!")) {
             this.take();
             continue;
           }
-          if (this.current().text === "(" || this.current().text === "[") {
+          if (this.at("(") || this.at("[")) {
             const spelling: string[] = [];
             let depth = 0;
             do {
@@ -966,8 +1021,8 @@ class Parser {
     const deriving: string[] = [];
     let inDeriving = false;
     while (
-      this.current().text !== ";" &&
-      !(this.current().text === "}" && this.current().virtual) &&
+      !this.at(";") &&
+      !(this.at("}") && this.current().virtual) &&
       this.current().kind !== "eof"
     ) {
       const token = this.take();
@@ -994,7 +1049,7 @@ class Parser {
     | import("./ast.js").UnsupportedDeclaration {
     const start = this.take().span;
     if (!this.accept("import")) {
-      while (this.current().text !== ";" && this.current().kind !== "eof")
+      while (!this.at(";") && this.current().kind !== "eof")
         this.take();
       this.skipLines();
       return { tag: "unsupported", feature: "foreign export", span: start };
@@ -1002,8 +1057,8 @@ class Parser {
     const callingConvention = this.take();
     if (callingConvention.text !== "javascript") {
       while (
-        this.current().text !== ";" &&
-        this.current().text !== "}" &&
+        !this.at(";") &&
+        !this.at("}") &&
         this.current().kind !== "eof"
       )
         this.take();
@@ -1041,8 +1096,8 @@ class Parser {
     let depth = 0;
     while (
       this.current().kind !== "newline" &&
-      this.current().text !== ";" &&
-      this.current().text !== "}" &&
+      !this.at(";") &&
+      !this.at("}") &&
       this.current().kind !== "eof"
     ) {
       const token = this.take();
@@ -1215,22 +1270,27 @@ class Parser {
         tokens: segment.map(tokenSpelling),
         span: segment[0].span,
       });
-      const signatureAt = segment.findIndex((token) => token.text === "::");
+      // GHC's DefaultSignatures: `default f :: ty` gives the class's *default
+      // implementation* of `f` its own, more constrained type. Reading the
+      // `default` keyword as the binder's name loses that type and, worse,
+      // invents a method called `default` that every instance is then missing.
+      const isDefault = segment[0]?.text === "default" && segment[1]?.kind === "ident";
+      const head = isDefault ? segment.slice(1) : segment;
+      const signatureAt = head.findIndex((token) => token.text === "::");
       if (signatureAt > 0) {
         const candidate =
-          segment[0].text === "(" && segment[2]?.text === ")"
-            ? segment[1]?.text
-            : segment[0].text;
+          head[0].text === "(" && head[2]?.text === ")" ? head[1]?.text : head[0].text;
         const typeStart = signatureAt + 1;
-        if (candidate && typeStart < segment.length)
+        if (candidate && typeStart < head.length)
           members.push({
             tag: "signature",
             name: candidate,
-            type: segment
+            type: head
               .slice(typeStart)
               .map((token) => token.text)
               .join(" "),
-            span: segment[0].span,
+            ...(isDefault ? { isDefault: true as const } : {}),
+            span: head[0].span,
           });
       }
       segment = [];
@@ -1259,8 +1319,8 @@ class Parser {
   private lineEnd() {
     while (
       this.current().kind !== "newline" &&
-      this.current().text !== ";" &&
-      this.current().text !== "}" &&
+      !this.at(";") &&
+      !this.at("}") &&
       this.current().kind !== "eof"
     )
       this.take();
@@ -1317,7 +1377,7 @@ class Parser {
     const qualified = this.qualifiedOperator();
     if (qualified) return qualified;
     if (
-      this.current().text === "`" &&
+      this.at("`") &&
       this.tokens[this.index + 1]?.kind === "ident" &&
       this.tokens[this.index + 2]?.text === "`"
     )
@@ -1331,7 +1391,7 @@ class Parser {
       this.take();
       return qualified;
     }
-    if (this.current().text === "`") {
+    if (this.at("`")) {
       this.take();
       const name = this.take();
       this.expect("`");
@@ -1379,7 +1439,7 @@ class Parser {
   // applied `(-)` section instead of `negate 5` - already handled correctly
   // for the parenthesized `(-5)` case above, just missing here.
   private negativeLiteral(): Expr | undefined {
-    if (this.current().text !== "-") return undefined;
+    if (!this.at("-")) return undefined;
     const saved = this.index;
     const minus = this.take();
     if (this.startsAtom()) {
@@ -1410,7 +1470,7 @@ class Parser {
   private recordUpdates(base: Expr): Expr {
     while (
       this.current().kind === "symbol" &&
-      this.current().text === "{" &&
+      this.at("{") &&
       !this.current().virtual
     ) {
       this.take();
@@ -1425,9 +1485,9 @@ class Parser {
     return base;
   }
   private skipVisibleTypeApplications() {
-    while (this.current().text === "@") {
+    while (this.at("@")) {
       this.take();
-      if (this.current().text === "'") this.take();
+      if (this.at("'")) this.take();
       const open = this.current().text;
       if (open === "(" || open === "[") {
         const close = open === "(" ? ")" : "]";
@@ -1459,6 +1519,33 @@ class Parser {
       t.text === "\\"
     );
   }
+  /** `static e` becomes a reference to a fresh top-level `StaticPtr` binding.
+   *
+   * Floating it out is not tidiness: the pointer must be *one* value with one
+   * identity, and an inline `StaticPtr key e` inside a function would allocate
+   * a fresh one on every call, so the table would hold whichever copy was
+   * registered last while `deRefStaticPtr` handed back another. */
+  private floatStaticForm(body: Expr, span: Span): Expr {
+    const name = `$static${this.staticForms.length}`;
+    const [k1, k2, k3, k4] = staticPtrFingerprint("main", this.moduleName, this.staticForms.length);
+    const key: Expr = [k1, k2, k3, k4].reduce<Expr>(
+      (fn, value) => ({ tag: "app", fn, arg: { tag: "int", value, span }, span }),
+      { tag: "var", name: "StaticKey", span },
+    );
+    const ptr: Expr = {
+      tag: "app",
+      fn: { tag: "app", fn: { tag: "var", name: "StaticPtr", span }, arg: key, span },
+      arg: body,
+      span,
+    };
+    this.staticForms.push({
+      tag: "value",
+      name,
+      equations: [{ patterns: [], guards: [{ body: ptr }], whereBindings: [] }],
+      span,
+    });
+    return { tag: "var", name, span };
+  }
   private atom(): Expr {
     const t = this.take();
     if (t.kind === "int")
@@ -1470,6 +1557,12 @@ class Parser {
       return { tag: "string", value: t.text, span: t.span };
     if (t.kind === "quasiquote")
       return { tag: "jsQuote", body: t.text, quoter: t.quoter, span: t.span };
+    // `static aexp`, the StaticPointers form. GHC floats each one to its own
+    // top-level binding before the body is ever looked at, and so does this:
+    // the fingerprint is the *position* of the form, so it must be fixed here,
+    // where the source order is, and not by anything downstream.
+    if (t.kind === "ident" && t.text === "static" && this.startsAtom())
+      return this.floatStaticForm(this.recordUpdates(this.atom()), t.span);
     if (t.kind === "ident" && t.text === "if") {
       const condition = this.expression();
       this.expect("then");
@@ -1504,8 +1597,8 @@ class Parser {
       const statements: import("./ast.js").DoStatement[] = [];
       while (
         this.current().kind !== "eof" &&
-        this.current().text !== "where" &&
-        this.current().text !== "}"
+        !this.at("where") &&
+        !this.at("}")
       ) {
         // Unlike an expression-level `let`, a do-statement binding has no
         // `in`: its scope is the rest of the block.
@@ -1520,7 +1613,7 @@ class Parser {
           // do not change the do-statement delimiter.
           if (this.acceptTypeSignature())
             while (
-              this.current().text !== "<-" &&
+              !this.at("<-") &&
               this.current().kind !== "eof"
             )
               this.take();
@@ -1561,7 +1654,7 @@ class Parser {
       };
     }
     if (t.text === "\\") {
-      if (this.current().text === "case") {
+      if (this.at("case")) {
         this.take();
         return {
           tag: "lambdaCase",
@@ -1570,7 +1663,7 @@ class Parser {
         };
       }
       const parameters: import("./ast.js").Pattern[] = [];
-      while (this.current().text !== "->" && this.current().kind !== "eof")
+      while (!this.at("->") && this.current().kind !== "eof")
         parameters.push(this.lambdaPattern());
       this.expect("->");
       let body = this.expression();
@@ -1625,18 +1718,18 @@ class Parser {
       // Tuple constructors are ordinary Haskell values: `(,)`, `(,,)`, etc.
       // Keep them as constructor names so typechecking and lowering can use
       // the same representation as tuple patterns and literals.
-      if (this.current().text === ",") {
+      if (this.at(",")) {
         let commas = 0;
         while (this.accept(",")) commas++;
         this.expect(")");
         return { tag: "var", name: `(${",".repeat(commas)})`, span: t.span };
       }
-      if (this.current().text === "-") {
+      if (this.at("-")) {
         const saved = this.index;
         this.take();
         if (this.startsAtom()) {
           const operand = this.recordUpdates(this.atom());
-          if (this.current().text === ")") {
+          if (this.at(")")) {
             this.expect(")");
             return {
               tag: "app",
@@ -1650,9 +1743,9 @@ class Parser {
       }
       if (
         this.operatorPrecedence(this.current()) !== undefined &&
-        this.current().text !== "-" &&
-        this.current().text !== "\\" &&
-        this.current().text !== "`" &&
+        !this.at("-") &&
+        !this.at("\\") &&
+        !this.at("`") &&
         this.tokens[this.index + 1]?.text !== ")"
       ) {
         const operator = this.take();
@@ -1714,7 +1807,7 @@ class Parser {
         };
       }
       if (
-        this.current().text === "`" &&
+        this.at("`") &&
         this.tokens[this.index + 1]?.kind === "ident" &&
         this.tokens[this.index + 2]?.text === "`"
       ) {
@@ -1809,7 +1902,7 @@ class Parser {
         };
       }
       if (this.acceptTypeSignature()) {
-        while (this.current().text !== ")" && this.current().kind !== "eof")
+        while (!this.at(")") && this.current().kind !== "eof")
           this.take();
         this.expect(")");
         return first;
@@ -1858,6 +1951,11 @@ class Parser {
   }
   private pattern(): import("./ast.js").Pattern {
     const token = this.take();
+    // Literals first: a string pattern may *contain* punctuation, and `"("` is
+    // a pattern matching one character, not an open parenthesis.
+    if (token.kind === "int") return { tag: "int", value: Number(token.text), span: token.span };
+    if (token.kind === "char") return { tag: "char", value: token.text, span: token.span };
+    if (token.kind === "string") return { tag: "string", value: token.text, span: token.span };
     if (token.text === "!") return this.pattern();
     if (token.text === "(") {
       if (this.accept(")"))
@@ -1879,6 +1977,15 @@ class Parser {
           args: [left, right],
           span: token.span,
         };
+      }
+      // Any constructor operator, not only `:`: `GHC.Generics` matches
+      // `(x :*: y)`, and a constructor written infix binds exactly as the
+      // prefix `(:*:) x y` it stands for.
+      if (this.current().kind === "symbol" && /^:.+/.test(this.current().text)) {
+        const operator = this.take().text;
+        const right = this.pattern();
+        this.expect(")");
+        return { tag: "con", name: operator, args: [left, right], span: token.span };
       }
       if (this.accept(":")) {
         const parts = [left];
@@ -1932,11 +2039,6 @@ class Parser {
           { tag: "con", name: "[]", args: [], span: token.span },
         );
     }
-    if (token.kind === "int")
-      return { tag: "int", value: Number(token.text), span: token.span };
-    if (token.kind === "char") return { tag: "char", value: token.text, span: token.span };
-    if (token.kind === "string")
-      return { tag: "string", value: token.text, span: token.span };
     if (token.kind === "ident") {
       if (token.text === "_") return { tag: "wild", span: token.span };
       if (this.accept("@"))
@@ -1954,7 +2056,7 @@ class Parser {
         if (this.accept("{")) {
           const fields: Array<{ name: string; pattern: import("./ast.js").Pattern }> = [];
           let wildcard = false;
-          while (this.current().kind !== "eof" && this.current().text !== "}") {
+          while (this.current().kind !== "eof" && !this.at("}")) {
             if (this.accept("..")) wildcard = true;
             else {
               const field = this.take();
@@ -1984,7 +2086,7 @@ class Parser {
   private recordFields(): { fields: Array<{ name: string; value: Expr }>; wildcard: boolean } {
     const fields: Array<{ name: string; value: Expr }> = [];
     let wildcard = false;
-    while (this.current().text !== "}" && this.current().kind !== "eof") {
+    while (!this.at("}") && this.current().kind !== "eof") {
       if (this.accept("..")) {
         wildcard = true;
         break;
@@ -2069,7 +2171,7 @@ class Parser {
         if (this.accept("{")) {
           const fields: Array<{ name: string; pattern: import("./ast.js").Pattern }> = [];
           let wildcard = false;
-          while (this.current().kind !== "eof" && this.current().text !== "}") {
+          while (this.current().kind !== "eof" && !this.at("}")) {
             if (this.accept("..")) wildcard = true;
             else {
               const field = this.take();
@@ -2151,8 +2253,8 @@ class Parser {
       this.acceptLayoutOpen();
       let depth = 1;
       while (depth && this.current().kind !== "eof") {
-        if (this.current().text === "{" && this.current().virtual) depth++;
-        else if (this.current().text === "}" && this.current().virtual) depth--;
+        if (this.at("{") && this.current().virtual) depth++;
+        else if (this.at("}") && this.current().virtual) depth--;
         this.take();
       }
     } else this.skipLines();
@@ -2167,9 +2269,9 @@ class Parser {
     while (
       this.startsPattern() &&
       this.current().text !== terminator &&
-      this.current().text !== "}"
+      !this.at("}")
     ) {
-      if (this.current().text === "(" || this.current().text === "[") {
+      if (this.at("(") || this.at("[")) {
         const start = this.current().span;
         const pattern = this.pattern();
         this.expect("=");
@@ -2204,8 +2306,8 @@ class Parser {
       }
       if (this.acceptTypeSignature()) {
         while (
-          this.current().text !== ";" &&
-          this.current().text !== "}" &&
+          !this.at(";") &&
+          !this.at("}") &&
           this.current().kind !== "eof"
         )
           this.take();
@@ -2343,7 +2445,7 @@ class Parser {
     const alternatives: import("./ast.js").CaseAlternative[] = [];
     while (
       this.current().kind !== "eof" &&
-      this.current().text !== "}"
+      !this.at("}")
     ) {
       let pattern = this.pattern();
       while (this.accept(":"))

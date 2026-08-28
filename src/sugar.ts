@@ -147,6 +147,15 @@ class Sugar {
         return { ...p, pattern: this.pattern(p.pattern) };
       case "con":
         return { ...p, args: p.args.map((arg) => this.pattern(arg)) };
+      // A `String` pattern is the list of `Char` patterns it denotes, exactly
+      // as a `String` *expression* is the list it denotes. Left as a literal it
+      // reaches pattern-match compilation as a refutable pattern nothing tests,
+      // and the alternative silently never fires.
+      case "string":
+        return [...p.value].reduceRight<Pattern>(
+          (tail, character) => ({ tag: "con", name: ":", args: [{ tag: "char", value: character, span: p.span }, tail], span: p.span }),
+          { tag: "con", name: "[]", args: [], span: p.span },
+        );
       case "record": {
         const info = this.cons.get(p.name);
         if (!info?.fields) {
@@ -412,4 +421,111 @@ export function derivedEqMethod(decl: DataDeclaration): ValueDeclaration {
     ],
     span,
   };
+}
+
+/** `deriving Generic`, as Haskell source.
+ *
+ * GHC's deriving builds the `Rep` from the shape of the declaration and
+ * nothing else, so it is generated the same way here - as text, parsed with
+ * everything else, because every name it uses is a *data constructor* or a
+ * type, and both live in one global namespace whatever module the type came
+ * from. There is nothing to rename and therefore no scope to carry.
+ *
+ * The metadata is where this and GHC part company. GHC's `MetaData`/`MetaCons`
+ * /`MetaSel` are type-level *strings*, and there is no `Symbol` kind here, so
+ * each datatype, constructor and selector gets a nullary type of its own with
+ * a `Datatype`/`Constructor`/`Selector` instance whose method returns the
+ * name. Generic code reads those names through exactly the same class methods,
+ * which is the part that has to agree.
+ *
+ * The sum and product trees are balanced, as GHC's are. Only self-consistency
+ * is load-bearing - `from` and `to` are generated from the same tree - but
+ * matching GHC costs nothing.
+ */
+export function derivedGenericSource(datas: readonly DataDeclaration[]): string {
+  const out: string[] = ["module GHCTS.Derived where"];
+  let derived = 0;
+  for (const decl of datas) {
+    if (!decl.deriving.includes("Generic")) continue;
+    // A constructor whose field types the parser did not capture cannot be
+    // given a `Rep`: `Rec0` needs the type. Better no instance than one whose
+    // fields are silently the wrong types.
+    if (decl.constructors.some((c) => (c.fieldTypes?.length ?? 0) !== c.arity)) continue;
+    derived++;
+    const meta = decl.name.replace(/[^A-Za-z0-9_]/g, "_");
+    const applied = decl.parameters.length ? `(${[decl.name, ...decl.parameters].join(" ")})` : decl.name;
+    out.push(`data Meta_D_${meta} = Meta_D_${meta}`);
+    out.push(`instance Datatype Meta_D_${meta} where`);
+    out.push(`  datatypeName x = ${JSON.stringify(decl.name)}`);
+    out.push(`  isNewtype x = ${decl.newtype === true ? "True" : "False"}`);
+
+    /** One constructor: its `C1` type, and how a value of it is wrapped and
+     * unwrapped. `$g<n>` names the fields; the same names appear in the
+     * pattern and in the expression on the other side. */
+    const conParts = decl.constructors.map((con, i) => {
+      const tag = `Meta_C_${meta}_${i}`;
+      out.push(`data ${tag} = ${tag}`);
+      out.push(`instance Constructor ${tag} where`);
+      out.push(`  conName x = ${JSON.stringify(con.name)}`);
+      out.push(`  conIsRecord x = ${con.fields ? "True" : "False"}`);
+      const fields = Array.from({ length: con.arity }, (_, j) => {
+        const sel = `Meta_S_${meta}_${i}_${j}`;
+        out.push(`data ${sel} = ${sel}`);
+        out.push(`instance Selector ${sel} where`);
+        // GHC's `selName` on a positional field is the empty string, and
+        // generic code tests exactly that to tell a record from a tuple.
+        out.push(`  selName x = ${JSON.stringify(con.fields?.[j] ?? "")}`);
+        const type = (con.fieldTypes?.[j] ?? "").replace(/^\s*!/, "").trim();
+        return { type: `S1 ${sel} (Rec0 (${type}))`, wrap: `M1 (K1 gRep${j})`, name: `gRep${j}` };
+      });
+      const body = fields.length === 0 ? { type: "U1", term: "U1" } : balance(fields.map((f) => ({ type: f.type, term: f.wrap })), ":*:");
+      return {
+        type: `C1 ${tag} (${body.type})`,
+        term: `M1 (${body.term})`,
+        pattern: `${con.name}${fields.map((f) => ` ${f.name}`).join("")}`,
+      };
+    });
+
+    if (conParts.length === 0) {
+      out.push(`instance Generic ${applied} (D1 Meta_D_${meta} V1) where`);
+      out.push(`  from x = case x of`);
+      out.push(`    _ -> error "Generic: uninhabited"`);
+      out.push(`  to x = error "Generic: uninhabited"`);
+      continue;
+    }
+    // The sum tree decides each constructor's `L1`/`R1` path, so it is walked
+    // once and both directions read off the same walk.
+    const arms: Array<{ term: string; pattern: string; con: number }> = [];
+    const sum = balanceSum(conParts.map((_, i) => i), (i, path) => {
+      const wrapped = path.reduceRight((inner, side) => `${side} (${inner})`, conParts[i]!.term);
+      arms.push({ term: wrapped, pattern: wrapped, con: i });
+      return conParts[i]!.type;
+    });
+    out.push(`instance Generic ${applied} (D1 Meta_D_${meta} (${sum})) where`);
+    out.push(`  from x = case x of`);
+    for (const arm of arms) out.push(`    ${conParts[arm.con]!.pattern} -> M1 (${arm.term})`);
+    out.push(`  to x = case x of`);
+    for (const arm of arms) out.push(`    M1 (${arm.pattern}) -> ${conParts[arm.con]!.pattern}`);
+  }
+  return derived === 0 ? "" : out.join("\n") + "\n";
+}
+
+/** A balanced tree of `op` over `items`, with the type and the term built
+ * together so a `:*:` in one is a `:*:` in the other. */
+function balance(items: ReadonlyArray<{ type: string; term: string }>, op: string): { type: string; term: string } {
+  if (items.length === 1) return items[0]!;
+  const half = Math.floor(items.length / 2);
+  const left = balance(items.slice(0, half), op);
+  const right = balance(items.slice(half), op);
+  return { type: `${left.type} ${op} (${right.type})`, term: `${left.term} ${op} (${right.term})` };
+}
+
+/** The balanced `:+:` tree, handing each leaf the `L1`/`R1` path that reaches
+ * it so the caller can build the two directions from one shape. */
+function balanceSum(items: readonly number[], leaf: (item: number, path: string[]) => string, path: string[] = []): string {
+  if (items.length === 1) return leaf(items[0]!, path);
+  const half = Math.floor(items.length / 2);
+  const left = balanceSum(items.slice(0, half), leaf, [...path, "L1"]);
+  const right = balanceSum(items.slice(half), leaf, [...path, "R1"]);
+  return `${left} :+: (${right})`;
 }

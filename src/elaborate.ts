@@ -64,7 +64,7 @@ import type {
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { renameDeclarations, renameValue, resolveProgram, type Scope } from "./modules.js";
 import { error } from "./diagnostics.js";
-import { constructorTable, derivedEqMethod, expandSugar, fieldSelectors } from "./sugar.js";
+import { constructorTable, derivedEqMethod, derivedGenericSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
 import { withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
@@ -219,7 +219,15 @@ function quantify(vars: TVar[], type: Type, constraints: Constraint[]): Scheme {
 
 // --------------------------------------------------------- type parsing ----
 
-const TYPE_TOKEN = /->|=>|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]/g;
+// A type *operator* is a constructor like any other - `f :*: g` is `(:*:) f g`
+// - and `GHC.Generics` names two of the four things a `Rep` is built from that
+// way, so an instance head that drops the operator has no head constructor at
+// all. `::` is matched only so a kind signature can be recognised and skipped;
+// it is not a type constructor.
+const TYPE_TOKEN = /->|=>|::|:[!#$%&*+./<=>?@\\^|~:-]+|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]/g;
+
+/** A type constructor written infix. `::` is a kind ascription, not one. */
+const isTypeOperator = (token: string | undefined): boolean => token !== undefined && token !== "::" && /^:/.test(token);
 
 function splitTop(tokens: readonly string[], separator: string): string[][] {
   const parts: string[][] = [[]];
@@ -258,19 +266,34 @@ class TypeParser {
    * application `s m`, so a class's arguments are parsed atom by atom. */
   argList(): Type[] {
     const args: Type[] = [];
-    while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
-      args.push(this.atom());
-    }
+    while (this.more()) args.push(this.atom());
     return args;
   }
 
+  /** Is another *atom* of an application still to come? A type operator ends
+   * one and starts the next, so it stops an application just as `->` does. */
+  private more(): boolean {
+    const token = this.tokens[this.index];
+    return token !== undefined && !["->", ")", "]", ",", "=>", "::"].includes(token) && !isTypeOperator(token);
+  }
+
   fun(): Type {
-    const left = this.application();
+    const left = this.operators();
     if (this.tokens[this.index] === "->") {
       this.index++;
       return tfun(left, this.fun());
     }
     return left;
+  }
+
+  /** `f :*: g` is `(:*:) f g`. Right-associative, as `GHC.Generics` declares
+   * both of its operators; a type operator binds tighter than `->`. */
+  private operators(): Type {
+    const left = this.application();
+    const token = this.tokens[this.index];
+    if (!isTypeOperator(token)) return left;
+    this.index++;
+    return tapp(tapp(tcon(token!), left), this.operators());
   }
 
   private application(): Type {
@@ -283,15 +306,11 @@ class TypeParser {
       let value = new TypeParser(TypeParser.tokens(synonym.target), bound, this.depth + 1).fun();
       // A partially applied synonym is still an application: `type Handler a =
       // a -> ()` used as `Handler Int Extra` keeps consuming arguments.
-      while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
-        value = tapp(value, this.atom());
-      }
+      while (this.more()) value = tapp(value, this.atom());
       return value;
     }
     let value = this.atom();
-    while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
-      value = tapp(value, this.atom());
-    }
+    while (this.more()) value = tapp(value, this.atom());
     return value;
   }
 
@@ -323,6 +342,18 @@ class TypeParser {
       while (this.tokens[this.index] === ",") {
         this.index++;
         items.push(this.fun());
+      }
+      // `(f :: Type -> Type)` is `f` with its kind written out. There are no
+      // kinds here, so the ascription is skipped rather than mistaken for an
+      // application - it is the *type* that names the instance.
+      if (this.tokens[this.index] === "::") {
+        let depth = 1;
+        while (this.index < this.tokens.length && depth > 0) {
+          const token_ = this.tokens[this.index];
+          if (token_ === "(" || token_ === "[") depth++;
+          if (token_ === ")" || token_ === "]") depth--;
+          if (depth > 0) this.index++;
+        }
       }
       if (this.tokens[this.index] === ")") this.index++;
       return items.length === 1
@@ -366,7 +397,66 @@ function parseSignature(source: string, vars: Map<string, Type>): { context: Con
       context.push({ cls: unqualify(item[0]!), types: new TypeParser(item.slice(1), vars).argList() });
     }
   }
-  return { context, type: new TypeParser(body, vars).fun() };
+  return resolveGenericRep(context, new TypeParser(body, vars).fun());
+}
+
+/** `Rep a`, GHC's associated type family, read as the class parameter its
+ * functional dependency determines.
+ *
+ * `class Generic a where type Rep a` cannot be written here - there are no
+ * type families - but `class Generic a rep | a -> rep` says the same thing
+ * about the same two types, and the improvement pass already solves `rep` from
+ * `a`. So a written
+ *
+ *   (Generic a, GToJSON (Rep a)) => a -> Value
+ *
+ * becomes `(Generic a r, GToJSON r) => a -> Value`, with one `r` per distinct
+ * argument of `Rep` across the whole signature - which is what makes the two
+ * constraints talk about the same representation.
+ *
+ * The limit of the reading is that `Rep a` is *solved for* and never
+ * *computed*: it is only meaningful where a constraint can be added to carry
+ * it, so a `Rep a` outside a signature has nowhere to put its `Generic`. */
+function resolveGenericRep(context: Constraint[], type: Type): { context: Constraint[]; type: Type } {
+  const key = (t: Type): string => {
+    const p = prune(t);
+    if (p.tag === "var") return `v${p.v}`;
+    if (p.tag === "app") return `(${key(p.fn)} ${key(p.arg)})`;
+    return p.tag === "con" ? `c${p.name}` : `g${p.index}`;
+  };
+  const reps = new Map<string, { arg: Type; rep: Type }>();
+  const repOf = (arg: Type): Type => {
+    const k = key(arg);
+    const seen = reps.get(k);
+    if (seen) return seen.rep;
+    const rep = freshVar();
+    reps.set(k, { arg, rep });
+    return rep;
+  };
+  const rewrite = (t: Type): Type => {
+    const p = prune(t);
+    if (p.tag !== "app") return p;
+    const fn = prune(p.fn);
+    if (fn.tag === "con" && fn.name === "Rep") return repOf(rewrite(p.arg));
+    return tapp(rewrite(p.fn), rewrite(p.arg));
+  };
+  const rewritten = context.map((c) => ({ cls: c.cls, types: c.types.map(rewrite) }));
+  const body = rewrite(type);
+  if (reps.size === 0) return { context: rewritten, type: body };
+  // A written `Generic a` names one argument; the second is the `rep` that the
+  // `Rep a`s in the same signature asked for.
+  const out = rewritten.map((c) =>
+    c.cls === "Generic" && c.types.length === 1 && reps.has(key(c.types[0]!))
+      ? { cls: c.cls, types: [c.types[0]!, repOf(c.types[0]!)] }
+      : c,
+  );
+  // A signature may mention `Rep a` and never say `Generic a`; the constraint
+  // is implied, and appending it keeps the order every call site agrees on.
+  for (const { arg, rep } of reps.values()) {
+    if (out.some((c) => c.cls === "Generic" && c.types.length === 2 && key(c.types[0]!) === key(arg))) continue;
+    out.push({ cls: "Generic", types: [arg, rep] });
+  }
+  return { context: out, type: body };
 }
 
 const parseType = (source: string, vars: Map<string, Type>): Type => parseSignature(source, vars).type;
@@ -379,6 +469,12 @@ interface ClassMethod {
   type: Type;
   /** `$dm<name>`, when the class body supplies a default. */
   hasDefault: boolean;
+  /** GHC's DefaultSignatures `default f :: ty`: the *extra* constraints the
+   * default implementation may assume, over the class's own. They become
+   * dictionary parameters of `$dm<name>`, supplied at each instance. */
+  defaultContext?: Constraint[];
+  /** The default implementation's own type, when it differs. */
+  defaultType?: Type;
 }
 
 interface ClassInfo {
@@ -418,7 +514,76 @@ interface InstanceInfo {
 /** A type constructor's name as it may appear inside a generated identifier;
  * `[]` and friends are legal type constructors but not legal name fragments. */
 const conKey = (con: string): string =>
-  con === "[]" ? "List" : con === "->" ? "Fun" : /^\(,+\)$/.test(con) ? `Tuple${con.length - 1}` : con;
+  con === "[]"
+    ? "List"
+    : con === "->"
+      ? "Fun"
+      : /^\(,+\)$/.test(con)
+        ? `Tuple${con.length - 1}`
+        : /^[A-Za-z_]/.test(con)
+          ? con
+          : `Op${[...con].map((c) => c.charCodeAt(0).toString(16)).join("")}`;
+
+/** The name an instance's dictionary is emitted under.
+ *
+ * This is every type constructor the head mentions, not only the outermost
+ * one. `GToFields (S1 m f)` and `GToFields (S1 m (Rec0 (Maybe a)))` have the
+ * same head constructor and are two different instances; naming both `$fGToFieldsM1`
+ * would silently emit one dictionary and use it for both. Variables contribute
+ * nothing, so `Eq [a]` is still `$fEqList` whatever `a` turns out to be. */
+function instanceKey(targets: readonly Type[]): string {
+  const parts: string[] = [];
+  const walk = (t: Type): void => {
+    const p = prune(t);
+    if (p.tag === "con") parts.push(conKey(p.name));
+    else if (p.tag === "app") {
+      walk(p.fn);
+      walk(p.arg);
+    }
+  };
+  for (const t of targets) {
+    const before = parts.length;
+    walk(t);
+    if (parts.length === before) parts.push("v");
+  }
+  return parts.join("");
+}
+
+/** GHC's overlap rule, and the only part of it this needs: when more than one
+ * instance matches a wanted, the one every other match is a *substitution
+ * instance of* wins.
+ *
+ * `GToFields (S1 m f)` and `GToFields (S1 m (Rec0 (Maybe a)))` both match a
+ * `Maybe` field; the second is the answer because the first matches it but not
+ * the other way round. Declaration order decides nothing - miso writes the two
+ * pairs it has in opposite orders - so it is not used. Two matches neither of
+ * which is more specific are genuinely ambiguous, and taking the first would be
+ * a coin toss, so `undefined` lets the caller report no instance.
+ *
+ * The comparison is on heads only. GHC's is too: an instance's context is not
+ * consulted when choosing between overlapping instances. */
+function mostSpecific(
+  matches: ReadonlyArray<{ instance: InstanceInfo; subst: Map<TVar, Type> }>,
+): { instance: InstanceInfo; subst: Map<TVar, Type> } | undefined {
+  if (matches.length <= 1) return matches[0];
+  const generalises = (a: InstanceInfo, b: InstanceInfo): boolean => {
+    // One substitution across all of a multi-parameter head's arguments: `C a a`
+    // does not generalise `C Int Bool`.
+    const subst = new Map<TVar, Type>();
+    return a.targets.length === b.targets.length && a.targets.every((t, i) => matchType(t, b.targets[i]!, subst));
+  };
+  // Drop every match that another match is *strictly* more specific than. What
+  // survives is the maximal one; several survive only when they are equally
+  // specific - which here means the same head twice, because `Data.Text.Text`
+  // and `MisoString` are one type - and then the first is as good as the last.
+  const survivors = matches.filter(
+    (m) =>
+      !matches.some(
+        (other) => other !== m && generalises(m.instance, other.instance) && !generalises(other.instance, m.instance),
+      ),
+  );
+  return survivors[0];
+}
 
 /** One-way matching: instantiate the *pattern*'s variables only, so a wanted
  * type is never mutated by trying an instance that does not apply. */
@@ -825,6 +990,13 @@ class Elaborator {
     return changed;
   }
 
+  /** Improvement for a caller outside inference: an instance declaration's
+   * default-signature constraints need the same fundep pass a call site's do,
+   * and there is no binding there to run one. */
+  improveOne(wanted: Constraint, givens: readonly Constraint[], span: Span): void {
+    for (let round = 0; round < 8; round++) if (!this.improveConstraint(wanted, givens, span, 0)) return;
+  }
+
   private improve(binding: Binding): void {
     const givens = binding.signature?.context ?? [];
     // Improving one constraint can expose another (a determined argument may
@@ -883,9 +1055,15 @@ class Elaborator {
       this.report(`instance resolution for \`${showConstraint(cls, types)}\` did not terminate`, span);
       return undefined;
     }
+    const matches: Array<{ instance: InstanceInfo; subst: Map<TVar, Type> }> = [];
     for (const instance of this.byClass.get(cls) ?? []) {
       const subst = new Map<TVar, Type>();
       if (!types.every((t, i) => { const target = instance.targets[i]; return target !== undefined && matchType(target, t, subst); })) continue;
+      matches.push({ instance, subst });
+    }
+    const chosen = mostSpecific(matches);
+    if (chosen) {
+      const { instance, subst } = chosen;
       const self = variable(dictValue(cls, instance.emitCon), span);
       if (instance.context.length === 0) return self;
       return applyAll(
@@ -1053,6 +1231,17 @@ export function elaborateProgram(
       declarations.push(decl);
     }
   }
+  // `deriving Generic` is generated as Haskell and parsed with everything
+  // else; see `derivedGenericSource`. It joins the pile *after* the modules so
+  // a hand-written `Generic` instance for the same type is seen first, and
+  // wins the overlap comparison by being identical.
+  const derivedSource = derivedGenericSource(declarations.filter((d): d is DataDeclaration => d.tag === "data"));
+  if (derivedSource) {
+    const parsed = parseModule(derivedSource, "GHCTS/Derived.hs");
+    if (parsed.module && !parsed.diagnostics.some((d) => d.severity === "error"))
+      declarations.push(...parsed.module.ast.declarations);
+    else elaborator.diagnostics.push(...parsed.diagnostics);
+  }
   const env: Env = new Map();
 
   // --- type synonyms ----------------------------------------------------
@@ -1141,9 +1330,23 @@ export function elaborateProgram(
       own.set(value.name, classScope ? renameValue(value, classScope) : value);
     }
     const methods: ClassMethod[] = [];
+    // Parsed against the same variable map as the methods, so the `a` of
+    // `default toJSON :: (Generic a, GToJSON (Rep a)) => a -> Value` is the
+    // class's own parameter and not a second one.
+    const defaultSignatures = new Map<string, { context: Constraint[]; type: Type }>();
     for (const member of decl.members) {
-      if (member.tag !== "signature") continue;
-      methods.push({ name: member.name, type: parseType(member.type, vars), hasDefault: own.has(member.name) });
+      if (member.tag !== "signature" || member.isDefault !== true) continue;
+      defaultSignatures.set(member.name, parseSignature(member.type, vars));
+    }
+    for (const member of decl.members) {
+      if (member.tag !== "signature" || member.isDefault === true) continue;
+      const declared = defaultSignatures.get(member.name);
+      methods.push({
+        name: member.name,
+        type: parseType(member.type, vars),
+        hasDefault: own.has(member.name),
+        ...(declared ? { defaultContext: declared.context, defaultType: declared.type } : {}),
+      });
       if (own.has(member.name)) defaults.set(defaultImpl(decl.name, member.name), own.get(member.name)!);
     }
     elaborator.classes.set(decl.name, { name: decl.name, variables, superclasses: supers, fundeps, methods, span: decl.span });
@@ -1194,13 +1397,16 @@ export function elaborateProgram(
     const instanceScope = scopeOf.get(decl);
     for (const value of instanceMethodValues(decl, file))
       methods.set(value.name, instanceScope ? renameValue(value, instanceScope) : value);
-    elaborator.addInstance(`${parsed.className} ${targetCons.map((c) => c ?? "_").join(" ")}`, {
+    // Two instances at the same head are not an error here the way they are in
+    // GHC: `Data.Text.Text`, `Data.Text.Lazy.Text` and `MisoString` are all the
+    // one `JSString`, so a library that writes an instance for each has written
+    // the same instance three times, not three conflicting ones.
+    const emitCon = instanceKey(targets);
+    elaborator.addInstance(`${parsed.className} ${emitCon}`, {
       cls: parsed.className,
       targets,
       targetCons,
-      // A variable argument contributes `v`, so the two heads of a
-      // multi-parameter class still name two different dictionaries.
-      emitCon: targetCons.map((con) => (con === undefined ? "v" : conKey(con))).join(""),
+      emitCon,
       context,
       params: context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
       methods,
@@ -1311,12 +1517,20 @@ export function elaborateProgram(
       if (!method.hasDefault) continue;
       const decl = defaults.get(defaultImpl(info.name, method.name))!;
       const skolems = info.variables.map((_, i) => tcon(`%${info.name}${i}`));
+      const at = (t: Type): Type => substituteVars(t, info.variables, skolems);
       addBinding(
         defaultImpl(info.name, method.name),
         { ...decl, name: defaultImpl(info.name, method.name) },
+        // The class's own dictionary first - the default is a function of the
+        // instance being built - then whatever a `default f ::` signature asks
+        // for on top, in the order it wrote them. `instanceDeclaration` passes
+        // them in the same order.
         skolemise({
-          context: [{ cls: info.name, types: skolems }],
-          type: substituteVars(method.type, info.variables, skolems),
+          context: [
+            { cls: info.name, types: skolems },
+            ...(method.defaultContext ?? []).map((c) => ({ cls: c.cls, types: c.types.map(at) })),
+          ],
+          type: at(method.defaultType ?? method.type),
         }),
       );
     }
@@ -1374,6 +1588,10 @@ export function elaborateProgram(
   // the same wrapper GHC emits is what makes entry mean "run".
   const mainBinding = elaborator.bindings.get("main");
   const wrapMain = mainBinding !== undefined && headCon(mainBinding.monoType) === "IO";
+  // Every `static e` the program contains, in the order the parser floated
+  // them out (`$static0`, or `Miso_Types_$static0` once a non-root module's
+  // names are flattened).
+  const staticEntries = bindings.map((b) => b.name).filter((n) => /(?:^|_)\$static\d+$/.test(n));
   for (const binding of bindings) {
     const decl = rewriteBinding(elaborator, binding);
     if (binding !== mainBinding || !wrapMain) {
@@ -1381,7 +1599,20 @@ export function elaborateProgram(
       continue;
     }
     out.push({ ...decl, name: "$mainIO" });
-    out.push(valueDecl("main", [], apply(variable("runMainIO", decl.span), variable("$mainIO", decl.span)), decl.span));
+    // GHC registers the static pointer table from module initialisers, which
+    // run before `main`. The JS backend's initialisers are emitted by the
+    // *code generator*, which this frontend does not reach, so the same
+    // "before anything else" is bought by sequencing the registrations in
+    // front of `main` itself - the earliest point a Haskell program has.
+    // `sptRegisterThen`, not `>>`: this declaration is built *after*
+    // elaboration, so it may not name a class method - there is no dictionary
+    // left to pass one.
+    const body = staticEntries.reduceRight<Expr>(
+      (rest, name) =>
+        apply(apply(variable("sptRegisterThen", decl.span), variable(name, decl.span)), rest),
+      variable("$mainIO", decl.span),
+    );
+    out.push(valueDecl("main", [], apply(variable("runMainIO", decl.span), body), decl.span));
   }
 
   const roots = new Set(
@@ -1705,14 +1936,25 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
       elaborator.resolve(parent.cls, parent.types.map((t) => applySubst(t, at)), instance.params, instance.span) ??
       errorExpr(instance.span),
   );
-  const methods = info.methods.map((method) =>
-    instance.methods.has(method.name)
-      ? applyAll(variable(methodImpl(instance.cls, instance.emitCon, method.name), instance.span), args)
-      : // The default is a function of this very dictionary, which is why the
-        // instance binding is a genuinely self-referential CAF. It terminates
-        // because the field is a thunk, never a forced value.
-        apply(variable(defaultImpl(instance.cls, method.name), instance.span), self),
-  );
+  const methods = info.methods.map((method) => {
+    if (instance.methods.has(method.name))
+      return applyAll(variable(methodImpl(instance.cls, instance.emitCon, method.name), instance.span), args);
+    // The default is a function of this very dictionary, which is why the
+    // instance binding is a genuinely self-referential CAF. It terminates
+    // because the field is a thunk, never a forced value.
+    //
+    // A `default f ::` signature adds constraints on top, at this instance's
+    // own types: `default toJSON :: (Generic a, GToJSON (Rep a)) => ...` used
+    // at `instance ToJSON Colour` needs `Generic Colour rep` and `GToJSON rep`.
+    // `rep` is not written anywhere, so the fundep has to supply it first -
+    // improvement, then selection, exactly as an ordinary call site does.
+    const extra = (method.defaultContext ?? []).map((c) => {
+      const at_ = c.types.map((t) => applySubst(t, at));
+      elaborator.improveOne({ cls: c.cls, types: at_ }, instance.params, instance.span);
+      return elaborator.resolve(c.cls, at_, instance.params, instance.span) ?? errorExpr(instance.span);
+    });
+    return applyAll(variable(defaultImpl(instance.cls, method.name), instance.span), [self, ...extra]);
+  });
   return valueDecl(
     dictValue(instance.cls, instance.emitCon),
     instance.params.map((p): Pattern => ({ tag: "var", name: p.name, span: instance.span })),

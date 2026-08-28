@@ -1002,4 +1002,95 @@ zipWithM f xs ys = sequence (zipWith f xs ys)
 
 zipWithM_ :: Monad m => (a -> b -> m c) -> [a] -> [b] -> m ()
 zipWithM_ f xs ys = sequence_ (zipWith f xs ys)
+
+-- ------------------------------------------------------------- StaticPtr ---
+--
+-- \`StaticPtr\` is wired in, exactly as it is in GHC: \`GHC.Tc.Gen.Expr\` and
+-- \`GHC.HsToCore.Expr\` look the type constructor up by known key, because
+-- \`static e\` is a *keyword form* that a module need not have imported anything
+-- to write. \`GHC.StaticPtr\` (src/library.ts) is the module that re-exports
+-- what is declared here. \`src/parser.ts\` floats each \`static e\` into its own
+-- top-level binding and fills in the fingerprint.
+--
+-- GHC's key is \`Fingerprint Word64 Word64\`. There is no \`Word64\` here, and
+-- the static pointer table's own interface is four 32-bit words anyway -
+-- \`h$hs_spt_insert(k1,k2,k3,k4,ref)\` - so that is the shape, in the order GHC's
+-- \`StgToJS.StaticPtr\` passes them: the high and low halves of each \`Word64\`.
+data StaticKey = StaticKey Int Int Int Int
+data StaticPtr a = StaticPtr StaticKey a
+
+deRefStaticPtr :: StaticPtr a -> a
+deRefStaticPtr p = case p of
+  StaticPtr k v -> v
+
+staticKey :: StaticPtr a -> StaticKey
+staticKey p = case p of
+  StaticPtr k v -> k
+
+instance Eq StaticKey where
+  (==) a b = eqStaticKey a b
+
+eqStaticKey :: StaticKey -> StaticKey -> Bool
+eqStaticKey (StaticKey a b c d) (StaticKey w x y z) = a == w && b == x && c == y && d == z
+
+-- GHC's \`Show Fingerprint\` is the two \`Word64\` halves as sixteen zero-padded
+-- hex digits each, which is these four words as eight digits each.
+instance Show StaticKey where
+  show k = showStaticKey k
+
+showStaticKey :: StaticKey -> [Char]
+showStaticKey (StaticKey a b c d) = hex8 a ++ (hex8 b ++ (hex8 c ++ hex8 d))
+
+hex8 :: Int -> [Char]
+hex8 (I n) = hexDigits 8 n []
+
+hexDigits :: IntPrim -> IntPrim -> [Char] -> [Char]
+hexDigits width n acc =
+  if primIntEq width 0
+    then acc
+    else hexDigits (primIntSub width 1) (primIntQuot n 16) (hexDigit (primIntRem n 16) : acc)
+
+hexDigit :: IntPrim -> Char
+hexDigit n = if primIntLt n 10 then C (primChr (primIntAdd n 48)) else C (primChr (primIntAdd n 87))
+
+-- The static pointer table is the RTS's (rts/js/staticpointer.js), not a
+-- Haskell \`Map\`: \`unsafeLookupStaticPtr\` has to find an entry that a *different*
+-- JS context registered, and the table is the only thing both contexts share.
+foreign import javascript unsafe "((a,b,c,d,p) => { h$hs_spt_insert(a,b,c,d,p); return 0; })" primSptInsert :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> a -> IntPrim
+foreign import javascript unsafe "((a,b,c,d) => (h$hs_spt_lookup_key(a,b,c,d) === null ? 0 : 1))" primSptHas :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> IntPrim
+foreign import javascript unsafe "((a,b,c,d) => h$hs_spt_lookup_key(a,b,c,d))" primSptGet :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> a
+
+-- The entry itself is what goes in the table, so that \`unsafeLookupStaticPtr\`
+-- returns the same \`StaticPtr\` \`static e\` denotes. Forcing it to weak head
+-- normal form here allocates nothing extra and does not touch \`e\`: the payload
+-- is a lazy constructor field, as GHC's is.
+sptRegister :: StaticPtr a -> IO ()
+sptRegister p = IO (\\s -> sptRegisterStep s p)
+
+sptRegisterStep :: RealWorld -> StaticPtr a -> IOResult ()
+sptRegisterStep s p = case p of
+  StaticPtr k v -> case k of
+    StaticKey (I a) (I b) (I c) (I d) -> case primSptInsert a b c d p of
+      _ -> IOResult s ()
+
+-- What \`src/elaborate.ts\` puts in front of \`main\`. It is a plain function and
+-- not \`sptRegister p >> m\` because it is built after elaboration, where \`>>\`
+-- has no dictionary to be applied to.
+sptRegisterThen :: StaticPtr a -> IO b -> IO b
+sptRegisterThen p m = IO (\\s -> sptRegisterThenStep s p m)
+
+sptRegisterThenStep :: RealWorld -> StaticPtr a -> IO b -> IOResult b
+sptRegisterThenStep s p m = case sptRegisterStep s p of
+  IOResult t u -> unIO m t
+
+unsafeLookupStaticPtr :: StaticKey -> IO (Maybe (StaticPtr a))
+unsafeLookupStaticPtr k = case k of
+  StaticKey (I a) (I b) (I c) (I d) ->
+    if primIntEq (primSptHas a b c d) 0 then pure Nothing else sptFetch a b c d
+
+-- Split from the test above because the miss returns \`null\`, and \`null\` in a
+-- position something may enter is not a value - it is the crash one step later.
+sptFetch :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> IO (Maybe (StaticPtr a))
+sptFetch a b c d = case primSptGet a b c d of
+  p -> pure (Just p)
 `;

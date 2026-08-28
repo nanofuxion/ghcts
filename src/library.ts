@@ -940,6 +940,161 @@ on f g x y = f (g x) (g y)
 comparing :: Ord b => (a -> b) -> a -> a -> Ordering
 comparing f x y = compare (f x) (f y)
 `,
+  // \`Proxy\` carries nothing; it exists so that a type can be passed where a
+  // value is expected. That is all it is in GHC too.
+  "Data.Proxy": `module Data.Proxy where
+
+data Proxy t = Proxy
+
+instance Eq (Proxy t) where
+  (==) a b = True
+
+instance Show (Proxy t) where
+  show p = "Proxy"
+
+instance Functor Proxy where
+  fmap f p = Proxy
+
+instance Semigroup (Proxy t) where
+  (<>) a b = Proxy
+
+instance Monoid (Proxy t) where
+  mempty = Proxy
+
+asProxyTypeOf :: a -> proxy a -> a
+asProxyTypeOf x p = x
+`,
+  // GHC.Generics, as far as a compiler with no type families can express it.
+  //
+  // The representation types are ordinary Haskell and nothing else would do:
+  // `M1`, `K1`, `U1`, `(:*:)` and `(:+:)` exist to be *pattern matched* by
+  // generic code, so they have to be real data constructors with real fields.
+  //
+  // WHAT THE `Rep` TYPE FAMILY BECAME, AND WHY. GHC declares
+  //
+  //   class Generic a where { type Rep a; from :: a -> Rep a x; ... }
+  //
+  // and `Rep` is an associated *type family*. This elaborator has none. It
+  // does have multi-parameter classes with functional dependencies, and an
+  // associated type of one class parameter is exactly a second parameter the
+  // first determines, so `Generic` is declared as
+  //
+  //   class Generic a rep | a -> rep
+  //
+  // and `src/elaborate.ts` reads a written `Rep a` back as "the `rep` that
+  // `Generic a rep` improves to". That is a faithful reading of what the
+  // family means, and it is where the faithfulness stops: `Rep a` cannot be
+  // *computed* here, only solved for, so it may only appear where a
+  // constraint can be added - a signature's context - and never as, say, the
+  // right-hand side of a type synonym.
+  //
+  // WHAT IS MISSING. There is no `deriving Generic`: nothing here synthesises
+  // an instance from a data declaration, so every `Generic` instance is one
+  // somebody wrote. `Meta`/`MetaData`/`MetaCons`/`MetaSel` are absent for the
+  // same reason they would be useless - they are built from type-level
+  // strings, and this frontend has no `Symbol` kind - so the metadata classes
+  // below take whatever nullary type a hand-written instance names.
+  "GHC.Generics": `module GHC.Generics where
+
+-- \\\`V1\\\` is GHC's empty representation - the one a type with no constructors
+-- has. It is declared with a constructor here only because a data declaration
+-- with no right-hand side is not syntax this parser accepts; nothing may build
+-- one, and the name is deliberately unusable.
+data V1 p = V1Impossible
+data U1 p = U1
+data K1 i c p = K1 c
+data M1 i c f p = M1 (f p)
+data (:+:) f g p = L1 (f p) | R1 (g p)
+data (:*:) f g p = (:*:) (f p) (g p)
+data Par1 p = Par1 p
+data Rec1 f p = Rec1 (f p)
+
+-- The four tags that index \\\`M1\\\` and \\\`K1\\\`. They are phantom, so they need no
+-- constructors of their own beyond something to declare.
+data D = DTag
+data C = CTag
+data S = STag
+data R = RTag
+
+type D1 c f = M1 D c f
+type C1 c f = M1 C c f
+type S1 c f = M1 S c f
+type Rec0 c = K1 R c
+type Par0 c = K1 R c
+
+unM1 :: M1 i c f p -> f p
+unM1 (M1 x) = x
+
+unK1 :: K1 i c p -> c
+unK1 (K1 x) = x
+
+data Associativity = LeftAssociative | RightAssociative | NotAssociative
+data Fixity = Prefix | Infix Associativity Int
+
+instance Eq Associativity where
+  (==) a b = eqAssociativity a b
+
+eqAssociativity :: Associativity -> Associativity -> Bool
+eqAssociativity a b = case a of
+  LeftAssociative -> case b of
+    LeftAssociative -> True
+    _ -> False
+  RightAssociative -> case b of
+    RightAssociative -> True
+    _ -> False
+  NotAssociative -> case b of
+    NotAssociative -> True
+    _ -> False
+
+-- The metadata classes. GHC's argument is \\\`t d f a\\\`, a proxy shaped like the
+-- \\\`M1\\\` whose tag is being asked about, so that a call site can pick the
+-- instance by writing the type it wants rather than by having a value.
+class Datatype d where
+  datatypeName :: t d f a -> [Char]
+  moduleName :: t d f a -> [Char]
+  packageName :: t d f a -> [Char]
+  isNewtype :: t d f a -> Bool
+  moduleName x = "Main"
+  packageName x = "main"
+  isNewtype x = False
+
+class Constructor c where
+  conName :: t c f a -> [Char]
+  conFixity :: t c f a -> Fixity
+  conIsRecord :: t c f a -> Bool
+  conFixity x = Prefix
+  conIsRecord x = False
+
+class Selector s where
+  selName :: t s f a -> [Char]
+
+-- \\\`rep\\\` is what GHC writes \\\`Rep a\\\`; the fundep is the whole content of the
+-- family, and without it \\\`to (from x)\\\` would have nothing to fix the
+-- intermediate type to.
+class Generic a rep | a -> rep where
+  from :: a -> rep x
+  to :: rep x -> a
+`,
+  // \`StaticPtr\`, \`staticKey\` and \`deRefStaticPtr\` are declared in
+  // \`src/prelude.ts\`, because \`static e\` is a keyword form that needs no
+  // import - GHC wires the same names in for the same reason. This module is
+  // the one that names them.
+  //
+  // WHAT IS MISSING. \`staticPtrInfo\`/\`StaticPtrInfo\` (the unit, module and
+  // source location of the form) and \`staticPtrKeys\` are not here: nothing in
+  // miso reads either, and \`StaticPtrInfo\` would put three strings in every
+  // entry to be shown by nothing.
+  "GHC.StaticPtr": `module GHC.StaticPtr (StaticPtr, StaticKey, StaticKey(StaticKey), deRefStaticPtr, staticKey, unsafeLookupStaticPtr, IsStatic) where
+
+-- GHC's \\\`IsStatic\\\` is what \\\`static\\\` elaborates through when
+-- \\\`-XExtendedLiterals\\\`-style overloading is in play; the identity instance is
+-- the only one \\\`base\\\` ships.
+class IsStatic p where
+  fromStaticPtr :: StaticPtr a -> p a
+
+instance IsStatic StaticPtr where
+  fromStaticPtr p = p
+`,
   "GHC.JS.Prim": `module GHC.JS.Prim where
 
 -- GHC's own shape: \\\`data JSVal = JSVal JSVal#\\\`. A raw JavaScript value is not
