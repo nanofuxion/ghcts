@@ -1067,6 +1067,7 @@ type Text = JSString
   // never in which contents exist - unlike `Int64` and `Int`, where the
   // difference is which values the type can hold.
   "Data.ByteString": `module Data.ByteString where
+import Data.JSString (JSString(JSString), pack)
 
 data ByteString = ByteString JSValPrim
 
@@ -1074,6 +1075,14 @@ foreign import javascript unsafe "((n) => new Uint8Array(n))" jsBytesEmpty :: In
 foreign import javascript unsafe "((a) => a.length)" jsBytesLength :: JSValPrim -> IntPrim
 foreign import javascript unsafe "((a,b) => { const r = new Uint8Array(a.length + b.length); r.set(a); r.set(b, a.length); return r; })" jsBytesAppend :: JSValPrim -> JSValPrim -> JSValPrim
 foreign import javascript unsafe "((a,b) => a.length === b.length && a.every((x, i) => x === b[i]))" jsBytesEq :: JSValPrim -> JSValPrim -> Bool
+-- One byte per \`Char\`, truncating: \`Uint8Array.from\` assigns through ToUint8
+-- (low 8 bits), which is exactly GHC's \`c2w = fromIntegral . ord\`. Iterating a
+-- JS string with \`for..of\` (what \`Array.from\`/\`.from\`'s iterable protocol
+-- uses) steps by *code point*, one element per surrogate pair included, so
+-- \`codePointAt(0)\` is the real \`ord\` and not a UTF-16-code-unit approximation.
+-- \`Data.ByteString.Char8\`'s \`IsString\` instance is this - Latin-1-truncating,
+-- not UTF-8 - so a string literal \`ByteString\` is not \`encodeUtf8\` in disguise.
+foreign import javascript unsafe "((s) => Uint8Array.from(s, (ch) => ch.codePointAt(0)))" jsBytesFromJSString :: JSStringPrim -> JSValPrim
 
 empty :: ByteString
 empty = ByteString (jsBytesEmpty 0)
@@ -1092,6 +1101,22 @@ instance Semigroup ByteString where
 
 instance Monoid ByteString where
   mempty = empty
+
+-- \`Data.ByteString.Char8.pack\`/GHC's \`IsString ByteString\` instance. Goes by
+-- way of the already-packed \`JSString\` rather than folding \`jsBytesSnoc\` over
+-- \`[Char]\` one \`Char\` at a time: a \`Uint8Array\` is a JS object, and this
+-- frontend's generic apply path only recognises a JS *primitive* (typeof
+-- \\!== 'object') as a value that needs no further forcing, so an accumulator
+-- built that way crashed the moment the recursion's base case handed it back
+-- through that path. A JS string is a primitive and already has a working
+-- fold (\`pack\`), so the one Uint8Array this creates is built in a single
+-- FFI call and only ever constructed, never routed back through apply.
+packChars :: [Char] -> ByteString
+packChars cs = case pack cs of
+  JSString s -> ByteString (jsBytesFromJSString s)
+
+instance IsString ByteString where
+  fromString cs = packChars cs
 `,
   "Data.ByteString.Char8": `module Data.ByteString.Char8 (module Data.ByteString) where
 import Data.ByteString
@@ -1168,6 +1193,13 @@ lazyTextToJSString :: JSString -> JSString
 lazyTextToJSString t = t
 lazyTextFromJSString :: JSString -> JSString
 lazyTextFromJSString s = s
+`,
+  "Data.Bool": `module Data.Bool where
+
+bool :: a -> a -> Bool -> a
+bool f t b = case b of
+  False -> f
+  True -> t
 `,
   "Data.Char": `module Data.Char where
 

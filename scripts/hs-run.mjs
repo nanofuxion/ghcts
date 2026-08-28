@@ -3923,6 +3923,37 @@ const programs = [
     ].join("\n"),
     expect: "Just (-350.0)Just 31Just (-12)NothingNothingJust 0.142",
   },
+  {
+    // `IsString ByteString` (miso's `Miso.Html.Render` needs it for OverloadedStrings
+    // literals). GHC's real instance is `Data.ByteString.Char8`'s `packChars`: one
+    // byte per `Char`, truncating (`fromIntegral . ord`) - not `encodeUtf8`. Code
+    // point 256 truncates to a single zero byte, where UTF-8 would need two bytes,
+    // so the byte count alone tells the instances apart: 2*100 + 1 = 201, not 202.
+    name: "IsString ByteString truncates one byte per Char, the way Char8.pack does",
+    source: [
+      "module Main where",
+      "import qualified Data.ByteString as B",
+      "import Data.ByteString (ByteString)",
+      "",
+      "main :: IO Int",
+      'main = pure (B.length ("hi" :: ByteString) * 100 + B.length ("\\256" :: ByteString))',
+      "",
+    ].join("\n"),
+    expect: 201,
+  },
+  {
+    // `Data.Bool.bool`, used by miso's `Miso.Html.Event.onEnter`.
+    name: "Data.Bool.bool picks its argument by the Bool",
+    source: [
+      "module Main where",
+      "import Data.Bool (bool)",
+      "",
+      "main :: IO Int",
+      "main = pure (bool 1 2 True * 10 + bool 1 2 False)",
+      "",
+    ].join("\n"),
+    expect: 21,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
