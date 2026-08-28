@@ -3092,6 +3092,29 @@ const programs = [
     // 4 bytes, 3 characters, 5 bytes once `x` is appended.
     expect: 435,
   },
+  {
+    // Let-polymorphism. A `where` group was inferred in written order and
+    // monomorphically, so a helper used at two types was whichever type its
+    // last use pinned. miso's `Miso.JSON.Lexer` has exactly one of these:
+    // `escaped = (char '\\' *>)`, used at `Lexer Char` and at `Lexer Int`.
+    name: "a where-bound helper used at two types",
+    source: [
+      "module Main where",
+      "",
+      "f :: Int",
+      "f = a + length b",
+      "  where",
+      "    twice g x = g (g x)",
+      "    a = twice (+ 1) 10",
+      "    b = twice (\\ys -> ys ++ ys) \"ab\"",
+      "",
+      "main :: IO Int",
+      "main = pure f",
+      "",
+    ].join("\n"),
+    // 12, and "abababab".
+    expect: 20,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

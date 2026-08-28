@@ -1059,24 +1059,64 @@ class Elaborator {
     }
   }
 
-  /** `let`/`where` groups are inferred monomorphically: their constraints
-   * float out to the enclosing top-level binding, which is where dictionaries
-   * are actually bound. */
+  /** A `let`/`where` group, in dependency order, generalising as it goes.
+   *
+   * Let-polymorphism, but only over the variables no dictionary depends on: a
+   * local binding's constraints float out to the enclosing top-level binding,
+   * which is where dictionaries are actually bound, so a variable a constraint
+   * still mentions has to stay monomorphic or that constraint would be left
+   * with nothing to solve it at. Everything else generalises, and because the
+   * scheme carries no constraints the use site instantiates it and emits
+   * exactly the variable it already wrote - there is nothing for `desugar` to
+   * do differently.
+   *
+   * Without this, miso's `Miso.JSON.Lexer` could not typecheck: its
+   * `escaped = (char '\\' *>)` is used at `Lexer Char` and at `Lexer Int`, and
+   * one monomorphic type cannot be both. */
   private inferLocals(bindings: readonly LocalBinding[], env: Env): Env {
+    if (bindings.length === 0) return env;
     const inner = new Map(env);
-    const types = bindings.map(() => freshVar());
-    bindings.forEach((b, i) => inner.set(b.name, { tag: "mono", type: types[i]! }));
-    bindings.forEach((binding, i) => {
-      const scope = new Map(inner);
-      let result = types[i]!;
-      for (const pattern of binding.patterns) {
-        const argType = this.inferPattern(pattern, scope);
-        const next = freshVar();
-        if (!unify(result, tfun(argType, next))) this.report("binding parameters do not match its type", binding.span);
-        result = next;
+    // Only these entries can hold a free type variable: a `poly` scheme has
+    // had its own quantified over. A variable one of them mentions belongs to
+    // something still being inferred, so it is not this group's to generalise.
+    const monomorphic = new Set<TVar>();
+    for (const entry of env.values())
+      if (entry.tag === "mono" || entry.tag === "group") for (const v of typeVars(entry.type)) monomorphic.add(v);
+    const types = new Map<LocalBinding, Type>();
+    const groups = dependencyGroups(
+      bindings.map((b) => b.name),
+      bindings.map((b) => referencedNames(localAsDeclaration(b))),
+    );
+    for (const group of groups) {
+      const members = group.map((i) => bindings[i]!);
+      for (const b of members) {
+        const t = freshVar();
+        types.set(b, t);
+        inner.set(b.name, { tag: "mono", type: t });
       }
-      this.inferGuards(binding.guards ?? [{ body: binding.value }], binding.whereBindings ?? [], result, scope, binding.span);
-    });
+      for (const binding of members) {
+        const scope = new Map(inner);
+        let result = types.get(binding)!;
+        for (const pattern of binding.patterns) {
+          const argType = this.inferPattern(pattern, scope);
+          const next = freshVar();
+          if (!unify(result, tfun(argType, next))) this.report("binding parameters do not match its type", binding.span);
+          result = next;
+        }
+        this.inferGuards(binding.guards ?? [{ body: binding.value }], binding.whereBindings ?? [], result, scope, binding.span);
+      }
+      const constrained = new Set<TVar>();
+      for (const use of this.current?.uses ?? [])
+        if (use.kind === "apply")
+          for (const c of use.constraints) for (const t of c.types) for (const v of typeVars(t)) constrained.add(v);
+      for (const b of members) {
+        const type = types.get(b)!;
+        const gens = typeVars(type).filter((v) => !monomorphic.has(v) && !constrained.has(v));
+        if (gens.length) inner.set(b.name, { tag: "poly", scheme: quantify(gens, type, []), emit: b.name });
+        // What stayed monomorphic is monomorphic for every later group too.
+        for (const v of typeVars(type)) if (!gens.includes(v)) monomorphic.add(v);
+      }
+    }
     return inner;
   }
 
@@ -2488,17 +2528,28 @@ function skolemNames(vars: ReadonlyMap<string, Type>): Map<string, Type> {
  * parameters) is known before anything that calls it is inferred. Mutually
  * recursive bindings are inferred together and monomorphically. */
 function orderBindings(bindings: readonly Binding[]): Binding[][] {
-  const index = new Map(bindings.map((b, i) => [b.name, i]));
-  const edges = bindings.map((b) => [...referencedNames(b.decl)].flatMap((name) => {
+  return dependencyGroups(
+    bindings.map((b) => b.name),
+    bindings.map((b) => referencedNames(b.decl)),
+  ).map((group) => group.map((i) => bindings[i]!));
+}
+
+/** Tarjan's strongly connected components over "this binding names that one",
+ * yielding indices in dependency order. Shared by the top level and by
+ * `let`/`where` groups, which need the same answer for the same reason: a
+ * binding's scheme has to exist before anything that calls it is inferred. */
+function dependencyGroups(names: readonly string[], refs: readonly ReadonlySet<string>[]): number[][] {
+  const index = new Map(names.map((name, i) => [name, i]));
+  const edges = refs.map((set) => [...set].flatMap((name) => {
     const target = index.get(name);
     return target === undefined ? [] : [target];
   }));
   // Tarjan, iterative order not needed at this size.
-  const lowlink = new Array<number>(bindings.length).fill(-1);
-  const number = new Array<number>(bindings.length).fill(-1);
-  const onStack = new Array<boolean>(bindings.length).fill(false);
+  const lowlink = new Array<number>(names.length).fill(-1);
+  const number = new Array<number>(names.length).fill(-1);
+  const onStack = new Array<boolean>(names.length).fill(false);
   const stack: number[] = [];
-  const groups: Binding[][] = [];
+  const groups: number[][] = [];
   let counter = 0;
   const strongconnect = (v: number): void => {
     number[v] = counter;
@@ -2515,18 +2566,29 @@ function orderBindings(bindings: readonly Binding[]): Binding[][] {
       }
     }
     if (lowlink[v] === number[v]) {
-      const group: Binding[] = [];
+      const group: number[] = [];
       for (;;) {
         const w = stack.pop()!;
         onStack[w] = false;
-        group.push(bindings[w]!);
+        group.push(w);
         if (w === v) break;
       }
       groups.push(group);
     }
   };
-  for (let v = 0; v < bindings.length; v++) if (number[v] === -1) strongconnect(v);
+  for (let v = 0; v < names.length; v++) if (number[v] === -1) strongconnect(v);
   return groups;
+}
+
+/** A `let`/`where` binding read as the one-equation declaration it is, so the
+ * free-variable walk the top level uses serves the local groups too. */
+function localAsDeclaration(b: LocalBinding): ValueDeclaration {
+  return {
+    tag: "value",
+    name: b.name,
+    equations: [{ patterns: b.patterns, guards: b.guards ?? [{ body: b.value }], whereBindings: b.whereBindings ?? [] }],
+    span: b.span,
+  };
 }
 
 function referencedNames(decl: ValueDeclaration): Set<string> {
