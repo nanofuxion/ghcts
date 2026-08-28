@@ -1093,6 +1093,19 @@ class Elaborator {
         const t = freshVar();
         types.set(b, t);
         inner.set(b.name, { tag: "mono", type: t });
+        // A local signature is *checked*, not skolemised: a rigid variable
+        // would need the binding to abstract over dictionaries, which a
+        // `let` here cannot do. Parsed in the enclosing signature's variable
+        // scope, so `commit :: ComponentId -> Seq action -> ...` inside a
+        // `forall action.` names that `action` and not a new one - which is
+        // the whole reason miso's `Miso.Runtime` typechecks under GHC.
+        // A signature with a context is ignored: honouring it would promise
+        // dictionaries nothing binds.
+        if (b.signature === undefined) continue;
+        const written = parseSignature(b.signature, new Map(this.current?.tyvars ?? []));
+        if (written.context.length) continue;
+        if (!unify(t, written.type))
+          this.report(`\`${b.name}\` does not have its declared type \`${showType(written.type)}\``, b.span);
       }
       for (const binding of members) {
         const scope = new Map(inner);
@@ -1351,10 +1364,18 @@ class Elaborator {
         ),
       );
     }
-    // Nothing matched. A constraint still entirely on unsolved variables is
-    // reported by whatever left it ambiguous, not here; one that names a type
-    // constructor genuinely has no instance.
-    if (types.some((t) => headCon(t) !== undefined)) this.report(`no instance for \`${showConstraint(cls, types)}\``, span);
+    // Nothing matched. A constraint that names a type constructor genuinely
+    // has no instance; one still entirely on unsolved variables is ambiguous -
+    // there is no type to look an instance up at, and no later phase will
+    // supply one. Both used to reach `desugar` as `$dictionaryNotFound`, and
+    // only the first was reported, so the ambiguous ones were invisible to
+    // every count of how far this is from compiling miso.
+    this.report(
+      types.some((t) => headCon(t) !== undefined)
+        ? `no instance for \`${showConstraint(cls, types)}\``
+        : `ambiguous type variable in \`${showConstraint(cls, types)}\``,
+      span,
+    );
     return undefined;
   }
 

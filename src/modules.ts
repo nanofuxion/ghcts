@@ -517,6 +517,11 @@ class Renamer {
       value: this.expr(binding.value, shadow),
       guards: binding.guards?.map((g) => this.guard(g, shadow)),
       whereBindings: binding.whereBindings?.map((b) => this.binding(b, shadow)),
+      // A local signature names types in the module's scope, exactly as a
+      // top-level one does. Left unrenamed it says `MisoString` where the
+      // program says `JSString`, and the binding is checked against a type
+      // nothing else in the program has.
+      ...(binding.signature === undefined ? {} : { signature: renameTypeText(binding.signature, this.scopes.types) }),
     };
   }
 

@@ -3115,6 +3115,56 @@ const programs = [
     // 12, and "abababab".
     expect: 20,
   },
+  {
+    // A `let`/`where` type signature was parsed and thrown away, so a binding
+    // whose type only its signature fixes was left with an unsolved
+    // constraint on a free variable - which reached the backend as
+    // `$dictionaryNotFound` and was reported by nobody.
+    name: "a where-bound signature fixes an otherwise ambiguous type",
+    source: [
+      "module Main where",
+      "",
+      "class Def a where def :: Int -> a",
+      "instance Def Int where def n = n",
+      "instance Def Bool where def n = n > 0",
+      "",
+      "f :: Int",
+      "f = length (show b)",
+      "  where",
+      "    b :: Bool",
+      "    b = def 5",
+      "",
+      "main :: IO Int",
+      "main = pure f",
+      "",
+    ].join("\n"),
+    // `show True`
+    expect: 4,
+  },
+  {
+    // A local signature names types in the module's scope, so it has to be
+    // renamed with everything else: unrenamed it says `Widget` where the
+    // program says `Types_Widget`.
+    name: "a where-bound signature naming another module's type",
+    sources: {
+      Types: ["module Types where", "data Widget = Widget Int", "unwrap :: Widget -> Int", "unwrap (Widget n) = n", ""].join("\n"),
+      Main: [
+        "module Main where",
+        "import Types",
+        "",
+        "f :: Int",
+        "f = unwrap w",
+        "  where",
+        "    w :: Widget",
+        "    w = Widget 42",
+        "",
+        "main :: IO Int",
+        "main = pure f",
+        "",
+      ].join("\n"),
+    },
+    expect: 42,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

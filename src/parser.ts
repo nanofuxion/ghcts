@@ -2442,6 +2442,7 @@ class Parser {
     this.skipLines();
     this.acceptLayoutOpen();
     const bindings: import("./ast.js").LocalBinding[] = [];
+    const signatures = new Map<string, string>();
     while (
       this.startsPattern() &&
       this.current().text !== terminator &&
@@ -2486,12 +2487,19 @@ class Parser {
         continue;
       }
       if (this.acceptTypeSignature()) {
+        // A local signature is kept, not skipped. `src/elaborate.ts` checks the
+        // binding against it, which is what ties a `where` helper's variables
+        // to the enclosing signature's - miso's `Miso.Runtime` reads a global
+        // `IORef` whose own type variables are universally quantified, and only
+        // the local signature says which types the read is at.
+        const parts: string[] = [];
         while (
           !this.at(";") &&
           !this.at("}") &&
           this.current().kind !== "eof"
         )
-          this.take();
+          parts.push(tokenSpelling(this.take()));
+        signatures.set(name.text, parts.join(" "));
         this.skipLines();
         continue;
       }
@@ -2528,6 +2536,12 @@ class Parser {
       this.skipLines();
     }
     this.acceptLayoutClose();
+    // A signature may be written above or below the equations it belongs to,
+    // so they are matched by name once the whole group is read.
+    for (const binding of bindings) {
+      const signature = signatures.get(binding.name);
+      if (signature !== undefined) binding.signature = signature;
+    }
     return bindings;
   }
   /** The qualifiers of one `|` guard: comma-separated, evaluated left to
