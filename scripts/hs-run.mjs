@@ -1230,6 +1230,150 @@ const programs = [
     ].join("\n"),
     expect: "1234TrueTrueb",
   },
+  {
+    // Two parameters, and the *pair* selects: `convert True` and `convert flag`
+    // are the same method at two different instances, distinguished only by
+    // their second argument. A single-parameter dispatch could not tell them
+    // apart, and picking the wrong one would print "True" rather than "1".
+    name: "multi-parameter class: the instance is chosen by both arguments",
+    source: [
+      "module Main where",
+      "class Convert a b where",
+      "  convert :: a -> b",
+      "instance Convert Bool Int where",
+      "  convert b = if b then 1 else 0",
+      "instance Convert Int [Char] where",
+      "  convert n = show n",
+      "instance Convert Bool [Char] where",
+      "  convert b = if b then \"yes\" else \"no\"",
+      "flag :: Int",
+      "flag = convert True",
+      "digits :: [Char]",
+      "digits = convert flag",
+      "words_ :: [Char]",
+      "words_ = convert True",
+      "main :: [Char]",
+      "main = digits ++ words_",
+      "",
+    ].join("\n"),
+    expect: "1yes",
+  },
+  {
+    // The fundep is load-bearing here and nowhere else: `n` is passed straight
+    // back to `put`, so nothing in the program says what type it has. Only
+    // `m -> s` can, by reading it off `State Int`. Without improvement this
+    // does not compile at all ("no instance for MonadState t? (StateT Int
+    // Identity)"), and a fundep that improved to the wrong type would make
+    // `label` write into the counter.
+    name: "functional dependency: `m -> s` supplies the type nothing else does",
+    source: [
+      "module Main where",
+      "import Control.Monad.State",
+      "counter :: State Int ()",
+      "counter = get >>= put",
+      "label :: State [Char] ()",
+      "label = get >>= (\\s -> put (s ++ \"!\"))",
+      "main :: [Char]",
+      "main = show (execState counter 7) ++ execState label \"a\"",
+      "",
+    ].join("\n"),
+    expect: "7a!",
+  },
+  {
+    // One `bump`, two monads: the dictionary is a parameter, so this is the
+    // whole point of the class rather than of the concrete transformer. The
+    // `n + 1` inside it is only well typed because the *given* `MonadState Int
+    // m` improves `get`'s state type to `Int`.
+    name: "MonadState: one polymorphic action runs at both State and RWS",
+    source: [
+      "module Main where",
+      "import Control.Monad.State",
+      "import Control.Monad.RWS",
+      "bump :: MonadState Int m => m ()",
+      "bump = get >>= (\\n -> put (n + 1))",
+      "twice :: MonadState Int m => m ()",
+      "twice = bump >> bump",
+      "logged :: RWS Int [Int] Int ()",
+      "logged = do",
+      "  twice",
+      "  n <- get",
+      "  tell [n]",
+      "main :: [Char]",
+      "main = show (execState twice 1) ++ \"/\" ++ show (fst (execRWS logged 0 10))",
+      "",
+    ].join("\n"),
+    expect: "3/12",
+  },
+  {
+    // Through a stack: `ask` is the reader's, `get`/`put` are the state's one
+    // layer down, reached through the lifting instance's own context. 4*3 = 12
+    // and 4+3 = 7. In `copy` nothing but the two fundeps can say what `ask`
+    // read or what `put` wrote, so it is the stack's improvement, on its own.
+    name: "MonadReader/MonadState: ask and get under a ReaderT over State",
+    source: [
+      "module Main where",
+      "import Control.Monad.Reader",
+      "import Control.Monad.State",
+      "prog :: ReaderT Int (State Int) Int",
+      "prog = do",
+      "  r <- ask",
+      "  n <- get",
+      "  put (n + r)",
+      "  pure (n * r)",
+      "copy :: ReaderT Int (State Int) ()",
+      "copy = ask >>= put",
+      "main :: Int",
+      "main = case runState (runReaderT prog 3) 4 of",
+      "  (a, s) -> case runState (runReaderT copy 9) 0 of",
+      "    (b, t) -> a * 100 + s * 10 + t",
+      "",
+    ].join("\n"),
+    expect: 1279,
+  },
+  {
+    // miso's counter in miniature: `Miso.Lens`'s operators are constrained by
+    // `MonadState record m` alone, and miso's `Effect` is an `RWS`, so this is
+    // the exact shape that a single-parameter class could not express. `use`
+    // additionally needs the fundep - nothing but `m -> record` says what
+    // `gets` read. Model 5 + 1 = 6, told into the log: 6*10 + 6.
+    name: "Miso.Lens shape: `value += 1` at an RWS Effect",
+    source: [
+      "module Main where",
+      "import Control.Monad.State",
+      "import Control.Monad.RWS",
+      "data Lens record field = Lens (record -> field) (record -> field -> record)",
+      "lensGet :: Lens record field -> record -> field",
+      "lensGet l r = case l of",
+      "  Lens g s -> g r",
+      "lensSet :: Lens record field -> record -> field -> record",
+      "lensSet l r v = case l of",
+      "  Lens g s -> s r v",
+      "(%=) :: MonadState record m => Lens record field -> (field -> field) -> m ()",
+      "(%=) l f = modify (\\r -> lensSet l r (f (lensGet l r)))",
+      "(+=) :: (MonadState record m, Num field) => Lens record field -> field -> m ()",
+      "(+=) l x = (%=) l (\\v -> v + x)",
+      "use :: MonadState record m => Lens record field -> m field",
+      "use l = gets (\\r -> lensGet l r)",
+      "newtype Model = Model Int",
+      "value :: Lens Model Int",
+      "value = Lens (\\m -> case m of Model n -> n) (\\m v -> Model v)",
+      "type Effect model = RWS Int [Int] model ()",
+      "update :: Effect Model",
+      "update = value += 1",
+      "report :: Effect Model",
+      "report = do",
+      "  n <- use value",
+      "  tell [n]",
+      "main :: Int",
+      "main = case execRWS (update >> report) 0 (Model 5) of",
+      "  (m, w) -> case m of",
+      "    Model n -> case w of",
+      "      (x : xs) -> n * 10 + x",
+      "      [] -> 0",
+      "",
+    ].join("\n"),
+    expect: 66,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

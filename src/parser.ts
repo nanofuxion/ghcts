@@ -1107,7 +1107,11 @@ class Parser {
             .split(",")
             .map((item) => item.trim())
             .filter(Boolean);
-    const rest = arrow < 0 ? header : header.slice(arrow + 1);
+    const afterContext = arrow < 0 ? header : header.slice(arrow + 1);
+    // `class MonadState s m | m -> s where`: everything after the bar is the
+    // functional dependencies, and only what precedes it names parameters.
+    const bar = afterContext.findIndex((token) => token.text === "|");
+    const rest = bar < 0 ? afterContext : afterContext.slice(0, bar);
     const uppercase = rest.filter(
       (token) => token.kind === "ident" && /^[A-Z]/.test(token.text),
     );
@@ -1117,12 +1121,28 @@ class Parser {
       .slice(classIndex + 1)
       .filter((token) => token.kind === "ident" && /^[a-z]/.test(token.text))
       .map((token) => token.text);
+    const fundeps =
+      bar < 0
+        ? []
+        : afterContext
+            .slice(bar + 1)
+            .map((token) => token.text)
+            .join(" ")
+            .split(",")
+            .flatMap((item) => {
+              const sides = item.split("->");
+              if (sides.length !== 2) return [];
+              const names = (side: string): string[] =>
+                side.split(/\s+/).filter((word) => /^[a-z][A-Za-z0-9_']*$/.test(word));
+              return [{ from: names(sides[0]!), to: names(sides[1]!) }];
+            });
     const body = this.membersAfterWhere();
     return {
       tag: "class",
       name,
       context,
       parameters: [...new Set(parameters)],
+      fundeps,
       members: body.members,
       rawMembers: body.rawMembers,
       span: start,

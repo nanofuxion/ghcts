@@ -24,7 +24,7 @@ export interface TypeAliasDeclaration { tag: 'typeAlias'; name: string; paramete
  * contain associated types or an infix equation that is not yet one of the
  * compact surface `Declaration` forms. */
 export interface ClassMemberSlice { tokens: string[]; span: Span; }
-export interface ClassDeclaration { tag: 'class'; name: string; /** Superclass constraints, one string per item of the `=>` context. */ context: string[]; parameters: string[]; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
+export interface ClassDeclaration { tag: 'class'; name: string; /** Superclass constraints, one string per item of the `=>` context. */ context: string[]; parameters: string[]; /** `| m -> s, a b -> c`: each dependency names parameters, by name. */ fundeps: Array<{ from: string[]; to: string[] }>; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
 export interface InstanceDeclaration { tag: 'instance'; head: string; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
 /** Parsed but not yet represented in Core.  Keeping these explicit ensures a
  * later phase reports one accurate unsupported-feature diagnostic instead of

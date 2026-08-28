@@ -16,9 +16,19 @@
  * Hindley-Milner inference. Deliberate restrictions, each of which produces a
  * diagnostic rather than a wrong dictionary:
  *
- *   - single-parameter classes only. An instance head may be non-ground and
- *     carry a context (`Eq a => Eq [a]`); such an instance is a *function*
- *     from dictionaries to a dictionary, and selecting it is recursive.
+ *   - a class may have any number of parameters, and an instance is selected by
+ *     matching *all* of them. An instance head may be non-ground and carry a
+ *     context (`Eq a => Eq [a]`); such an instance is a *function* from
+ *     dictionaries to a dictionary, and selecting it is recursive.
+ *   - a multi-parameter class may declare functional dependencies
+ *     (`class MonadState s m | m -> s`), and they are honoured by an
+ *     improvement pass that unifies a wanted's determined arguments with those
+ *     of the given or instance its determining arguments already match. That
+ *     pass runs once per binding, at the point the binding is finished, not
+ *     interleaved with unification the way GHC's solver runs it: a type that
+ *     only improvement could have supplied is therefore known in time to
+ *     select a dictionary or to be generalised, but not in time to stop an
+ *     earlier unification in the same binding from going wrong first.
  *   - a binding with a signature takes its constraints from that signature, in
  *     that order; those are the *givens*, and a wanted constraint is discharged
  *     against them directly or through a superclass path. A binding without a
@@ -79,10 +89,21 @@ type Type =
   /** Only inside a `Scheme`; instantiation replaces these with fresh vars. */
   | { tag: "gen"; index: number };
 
+/** `MonadState s m` is `{ cls: "MonadState", types: [s, m] }`: the argument
+ * list is what makes a class multi-parameter, and every consumer here - given,
+ * wanted, instance head, superclass path - carries the whole list. */
 interface Constraint {
   cls: string;
-  type: Type;
+  types: Type[];
 }
+
+const sameTypes = (a: readonly Type[], b: readonly Type[]): boolean =>
+  a.length === b.length && a.every((t, i) => sameType(t, b[i]!));
+
+/** A constraint as it is spelled in a diagnostic and as the key that stops the
+ * superclass walk revisiting a node. */
+const showConstraint = (cls: string, types: readonly Type[]): string =>
+  [cls, ...types.map(showType)].join(" ");
 
 interface Scheme {
   gens: number;
@@ -175,7 +196,7 @@ function instantiate(scheme: Scheme): { type: Type; constraints: Constraint[] } 
   const images = Array.from({ length: scheme.gens }, () => freshVar());
   return {
     type: substGens(scheme.type, images),
-    constraints: scheme.constraints.map((c) => ({ cls: c.cls, type: substGens(c.type, images) })),
+    constraints: scheme.constraints.map((c) => ({ cls: c.cls, types: c.types.map((t) => substGens(t, images)) })),
   };
 }
 
@@ -193,7 +214,7 @@ function quantify(vars: TVar[], type: Type, constraints: Constraint[]): Scheme {
     if (p.tag === "app") return tapp(go(p.fn), go(p.arg));
     return p;
   };
-  return { gens: vars.length, type: go(type), constraints: constraints.map((c) => ({ cls: c.cls, type: go(c.type) })) };
+  return { gens: vars.length, type: go(type), constraints: constraints.map((c) => ({ cls: c.cls, types: c.types.map(go) })) };
 }
 
 // --------------------------------------------------------- type parsing ----
@@ -231,6 +252,16 @@ class TypeParser {
 
   static tokens(source: string): string[] {
     return source.match(TYPE_TOKEN) ?? [];
+  }
+
+  /** A constraint's arguments: `MonadState s m` is two types, not the
+   * application `s m`, so a class's arguments are parsed atom by atom. */
+  argList(): Type[] {
+    const args: Type[] = [];
+    while (this.index < this.tokens.length && !["->", ")", "]", ",", "=>"].includes(this.tokens[this.index]!)) {
+      args.push(this.atom());
+    }
+    return args;
   }
 
   fun(): Type {
@@ -332,7 +363,7 @@ function parseSignature(source: string, vars: Map<string, Type>): { context: Con
     const stripped = part[0] === "(" && part.at(-1) === ")" ? part.slice(1, -1) : part;
     for (const item of splitTop(stripped, ",")) {
       if (item.length < 2) continue;
-      context.push({ cls: unqualify(item[0]!), type: new TypeParser(item.slice(1), vars).fun() });
+      context.push({ cls: unqualify(item[0]!), types: new TypeParser(item.slice(1), vars).argList() });
     }
   }
   return { context, type: new TypeParser(body, vars).fun() };
@@ -352,19 +383,27 @@ interface ClassMethod {
 
 interface ClassInfo {
   name: string;
-  variable: TVar;
-  superclasses: string[];
+  /** One per class parameter, in declaration order. A method's signature and
+   * every superclass constraint are written over exactly these. */
+  variables: TVar[];
+  /** Over `variables`, so `class Monad m => MonadState s m` remembers that its
+   * superclass is `Monad m` and not `Monad s`. */
+  superclasses: Constraint[];
+  /** `| m -> s`, as indices into `variables`. */
+  fundeps: Array<{ from: number[]; to: number[] }>;
   methods: ClassMethod[];
   span: Span;
 }
 
 interface InstanceInfo {
   cls: string;
-  /** The instance head's argument, with its own free type variables: `[a]` for
-   * `instance Eq a => Eq [a]`. Resolution matches a wanted type against it. */
-  target: Type;
-  targetCon: string;
-  /** `targetCon` made safe to spell inside a generated identifier. */
+  /** The instance head's arguments, with their own free type variables: `[a]`
+   * for `instance Eq a => Eq [a]`, `[s, StateT s m]` for `instance Monad m =>
+   * MonadState s (StateT s m)`. Resolution matches a wanted against all of
+   * them at once. */
+  targets: Type[];
+  targetCons: Array<string | undefined>;
+  /** `targetCons` made safe to spell inside a generated identifier. */
   emitCon: string;
   /** The instance context, over `target`'s variables. Non-empty makes the
    * instance's dictionary a *function* of the dictionaries it names. */
@@ -406,6 +445,23 @@ function applySubst(t: Type, subst: ReadonlyMap<TVar, Type>): Type {
   return p;
 }
 
+/** `applySubst` for an instance's own types, giving a *fresh* variable to
+ * anything the match left unbound. An instance's variables are shared by every
+ * use of it, so unifying one of them directly would silently specialise the
+ * instance for the whole program. */
+function freshen(t: Type, subst: Map<TVar, Type>): Type {
+  const p = prune(t);
+  if (p.tag === "var") {
+    const known = subst.get(p.v);
+    if (known) return known;
+    const made = freshVar();
+    subst.set(p.v, made);
+    return made;
+  }
+  if (p.tag === "app") return tapp(freshen(p.fn, subst), freshen(p.arg, subst));
+  return p;
+}
+
 function showType(t: Type): string {
   const p = prune(t);
   if (p.tag === "con") return p.name;
@@ -441,7 +497,7 @@ type Use =
 /** What a binding was told, or worked out, about its own constraints. */
 interface Given {
   cls: string;
-  type: Type;
+  types: Type[];
   name: string;
 }
 
@@ -466,8 +522,11 @@ interface Binding {
 class Elaborator {
   readonly diagnostics: Diagnostic[] = [];
   readonly classes = new Map<string, ClassInfo>();
-  /** Keyed `Class Type`; instance selection here is exact-head only. */
+  /** Keyed `Class Con...`, one entry per instance head. */
   readonly instances = new Map<string, InstanceInfo>();
+  /** The same instances grouped by class: selection matches every argument, so
+   * it has to consider each of a class's instances rather than index by one. */
+  private readonly byClass = new Map<string, InstanceInfo[]>();
   readonly constructors = new Map<string, Scheme>();
   readonly bindings = new Map<string, Binding>();
   readonly boxedInt = new Set<Extract<Pattern, { tag: "int" }>>();
@@ -686,64 +745,161 @@ class Elaborator {
 
   // ------------------------------------------------------------- solving --
 
+  addInstance(key: string, info: InstanceInfo): void {
+    this.instances.set(key, info);
+    const group = this.byClass.get(info.cls);
+    if (group) group.push(info);
+    else this.byClass.set(info.cls, [info]);
+  }
+
   /** Every constraint the binding still owes, in occurrence order. */
   private wanted(binding: Binding): Constraint[] {
     return binding.uses.flatMap((use) =>
-      use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: use.cls, type: use.type }] : [],
+      use.kind === "apply" ? use.constraints : use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : [],
     );
+  }
+
+  /** Functional-dependency improvement, GHC's `GHC/Tc/Instance/FunDeps.hs`.
+   *
+   * `class MonadState s m | m -> s` promises that `m` fixes `s`. So whenever a
+   * wanted's *determining* arguments are already the same as a given's, or
+   * match an instance head's, its *determined* arguments must be whatever that
+   * given or instance says they are, and are unified with them. This is not
+   * decoration: `get :: MonadState s m => m s` mentions `s` nowhere else, so
+   * without improvement every `n <- get` leaves `s` an unsolved variable and no
+   * dictionary can be selected for it.
+   *
+   * Improvement only ever *unifies*; it never chooses a dictionary. Selection
+   * still happens in `resolve`, against the improved types. */
+  private improveConstraint(
+    wanted: Constraint,
+    givens: readonly Constraint[],
+    span: Span,
+    depth: number,
+  ): boolean {
+    const info = this.classes.get(wanted.cls);
+    if (!info || info.fundeps.length === 0 || depth > 16) return false;
+    const arg = (c: Constraint, i: number): Type | undefined => c.types[i];
+    let changed = false;
+    const improveTo = (from: Type | undefined, to: Type): void => {
+      if (from === undefined || sameType(from, to)) return;
+      if (unify(from, to)) {
+        changed = true;
+        return;
+      }
+      // Two sources disagree about a determined argument. In legal Haskell the
+      // instances of a class are fundep-consistent, so this is a real error in
+      // the program rather than a solver limitation.
+      this.report(
+        `functional dependency of \`${info.name}\` makes \`${showType(from)}\` and \`${showType(to)}\` the same type`,
+        span,
+      );
+    };
+    for (const fd of info.fundeps) {
+      for (const given of givens) {
+        if (given.cls !== wanted.cls) continue;
+        if (!fd.from.every((i) => { const g = arg(given, i); const w = arg(wanted, i); return g !== undefined && w !== undefined && sameType(g, w); })) continue;
+        for (const i of fd.to) improveTo(arg(wanted, i), arg(given, i) ?? freshVar());
+      }
+      for (const instance of this.byClass.get(wanted.cls) ?? []) {
+        // One-way matching: the instance's variables are instantiated, the
+        // wanted's are not. A wanted whose determining argument is still an
+        // unsolved variable therefore matches nothing and stays unimproved,
+        // which is what stops improvement from inventing a type.
+        const subst = new Map<TVar, Type>();
+        if (!fd.from.every((i) => { const t = instance.targets[i]; const w = arg(wanted, i); return t !== undefined && w !== undefined && matchType(t, w, subst); })) continue;
+        for (const i of fd.to) {
+          const target = instance.targets[i];
+          if (target) improveTo(arg(wanted, i), freshen(target, subst));
+        }
+        // A lifting instance determines nothing on its own: `MonadState s
+        // (ReaderT r m)` learns its `s` from its own context, so improvement
+        // continues into that context under the same substitution - which is
+        // what carries the fundep down through a transformer stack.
+        for (const c of instance.context) {
+          if (this.improveConstraint({ cls: c.cls, types: c.types.map((t) => freshen(t, subst)) }, givens, span, depth + 1))
+            changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  private improve(binding: Binding): void {
+    const givens = binding.signature?.context ?? [];
+    // Improving one constraint can expose another (a determined argument may
+    // be some other wanted's determining one), so this runs to a fixed point.
+    for (let round = 0; round < 8; round++) {
+      let changed = false;
+      for (const wanted of this.wanted(binding)) {
+        if (this.improveConstraint(wanted, givens, binding.decl.span, 0)) changed = true;
+      }
+      if (!changed) return;
+    }
   }
 
   /** Discharge one constraint, producing the expression that names its
    * dictionary. A given wins over an instance, and a superclass field of a
    * given wins over nothing at all. */
-  resolve(cls: string, type: Type, givens: readonly Given[], span: Span, depth = 0): Expr | undefined {
-    const queue: Array<{ cls: string; expr: Expr }> = givens
-      .filter((g) => sameType(g.type, type))
-      .map((g) => ({ cls: g.cls, expr: variable(g.name, span) }));
-    const seen = new Set(queue.map((item) => item.cls));
+  resolve(cls: string, types: readonly Type[], givens: readonly Given[], span: Span, depth = 0): Expr | undefined {
+    const queue: Array<{ cls: string; types: Type[]; expr: Expr }> = givens.map((g) => ({
+      cls: g.cls,
+      types: g.types,
+      expr: variable(g.name, span),
+    }));
+    const seen = new Set(queue.map((item) => showConstraint(item.cls, item.types)));
     while (queue.length) {
       const item = queue.shift()!;
-      if (item.cls === cls) return item.expr;
+      if (item.cls === cls && sameTypes(item.types, types)) return item.expr;
       const info = this.classes.get(item.cls);
-      info?.superclasses.forEach((parent, index) => {
-        if (seen.has(parent)) return;
-        seen.add(parent);
-        queue.push({ cls: parent, expr: apply(variable(superSelector(item.cls, index), span), item.expr) });
+      if (!info) continue;
+      // A superclass constraint is written over the class's own variables, so
+      // reaching it means instantiating them at the arguments in hand:
+      // `class Monad m => MonadState s m` gives `Monad m`, never `Monad s`.
+      const at = new Map<TVar, Type>(info.variables.map((v, i) => [v, item.types[i] ?? varType(v)]));
+      info.superclasses.forEach((parent, index) => {
+        const parentTypes = parent.types.map((t) => applySubst(t, at));
+        const key = showConstraint(parent.cls, parentTypes);
+        if (seen.has(key)) return;
+        seen.add(key);
+        queue.push({
+          cls: parent.cls,
+          types: parentTypes,
+          expr: apply(variable(superSelector(item.cls, index), span), item.expr),
+        });
       });
     }
-    const con = headCon(type);
-    if (con === undefined) return undefined;
+    const con = types.length === 1 ? headCon(types[0]!) : undefined;
     // `IntPrim` is the machine integer itself, so a `Num IntPrim` wanted is
     // discharged by the literal staying raw; there is no dictionary to name.
     if (con === "IntPrim" && cls === "Num") return undefined;
     // Likewise `DoublePrim`: a fractional literal at the machine type stays a
     // raw `LitDouble`, so there is no `Fractional` dictionary to name.
     if (con === "DoublePrim" && cls === "Fractional") return undefined;
-    const instance = this.instances.get(`${cls} ${con}`);
-    if (!instance) {
-      this.report(`no instance for \`${cls} ${con}\``, span);
-      return undefined;
-    }
-    const self = variable(dictValue(cls, instance.emitCon), span);
-    if (instance.context.length === 0) return self;
     // A constrained instance is a function from dictionaries to a dictionary,
     // so selecting it is recursive. The depth bound is what turns a
     // non-terminating instance chain into a diagnostic instead of a hang.
     if (depth > 32) {
-      this.report(`instance resolution for \`${cls} ${showType(type)}\` did not terminate`, span);
+      this.report(`instance resolution for \`${showConstraint(cls, types)}\` did not terminate`, span);
       return undefined;
     }
-    const subst = new Map<TVar, Type>();
-    if (!matchType(instance.target, type, subst)) {
-      this.report(`no instance for \`${cls} ${showType(type)}\``, span);
-      return undefined;
+    for (const instance of this.byClass.get(cls) ?? []) {
+      const subst = new Map<TVar, Type>();
+      if (!types.every((t, i) => { const target = instance.targets[i]; return target !== undefined && matchType(target, t, subst); })) continue;
+      const self = variable(dictValue(cls, instance.emitCon), span);
+      if (instance.context.length === 0) return self;
+      return applyAll(
+        self,
+        instance.context.map(
+          (c) => this.resolve(c.cls, c.types.map((t) => applySubst(t, subst)), givens, span, depth + 1) ?? errorExpr(span),
+        ),
+      );
     }
-    return applyAll(
-      self,
-      instance.context.map(
-        (c) => this.resolve(c.cls, applySubst(c.type, subst), givens, span, depth + 1) ?? errorExpr(span),
-      ),
-    );
+    // Nothing matched. A constraint still entirely on unsolved variables is
+    // reported by whatever left it ambiguous, not here; one that names a type
+    // constructor genuinely has no instance.
+    if (types.some((t) => headCon(t) !== undefined)) this.report(`no instance for \`${showConstraint(cls, types)}\``, span);
+    return undefined;
   }
 
   /** Ambiguous numeric constraints default to `Int`, which is what makes
@@ -751,12 +907,15 @@ class Elaborator {
   private applyDefaulting(binding: Binding): void {
     const wanted = this.wanted(binding);
     for (const c of wanted) {
-      const t = prune(c.type);
+      // Defaulting is a numeric-class rule, and both `Num` and `Fractional`
+      // take one argument; a multi-parameter constraint is never defaulted.
+      if (c.types.length !== 1) continue;
+      const t = prune(c.types[0]!);
       if (t.tag !== "var") continue;
       // A variable the binding is quantified over is not ambiguous: it is a
       // dictionary parameter, and defaulting it would erase the polymorphism.
-      if (binding.givens.some((g) => sameType(g.type, t))) continue;
-      const classes = wanted.filter((other) => sameType(other.type, t)).map((other) => other.cls);
+      if (binding.givens.some((g) => g.types.some((gt) => sameType(gt, t)))) continue;
+      const classes = wanted.filter((other) => other.types.length === 1 && sameType(other.types[0]!, t)).map((other) => other.cls);
       // Haskell's `default (Integer, Double)`: a `Fractional` wanted rules
       // `Int` out, so the same ambiguous variable defaults to `Double`.
       if (classes.includes("Fractional")) unify(t, tcon("Double"));
@@ -784,24 +943,28 @@ class Elaborator {
   /** Turn a fully inferred binding into its dictionary parameters and scheme,
    * then rewrite every occurrence inside it. */
   finish(binding: Binding): void {
+    // Improvement first: it only refines types, and everything below - which
+    // constraints are generalised, what defaults, which dictionary is selected
+    // - reads those types.
+    this.improve(binding);
     this.solveIntPatterns(binding);
 
     if (binding.signature) {
-      binding.givens = binding.signature.context.map((c, i) => ({ cls: c.cls, type: c.type, name: `$d${i}` }));
+      binding.givens = binding.signature.context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` }));
     } else if (binding.decl.equations[0]?.patterns.length) {
       // No signature but genuine parameters: generalise, and every wanted
       // constraint on a generalised variable becomes a dictionary parameter.
       const quantified = typeVars(binding.monoType);
       const params: Given[] = [];
       for (const c of this.wanted(binding)) {
-        const t = prune(c.type);
+        const ts = c.types.map(prune);
         // A constraint counts as generalised when it *mentions* a quantified
         // variable, not only when it is one: `Eq [a]` is as much a dictionary
         // parameter as `Eq a`, and dropping it would leave it unsolvable.
-        const vars = typeVars(t);
+        const vars = ts.flatMap((t) => typeVars(t));
         if (vars.length === 0 || !vars.some((v) => quantified.includes(v))) continue;
-        if (params.some((p) => p.cls === c.cls && sameType(p.type, t))) continue;
-        params.push({ cls: c.cls, type: t, name: `$d${params.length}` });
+        if (params.some((p) => p.cls === c.cls && sameTypes(p.types, ts))) continue;
+        params.push({ cls: c.cls, types: ts, name: `$d${params.length}` });
       }
       binding.givens = params;
     }
@@ -813,7 +976,7 @@ class Elaborator {
       quantify(
         binding.signature ? [] : typeVars(binding.monoType),
         binding.signature?.type ?? binding.monoType,
-        binding.givens.map((g) => ({ cls: g.cls, type: g.type })),
+        binding.givens.map((g) => ({ cls: g.cls, types: g.types })),
       );
   }
 
@@ -822,13 +985,13 @@ class Elaborator {
     const span = spanOf(use.node);
     if (use.kind === "group") {
       const target = this.bindings.get(use.target);
-      return (target?.givens ?? []).map((g) => this.resolve(g.cls, g.type, binding.givens, span) ?? errorExpr(span));
+      return (target?.givens ?? []).map((g) => this.resolve(g.cls, g.types, binding.givens, span) ?? errorExpr(span));
     }
     if (use.kind === "literal" && headCon(use.type) === "IntPrim") return [];
     if (use.kind === "literal" && headCon(use.type) === "DoublePrim") return [];
-    const constraints =
-      use.kind === "literal" ? [{ cls: use.cls, type: use.type }] : use.constraints;
-    return constraints.map((c) => this.resolve(c.cls, c.type, binding.givens, span) ?? errorExpr(span));
+    const constraints: Constraint[] =
+      use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : use.constraints;
+    return constraints.map((c) => this.resolve(c.cls, c.types, binding.givens, span) ?? errorExpr(span));
   }
 }
 
@@ -944,15 +1107,31 @@ export function elaborateProgram(
   const classDecls = declarations.filter((d): d is ClassDeclaration => d.tag === "class");
   const defaults = new Map<string, ValueDeclaration>();
   for (const decl of classDecls) {
-    if (decl.parameters.length !== 1) {
-      elaborator.report(`class \`${decl.name}\`: only single-parameter classes are elaborated`, decl.span);
+    if (decl.parameters.length === 0) {
+      elaborator.report(`class \`${decl.name}\`: a class must have at least one parameter`, decl.span);
       continue;
     }
     const vars = new Map<string, Type>();
-    const variableType = freshVar();
-    if (variableType.tag !== "var") continue;
-    vars.set(decl.parameters[0]!, variableType);
-    const supers = superclassesOf(decl);
+    const variables: TVar[] = [];
+    for (const parameter of decl.parameters) {
+      const made = freshVar();
+      if (made.tag !== "var") continue;
+      vars.set(parameter, made);
+      variables.push(made.v);
+    }
+    // Parsed against the same variable map as the methods, so `m` in
+    // `class Monad m => MonadState s m` is the class's own second parameter.
+    const supers = superclassesOf(decl, vars);
+    const fundeps = decl.fundeps.flatMap((fd) => {
+      const index = (name: string): number => decl.parameters.indexOf(name);
+      const from = fd.from.map(index);
+      const to = fd.to.map(index);
+      if ([...from, ...to].some((i) => i < 0)) {
+        elaborator.report(`class \`${decl.name}\`: a functional dependency names a parameter it does not have`, decl.span);
+        return [];
+      }
+      return [{ from, to }];
+    });
     const own = new Map<string, ValueDeclaration>();
     const classScope = scopeOf.get(decl);
     for (const value of instanceMethodValues(
@@ -967,7 +1146,7 @@ export function elaborateProgram(
       methods.push({ name: member.name, type: parseType(member.type, vars), hasDefault: own.has(member.name) });
       if (own.has(member.name)) defaults.set(defaultImpl(decl.name, member.name), own.get(member.name)!);
     }
-    elaborator.classes.set(decl.name, { name: decl.name, variable: variableType.v, superclasses: supers, methods, span: decl.span });
+    elaborator.classes.set(decl.name, { name: decl.name, variables, superclasses: supers, fundeps, methods, span: decl.span });
   }
 
   // A method's scheme is its declared signature plus its own class constraint,
@@ -975,10 +1154,10 @@ export function elaborateProgram(
   // zero at every call site.
   for (const info of elaborator.classes.values()) {
     for (const method of info.methods) {
-      const ordered = [info.variable, ...typeVars(method.type).filter((v) => v !== info.variable)];
+      const ordered = [...info.variables, ...typeVars(method.type).filter((v) => !info.variables.includes(v))];
       env.set(method.name, {
         tag: "poly",
-        scheme: quantify(ordered, method.type, [{ cls: info.name, type: varType(info.variable) }]),
+        scheme: quantify(ordered, method.type, [{ cls: info.name, types: info.variables.map(varType) }]),
         emit: method.name,
       });
     }
@@ -1001,9 +1180,13 @@ export function elaborateProgram(
     // `Eq a => Eq [a]` is the same type variable in both.
     const vars = new Map<string, Type>();
     const context = parseSignature(decl.head, vars).context;
-    const target = parseType(parsed.target, vars);
-    const targetCon = headCon(target);
-    if (targetCon === undefined) {
+    const targets = new TypeParser(TypeParser.tokens(parsed.target), vars).argList();
+    const targetCons = targets.map((t) => headCon(t));
+    if (targets.length !== info.variables.length) {
+      elaborator.report(`instance \`${decl.head}\`: \`${info.name}\` takes ${info.variables.length} argument(s)`, decl.span);
+      continue;
+    }
+    if (targetCons.every((con) => con === undefined)) {
       elaborator.report(`instance \`${decl.head}\`: the instance head must have a type constructor`, decl.span);
       continue;
     }
@@ -1011,13 +1194,15 @@ export function elaborateProgram(
     const instanceScope = scopeOf.get(decl);
     for (const value of instanceMethodValues(decl, file))
       methods.set(value.name, instanceScope ? renameValue(value, instanceScope) : value);
-    elaborator.instances.set(`${parsed.className} ${targetCon}`, {
+    elaborator.addInstance(`${parsed.className} ${targetCons.map((c) => c ?? "_").join(" ")}`, {
       cls: parsed.className,
-      target,
-      targetCon,
-      emitCon: conKey(targetCon),
+      targets,
+      targetCons,
+      // A variable argument contributes `v`, so the two heads of a
+      // multi-parameter class still name two different dictionaries.
+      emitCon: targetCons.map((con) => (con === undefined ? "v" : conKey(con))).join(""),
       context,
-      params: context.map((c, i) => ({ cls: c.cls, type: c.type, name: `$d${i}` })),
+      params: context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
       methods,
       span: decl.span,
     });
@@ -1028,14 +1213,14 @@ export function elaborateProgram(
   for (const decl of datas) {
     if (!decl.deriving.includes("Eq") || elaborator.instances.has(`Eq ${decl.name}`)) continue;
     const vars = decl.parameters.map(() => freshVar());
-    const context = vars.map((type) => ({ cls: "Eq", type }));
-    elaborator.instances.set(`Eq ${decl.name}`, {
+    const context = vars.map((type) => ({ cls: "Eq", types: [type] }));
+    elaborator.addInstance(`Eq ${decl.name}`, {
       cls: "Eq",
-      target: vars.reduce<Type>(tapp, tcon(decl.name)),
-      targetCon: decl.name,
+      targets: [vars.reduce<Type>(tapp, tcon(decl.name))],
+      targetCons: [decl.name],
       emitCon: conKey(decl.name),
       context,
-      params: context.map((c, i) => ({ cls: c.cls, type: c.type, name: `$d${i}` })),
+      params: context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
       methods: new Map([["==", derivedEqMethod(decl)]]),
       span: decl.span,
     });
@@ -1066,7 +1251,11 @@ export function elaborateProgram(
       decl,
       signature,
       declaredScheme: declared
-        ? quantify([...typeVars(declared.type), ...declared.context.flatMap((c) => typeVars(c.type))], declared.type, declared.context)
+        ? quantify(
+            [...typeVars(declared.type), ...declared.context.flatMap((c) => c.types.flatMap((t) => typeVars(t)))],
+            declared.type,
+            declared.context,
+          )
         : undefined,
       givens: [],
       uses: [],
@@ -1104,14 +1293,14 @@ export function elaborateProgram(
     for (const method of info.methods) {
       const decl = instance.methods.get(method.name);
       if (!decl) {
-        if (!method.hasDefault) elaborator.report(`instance \`${instance.cls} ${instance.targetCon}\` has no \`${method.name}\` and the class has no default`, instance.span);
+        if (!method.hasDefault) elaborator.report(`instance \`${instance.cls} ${instance.targetCons.join(" ")}\` has no \`${method.name}\` and the class has no default`, instance.span);
         continue;
       }
       // The instance context becomes the method's givens, so a method of
       // `instance Eq a => Eq [a]` takes the same `$d0` the dictionary does.
       const at = skolemise({
         context: instance.context,
-        type: substituteVar(method.type, varType(info.variable), instance.target),
+        type: substituteVars(method.type, info.variables, instance.targets),
       });
       const implName = methodImpl(instance.cls, instance.emitCon, method.name);
       addBinding(implName, { ...decl, name: implName }, at);
@@ -1121,11 +1310,14 @@ export function elaborateProgram(
     for (const method of info.methods) {
       if (!method.hasDefault) continue;
       const decl = defaults.get(defaultImpl(info.name, method.name))!;
-      const skolem = tcon(`%${info.name}`);
+      const skolems = info.variables.map((_, i) => tcon(`%${info.name}${i}`));
       addBinding(
         defaultImpl(info.name, method.name),
         { ...decl, name: defaultImpl(info.name, method.name) },
-        skolemise({ context: [{ cls: info.name, type: skolem }], type: substituteVar(method.type, varType(info.variable), skolem) }),
+        skolemise({
+          context: [{ cls: info.name, types: skolems }],
+          type: substituteVars(method.type, info.variables, skolems),
+        }),
       );
     }
   }
@@ -1291,10 +1483,12 @@ const PRIMITIVE_TYPES: Record<string, string> = {
 /** `class Eq a => Ord a where` keeps only its name and parameters in the
  * surface AST, so the context is recovered from the class header the parser
  * preserved. */
-function superclassesOf(decl: ClassDeclaration): string[] {
+function superclassesOf(decl: ClassDeclaration, vars: Map<string, Type>): Constraint[] {
   return decl.context.flatMap((item) => {
-    const match = /^([A-Z][A-Za-z0-9_.']*)\s/.exec(`${item} `);
-    return match ? [match[1]!] : [];
+    const tokens = TypeParser.tokens(item);
+    const cls = tokens[0];
+    if (cls === undefined || !/^[A-Z]/.test(cls)) return [];
+    return [{ cls: unqualify(cls), types: new TypeParser(tokens.slice(1), vars).argList() }];
   });
 }
 
@@ -1309,17 +1503,25 @@ function substituteVar(type: Type, from: Type, to: Type): Type {
   return go(type);
 }
 
+/** A class method's type at an instance's arguments: every class variable is
+ * replaced at once, so `put :: s -> m ()` at `MonadState s (StateT s m)`
+ * becomes `s -> StateT s m ()` and not a half-substituted type. */
+function substituteVars(type: Type, from: readonly TVar[], to: readonly Type[]): Type {
+  const subst = new Map<TVar, Type>(from.map((v, i) => [v, to[i] ?? varType(v)]));
+  return applySubst(type, subst);
+}
+
 /** A declared signature's variables are rigid: the binding must work for every
  * instantiation, so they become opaque constructors and its constraints become
  * the only dictionaries available. */
 function skolemise(signature: { context: Constraint[]; type: Type }): { context: Constraint[]; type: Type } {
   let type = signature.type;
   let context = signature.context;
-  for (const v of [...typeVars(signature.type), ...signature.context.flatMap((c) => typeVars(c.type))]) {
+  for (const v of [...typeVars(signature.type), ...signature.context.flatMap((c) => c.types.flatMap((t) => typeVars(t)))]) {
     const skolem = tcon(`%${v.id}`);
     const from: Type = { tag: "var", v };
     type = substituteVar(type, from, skolem);
-    context = context.map((c) => ({ cls: c.cls, type: substituteVar(c.type, from, skolem) }));
+    context = context.map((c) => ({ cls: c.cls, types: c.types.map((t) => substituteVar(t, from, skolem)) }));
   }
   return { context, type };
 }
@@ -1497,9 +1699,11 @@ function instanceDeclaration(elaborator: Elaborator, instance: InstanceInfo): Va
   // With a context the dictionary is a function, so "itself" - what a default
   // method is handed - is this binding applied to its own parameters.
   const self = applyAll(variable(dictValue(instance.cls, instance.emitCon), instance.span), args);
+  const at = new Map<TVar, Type>(info.variables.map((v, i) => [v, instance.targets[i] ?? varType(v)]));
   const supers = info.superclasses.map(
     (parent) =>
-      elaborator.resolve(parent, instance.target, instance.params, instance.span) ?? errorExpr(instance.span),
+      elaborator.resolve(parent.cls, parent.types.map((t) => applySubst(t, at)), instance.params, instance.span) ??
+      errorExpr(instance.span),
   );
   const methods = info.methods.map((method) =>
     instance.methods.has(method.name)

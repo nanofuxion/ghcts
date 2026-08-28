@@ -1046,20 +1046,22 @@ throwStep s e = case jsThrow e of
   // and anything written in JavaScript here would have to reimplement lazy
   // evaluation to get it right.
   //
-  // WHAT IS MISSING, AND WHY. mtl's \`MonadState\`/\`MonadReader\`/\`MonadWriter\`
-  // are multi-parameter classes with functional dependencies (\`m -> s\`), and
-  // \`src/elaborate.ts\` elaborates single-parameter classes only. So \`get\`,
-  // \`ask\` and \`tell\` here are ordinary functions at their own transformer,
-  // exactly as \`Control.Monad.Trans.State\` (transformers, not mtl) defines
-  // them. Code that is polymorphic in the monad - miso's own \`Miso.Lens\`
-  // operators, whose signatures read \`MonadState record m =>\` - therefore
-  // still does not typecheck; a class faked with one parameter would have to
-  // leave the state type free in the method signature, which the skolemised
-  // instance-method check correctly rejects.
+  // \`get\`, \`put\`, \`state\`, \`ask\` and \`tell\` are mtl's class methods, not
+  // functions at one transformer, so code that is polymorphic in the monad -
+  // miso's own \`Miso.Lens\` operators, whose signatures read \`MonadState record
+  // m =>\` - typechecks and runs. Each class is declared in its own leaf module
+  // so that every transformer can carry the lifting instances for all three
+  // without importing its siblings.
   //
-  // \`MonadTrans\` is missing for the same shape of reason: \`lift :: Monad m =>
-  // m a -> t m a\` puts a constraint on a *method*, which a class declaration
-  // here cannot carry. Nothing in miso calls \`lift\`.
+  // WHAT IS MISSING, AND WHY. \`local\`, \`listen\` and \`censor\` stay ordinary
+  // functions at \`ReaderT\`/\`WriterT\`/\`RWST\` rather than joining their classes:
+  // they are the operations that would have to be re-implemented, not merely
+  // lifted, at every other transformer, and nothing in miso uses them through
+  // a stack.
+  //
+  // \`MonadTrans\` is missing for a different reason: \`lift :: Monad m => m a ->
+  // t m a\` puts a constraint on a *method*, which a class declaration here
+  // cannot carry. Nothing in miso calls \`lift\`.
   "Data.Functor.Identity": `module Data.Functor.Identity (runIdentity) where
 
 newtype Identity a = Identity a
@@ -1086,8 +1088,58 @@ instance Eq a => Eq (Identity a) where
   "Control.Monad.Identity": `module Control.Monad.Identity (module Data.Functor.Identity) where
 import Data.Functor.Identity
 `,
-  "Control.Monad.Reader": `module Control.Monad.Reader (runReaderT, runReader, ask, asks, reader, local, withReaderT) where
+  // mtl's three classes. Each lives in a leaf module of its own, exactly as
+  // mtl has it, so that every transformer module can declare the *lifting*
+  // instances for all three without importing its siblings.
+  //
+  // The functional dependency is what makes them usable: `get :: MonadState s
+  // m => m s` mentions `s` nowhere but the result, so `m -> s` is the only
+  // thing that can decide which state type a `n <- get` produced. See the
+  // improvement pass in `src/elaborate.ts`.
+  "Control.Monad.State.Class": `module Control.Monad.State.Class (gets, modify, modify') where
+
+class Monad m => MonadState s m | m -> s where
+  get :: m s
+  put :: s -> m ()
+  state :: (s -> (a, s)) -> m a
+
+gets :: MonadState s m => (s -> a) -> m a
+gets f = get >>= (\\s -> pure (f s))
+
+-- Lazy, as GHC's is: \\\`state\\\` hands over an unforced pair, so \\\`modify (+1)\\\` on
+-- a state nobody looks at costs nothing and never diverges.
+modify :: MonadState s m => (s -> s) -> m ()
+modify f = state (\\s -> ((), f s))
+
+-- \\\`modify'\\\` differs only in the \\\`seq\\\`, and that is the whole point of it:
+-- without forcing, a long fold leaves a chain of thunks in the state.
+modify' :: MonadState s m => (s -> s) -> m ()
+modify' f = get >>= (\\s -> putStrict (f s))
+
+putStrict :: MonadState s m => s -> m ()
+putStrict s = seq s (put s)
+`,
+  "Control.Monad.Reader.Class": `module Control.Monad.Reader.Class (asks, reader) where
+
+class Monad m => MonadReader r m | m -> r where
+  ask :: m r
+
+asks :: MonadReader r m => (r -> a) -> m a
+asks f = ask >>= (\\r -> pure (f r))
+
+reader :: MonadReader r m => (r -> a) -> m a
+reader f = asks f
+`,
+  "Control.Monad.Writer.Class": `module Control.Monad.Writer.Class where
+
+class Monad m => MonadWriter w m | m -> w where
+  tell :: w -> m ()
+`,
+  "Control.Monad.Reader": `module Control.Monad.Reader (runReaderT, runReader, local, withReaderT, module Control.Monad.Reader.Class) where
 import Data.Functor.Identity
+import Control.Monad.Reader.Class
+import Control.Monad.State.Class
+import Control.Monad.Writer.Class
 
 newtype ReaderT r m a = ReaderT (r -> m a)
 
@@ -1098,15 +1150,6 @@ runReaderT (ReaderT f) r = f r
 
 runReader :: Reader r a -> r -> a
 runReader m r = runIdentity (runReaderT m r)
-
-ask :: Monad m => ReaderT r m r
-ask = ReaderT (\\r -> pure r)
-
-asks :: Monad m => (r -> a) -> ReaderT r m a
-asks f = ReaderT (\\r -> pure (f r))
-
-reader :: Monad m => (r -> a) -> ReaderT r m a
-reader f = asks f
 
 local :: (r -> r) -> ReaderT r m a -> ReaderT r m a
 local f m = ReaderT (\\r -> runReaderT m (f r))
@@ -1135,9 +1178,27 @@ instance MonadFail m => MonadFail (ReaderT r m) where
 
 instance MonadIO m => MonadIO (ReaderT r m) where
   liftIO io = ReaderT (\\r -> liftIO io)
+
+instance Monad m => MonadReader r (ReaderT r m) where
+  ask = ReaderT (\\r -> pure r)
+
+-- The lifting instances. A \\\`ReaderT\\\` over a state or a writer still is one:
+-- the environment is threaded past the effect and the base monad's own
+-- \\\`get\\\`/\\\`tell\\\` does the work. Which \\\`s\\\` or \\\`w\\\` that is comes from the
+-- fundep, one step at a time down the stack.
+instance MonadState s m => MonadState s (ReaderT r m) where
+  get = ReaderT (\\r -> get)
+  put s = ReaderT (\\r -> put s)
+  state f = ReaderT (\\r -> state f)
+
+instance MonadWriter w m => MonadWriter w (ReaderT r m) where
+  tell w = ReaderT (\\r -> tell w)
 `,
-  "Control.Monad.State": `module Control.Monad.State (runStateT, runState, evalState, execState, evalStateT, execStateT, get, put, state, gets, modify, modify', withState) where
+  "Control.Monad.State": `module Control.Monad.State (runStateT, runState, evalState, execState, evalStateT, execStateT, withState, module Control.Monad.State.Class) where
 import Data.Functor.Identity
+import Control.Monad.State.Class
+import Control.Monad.Reader.Class
+import Control.Monad.Writer.Class
 
 newtype StateT s m a = StateT (s -> m (a, s))
 
@@ -1160,32 +1221,6 @@ evalStateT m s = runStateT m s >>= (\\p -> pure (fst p))
 
 execStateT :: Monad m => StateT s m a -> s -> m s
 execStateT m s = runStateT m s >>= (\\p -> pure (snd p))
-
-get :: Monad m => StateT s m s
-get = StateT (\\s -> pure (s, s))
-
-put :: Monad m => s -> StateT s m ()
-put s = StateT (\\_ -> pure ((), s))
-
-state :: Monad m => (s -> (a, s)) -> StateT s m a
-state f = StateT (\\s -> pure (f s))
-
-gets :: Monad m => (s -> a) -> StateT s m a
-gets f = StateT (\\s -> pure (f s, s))
-
--- Lazy, as GHC's is: the new state is a thunk, so \\\`modify (+1)\\\` on a state
--- nobody looks at costs nothing and never diverges.
-modify :: Monad m => (s -> s) -> StateT s m ()
-modify f = StateT (\\s -> pure ((), f s))
-
--- \\\`modify'\\\` differs from \\\`modify\\\` only in the \\\`seq\\\`, and that is the whole
--- point of it: without forcing, a long fold leaves a chain of thunks in the
--- state instead of a value.
-modify' :: Monad m => (s -> s) -> StateT s m ()
-modify' f = StateT (\\s -> modifyStrictStep (f s))
-
-modifyStrictStep :: Monad m => s -> m ((), s)
-modifyStrictStep s = seq s (pure ((), s))
 
 withState :: (s -> s) -> StateT s m a -> StateT s m a
 withState f m = StateT (\\s -> runStateT m (f s))
@@ -1235,9 +1270,29 @@ instance MonadIO m => MonadIO (StateT s m) where
 
 stateLiftIO :: MonadIO m => IO a -> s -> m (a, s)
 stateLiftIO io s = liftIO io >>= (\\a -> pure (a, s))
+
+instance Monad m => MonadState s (StateT s m) where
+  get = StateT (\\s -> pure (s, s))
+  put s = StateT (\\_ -> pure ((), s))
+  state f = StateT (\\s -> pure (f s))
+
+instance MonadReader r m => MonadReader r (StateT s m) where
+  ask = StateT (\\s -> stateAsk s)
+
+stateAsk :: MonadReader r m => s -> m (r, s)
+stateAsk s = ask >>= (\\r -> pure (r, s))
+
+instance MonadWriter w m => MonadWriter w (StateT s m) where
+  tell w = StateT (\\s -> stateTell w s)
+
+stateTell :: MonadWriter w m => w -> s -> m ((), s)
+stateTell w s = tell w >>= (\\_ -> pure ((), s))
 `,
-  "Control.Monad.Writer": `module Control.Monad.Writer (runWriterT, runWriter, execWriter, execWriterT, writer, tell, listen, censor) where
+  "Control.Monad.Writer": `module Control.Monad.Writer (runWriterT, runWriter, execWriter, execWriterT, writer, listen, censor, module Control.Monad.Writer.Class) where
 import Data.Functor.Identity
+import Control.Monad.Writer.Class
+import Control.Monad.State.Class
+import Control.Monad.Reader.Class
 
 newtype WriterT w m a = WriterT (m (a, w))
 
@@ -1257,9 +1312,6 @@ execWriterT m = runWriterT m >>= (\\p -> pure (snd p))
 
 writer :: Applicative m => (a, w) -> WriterT w m a
 writer p = WriterT (pure p)
-
-tell :: Applicative m => w -> WriterT w m ()
-tell w = WriterT (pure ((), w))
 
 listen :: Monad m => WriterT w m a -> WriterT w m (a, w)
 listen m = WriterT (runWriterT m >>= (\\p -> listenStep p))
@@ -1322,9 +1374,37 @@ instance (Monoid w, MonadIO m) => MonadIO (WriterT w m) where
 
 writerLiftIO :: (Monoid w, MonadIO m) => IO a -> m (a, w)
 writerLiftIO io = liftIO io >>= (\\a -> pure (a, mempty))
+
+instance (Monoid w, Monad m) => MonadWriter w (WriterT w m) where
+  tell w = WriterT (pure ((), w))
+
+-- Lifted through the output: each action of the base monad contributes
+-- \\\`mempty\\\`, so nothing is written that the program did not \\\`tell\\\`.
+instance (Monoid w, MonadState s m) => MonadState s (WriterT w m) where
+  get = WriterT writerGet
+  put s = WriterT (writerPut s)
+  state f = WriterT (writerState f)
+
+writerGet :: (Monoid w, MonadState s m) => m (s, w)
+writerGet = get >>= (\\s -> pure (s, mempty))
+
+writerPut :: (Monoid w, MonadState s m) => s -> m ((), w)
+writerPut s = put s >>= (\\_ -> pure ((), mempty))
+
+writerState :: (Monoid w, MonadState s m) => (s -> (a, s)) -> m (a, w)
+writerState f = state f >>= (\\a -> pure (a, mempty))
+
+instance (Monoid w, MonadReader r m) => MonadReader r (WriterT w m) where
+  ask = WriterT writerAsk
+
+writerAsk :: (Monoid w, MonadReader r m) => m (r, w)
+writerAsk = ask >>= (\\r -> pure (r, mempty))
 `,
-  "Control.Monad.RWS": `module Control.Monad.RWS (runRWST, runRWS, evalRWS, execRWS, evalRWST, execRWST, rws, ask, asks, local, get, put, state, gets, modify, modify', tell, listen, censor) where
+  "Control.Monad.RWS": `module Control.Monad.RWS (runRWST, runRWS, evalRWS, execRWS, evalRWST, execRWST, rws, local, listen, censor, module Control.Monad.State.Class, module Control.Monad.Reader.Class, module Control.Monad.Writer.Class) where
 import Data.Functor.Identity
+import Control.Monad.State.Class
+import Control.Monad.Reader.Class
+import Control.Monad.Writer.Class
 
 -- One pass, not \\\`ReaderT r (WriterT w (StateT s m))\\\`: miso's \\\`Effect\\\` is an
 -- \\\`RWS\\\`, and the fused form is what \\\`execRWS\\\` can take apart in one \\\`case\\\`.
@@ -1361,42 +1441,12 @@ execRWST m r s = runRWST m r s >>= (\\t -> pure (execRWSStep t))
 rws :: Monad m => (r -> s -> (a, s, w)) -> RWST r w s m a
 rws f = RWST (\\r s -> pure (f r s))
 
-ask :: (Monoid w, Monad m) => RWST r w s m r
-ask = RWST (\\r s -> pure (r, s, mempty))
-
-asks :: (Monoid w, Monad m) => (r -> a) -> RWST r w s m a
-asks f = RWST (\\r s -> pure (f r, s, mempty))
-
 local :: (r -> r) -> RWST r w s m a -> RWST r w s m a
 local f m = RWST (\\r s -> runRWST m (f r) s)
-
-get :: (Monoid w, Monad m) => RWST r w s m s
-get = RWST (\\r s -> pure (s, s, mempty))
-
-put :: (Monoid w, Monad m) => s -> RWST r w s m ()
-put s = RWST (\\r _ -> pure ((), s, mempty))
-
-state :: (Monoid w, Monad m) => (s -> (a, s)) -> RWST r w s m a
-state f = RWST (\\r s -> rwsStateStep (f s))
 
 rwsStateStep :: (Monoid w, Monad m) => (a, s) -> m (a, s, w)
 rwsStateStep p = case p of
   (a, s) -> pure (a, s, mempty)
-
-gets :: (Monoid w, Monad m) => (s -> a) -> RWST r w s m a
-gets f = RWST (\\r s -> pure (f s, s, mempty))
-
-modify :: (Monoid w, Monad m) => (s -> s) -> RWST r w s m ()
-modify f = RWST (\\r s -> pure ((), f s, mempty))
-
-modify' :: (Monoid w, Monad m) => (s -> s) -> RWST r w s m ()
-modify' f = RWST (\\r s -> rwsModifyStrict (f s))
-
-rwsModifyStrict :: (Monoid w, Monad m) => s -> m ((), s, w)
-rwsModifyStrict s = seq s (pure ((), s, mempty))
-
-tell :: Monad m => w -> RWST r w s m ()
-tell w = RWST (\\r s -> pure ((), s, w))
 
 listen :: (Monoid w, Monad m) => RWST r w s m a -> RWST r w s m (a, w)
 listen m = RWST (\\r s -> runRWST m r s >>= (\\t -> rwsListenStep t))
@@ -1462,8 +1512,25 @@ instance (Monoid w, MonadIO m) => MonadIO (RWST r w s m) where
 
 rwsLiftIO :: (Monoid w, MonadIO m) => IO a -> s -> m (a, s, w)
 rwsLiftIO io s = liftIO io >>= (\\a -> pure (a, s, mempty))
+
+-- One monad, all three classes: this is what makes miso's \\\`Effect\\\` accept
+-- \\\`value += 1\\\` (MonadState), \\\`getProps\\\` (MonadReader) and \\\`io_\\\` (MonadWriter)
+-- in the same \\\`do\\\` block.
+instance (Monoid w, Monad m) => MonadState s (RWST r w s m) where
+  get = RWST (\\r s -> pure (s, s, mempty))
+  put s = RWST (\\r _ -> pure ((), s, mempty))
+  state f = RWST (\\r s -> rwsStateStep (f s))
+
+instance (Monoid w, Monad m) => MonadReader r (RWST r w s m) where
+  ask = RWST (\\r s -> pure (r, s, mempty))
+
+instance (Monoid w, Monad m) => MonadWriter w (RWST r w s m) where
+  tell w = RWST (\\r s -> pure ((), s, w))
 `,
   "Control.Monad.Trans.Maybe": `module Control.Monad.Trans.Maybe (runMaybeT, hoistMaybe) where
+import Control.Monad.State.Class
+import Control.Monad.Reader.Class
+import Control.Monad.Writer.Class
 
 newtype MaybeT m a = MaybeT (m (Maybe a))
 
@@ -1525,6 +1592,22 @@ instance MonadIO m => MonadIO (MaybeT m) where
 
 maybeTLiftIO :: MonadIO m => IO a -> m (Maybe a)
 maybeTLiftIO io = liftIO io >>= (\\a -> pure (Just a))
+
+-- Lifting through the short circuit: the effect runs in the base monad and its
+-- result is always a \\\`Just\\\`, so \\\`get\\\` inside a \\\`MaybeT\\\` cannot itself fail.
+instance MonadState s m => MonadState s (MaybeT m) where
+  get = MaybeT (maybeTLift get)
+  put s = MaybeT (maybeTLift (put s))
+  state f = MaybeT (maybeTLift (state f))
+
+maybeTLift :: Monad m => m a -> m (Maybe a)
+maybeTLift m = m >>= (\\a -> pure (Just a))
+
+instance MonadReader r m => MonadReader r (MaybeT m) where
+  ask = MaybeT (maybeTLift ask)
+
+instance MonadWriter w m => MonadWriter w (MaybeT m) where
+  tell w = MaybeT (maybeTLift (tell w))
 `,
   // ----------------------------------------------------------- marshalling ---
   "GHCJS.Types": `module GHCJS.Types (jsval) where
