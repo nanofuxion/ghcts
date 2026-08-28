@@ -109,6 +109,11 @@ const primOps: Record<string, Prim> = {
   primReadMVar: { op: "ReadMVarOp", arity: 1 },
   primTryPutMVar: { op: "TryPutMVarOp", arity: 2, bool: true },
   primIsEmptyMVar: { op: "IsEmptyMVarOp", arity: 1, bool: true },
+  // `h$makeStableName` hands back one object per heap object and
+  // `h$stableNameInt` its unique integer, so integer equality on two stable
+  // names is object identity - which is what `Eq (StableName a)` means.
+  primMakeStableName: { op: "MakeStableNameOp", arity: 1 },
+  primStableNameInt: { op: "StableNameToIntOp", arity: 1 },
   primFork: { op: "ForkOp", arity: 1 },
   primDelay: { op: "DelayOp", arity: 1 },
 };
@@ -222,7 +227,10 @@ class Desugarer {
       }
       case "let": {
         const [binds, inner] = this.localGroup(e.bindings, scope);
-        return binds.reduceRight<CoreExpr>((body, bind) => ({ tag: "Let", bind, body }), this.expr(e.body, inner));
+        return binds.reduceRight<CoreExpr>(
+          (body, bind) => ({ tag: "Let", bind, body }),
+          forceStrict(e.bindings, inner, this.expr(e.body, inner)),
+        );
       }
       case "tuple": {
         const con = this.lookupCon(`(${",".repeat(e.items.length - 1)})`, e.items.length);
@@ -509,7 +517,7 @@ class Desugarer {
             ),
       next(),
     );
-    return wrap(chain);
+    return wrap(forceStrict(row.whereBindings, inner, chain));
   }
 
   /** A `let`/`where` group. Bindings with parameters become functions; the
@@ -554,6 +562,17 @@ interface MatchRow {
 }
 
 const varOf = (binder: Binder): CoreExpr => ({ tag: "Var", binder });
+
+/** `let !x = e in b` is GHC's `case e of x -> b`: the group is still a `Let`,
+ * and a `Case` on each strict binder in front of the body forces it exactly
+ * where the `in` is - not earlier, and not only when `x` happens to be used. */
+const forceStrict = (bindings: readonly LocalBinding[], scope: Scope, body: CoreExpr): CoreExpr =>
+  bindings.reduceRight<CoreExpr>((rest, binding) => {
+    const binder = binding.strict ? scope.get(binding.name) : undefined;
+    return binder
+      ? { tag: "Case", scrutinee: varOf(binder), binder: mkBinder("$bang"), alts: [{ con: { tag: "DEFAULT" }, binders: [], body: rest }] }
+      : rest;
+  }, body);
 
 
 /** Pattern-match failure. `RaiseDivZeroOp` is the only nullary raising primop

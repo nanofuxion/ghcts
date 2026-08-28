@@ -66,7 +66,7 @@ import { renameDeclarations, renameValue, resolveProgram, type Scope } from "./m
 import { error } from "./diagnostics.js";
 import { constructorTable, derivedEqMethod, derivedGenericSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE } from "./prelude.js";
-import { withLibraryModules } from "./library.js";
+import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
 import type { Diagnostic } from "./types.js";
 
@@ -761,7 +761,12 @@ class Elaborator {
   constructor(private readonly file: string) {}
 
   report(message: string, span: Span): void {
-    this.diagnostics.push(error("GHCTS-DICT", message, this.file, span.line, span.column));
+    // The whole program is one flat declaration pile by the time this pass runs,
+    // so a span alone cannot say which module a failure came from. The binding
+    // under check can - its name is `Module_name` after `renameDeclarations` -
+    // and that is what makes a hundred reports groupable by cause.
+    const where = this.current ? ` (in \`${this.current.name}\`)` : "";
+    this.diagnostics.push(error("GHCTS-DICT", message + where, this.file, span.line, span.column));
   }
 
   // ------------------------------------------------------------ patterns --
@@ -1456,7 +1461,7 @@ export function elaborateProgram(
   // The compiler's own library modules join the program before resolution, so
   // they are ordered, renamed and scoped exactly like any other module - and a
   // project module of the same name shadows them.
-  const resolved = resolveProgram(withLibraryModules(modules), root);
+  const resolved = resolveProgram(withLibraryModules(modules), root, libraryModuleNames);
   const elaborator = new Elaborator(file);
   const prelude = parseModule(PRELUDE_SOURCE, "GHCTS/Prelude.hs");
   if (!prelude.module || prelude.diagnostics.some((d) => d.severity === "error")) {
@@ -1472,7 +1477,7 @@ export function elaborateProgram(
   const declarations: Declaration[] = [...prelude.module.ast.declarations];
   for (const module of resolved.order) {
     const scope = resolved.scopes.get(module.name)!;
-    for (const decl of renameDeclarations(module, scope, module.name === root)) {
+    for (const decl of renameDeclarations(module, scope, module.name === root, !libraryModuleNames.has(module.name))) {
       scopeOf.set(decl, scope);
       declarations.push(decl);
     }
@@ -1542,7 +1547,7 @@ export function elaborateProgram(
   // three want the same scheme. `src/desugar.ts` invents the matching DataCon
   // on demand, so the two ends agree without a declaration anywhere.
   elaborator.constructors.set("()", { gens: 0, constraints: [], type: tcon("()") });
-  for (let arity = 2; arity <= 7; arity++) {
+  for (let arity = 2; arity <= 8; arity++) {
     const name = `(${",".repeat(arity - 1)})`;
     const fields = Array.from({ length: arity }, () => freshVar());
     const type = fields.reduceRight((acc, field) => tfun(field, acc), fields.reduce<Type>(tapp, tcon(name)));
@@ -1562,19 +1567,41 @@ export function elaborateProgram(
       elaborator.report(`class \`${decl.name}\`: a class must have at least one parameter`, decl.span);
       continue;
     }
+    // An associated type is an extra class parameter the class's own
+    // parameters determine - `class At at where type Index at` says exactly
+    // what `class At at index | at -> index` says - and the fundep solver
+    // already improves such a parameter from the others. This is the same
+    // reading `Rep`/`Generic` gets in `src/library.ts`, applied to whatever a
+    // class actually declares.
+    const families = decl.associatedTypes.map((a) => a.name);
+    const parameters = [...decl.parameters, ...families.map((f) => `$assoc$${f}`)];
     const vars = new Map<string, Type>();
     const variables: TVar[] = [];
-    for (const parameter of decl.parameters) {
+    for (const parameter of parameters) {
       const made = freshVar();
       if (made.tag !== "var") continue;
       vars.set(parameter, made);
       variables.push(made.v);
     }
+    // `Index at` in a method's type *is* that extra parameter; the family is
+    // never computed, only solved for, which is the whole of what this reading
+    // can do and all miso asks of it.
+    const familyVars = new Map(families.map((f) => [f, vars.get(`$assoc$${f}`)!]));
+    const deFamily = (t: Type): Type => {
+      const p = prune(t);
+      if (p.tag !== "app") return p;
+      const fn = prune(p.fn);
+      if (fn.tag === "con") {
+        const found = familyVars.get(fn.name);
+        if (found) return found;
+      }
+      return tapp(deFamily(p.fn), deFamily(p.arg));
+    };
     // Parsed against the same variable map as the methods, so `m` in
     // `class Monad m => MonadState s m` is the class's own second parameter.
-    const supers = superclassesOf(decl, vars);
+    const supers = superclassesOf(decl, vars).map((c) => ({ cls: c.cls, types: c.types.map(deFamily) }));
     const fundeps = decl.fundeps.flatMap((fd) => {
-      const index = (name: string): number => decl.parameters.indexOf(name);
+      const index = (name: string): number => parameters.indexOf(name);
       const from = fd.from.map(index);
       const to = fd.to.map(index);
       if ([...from, ...to].some((i) => i < 0)) {
@@ -1583,10 +1610,12 @@ export function elaborateProgram(
       }
       return [{ from, to }];
     });
+    for (let i = 0; i < families.length; i++)
+      fundeps.push({ from: decl.parameters.map((_, j) => j), to: [decl.parameters.length + i] });
     const own = new Map<string, ValueDeclaration>();
     const classScope = scopeOf.get(decl);
     for (const value of instanceMethodValues(
-      { tag: "instance", head: decl.name, members: [], rawMembers: decl.rawMembers, span: decl.span },
+      { tag: "instance", head: decl.name, associatedTypes: [], members: [], rawMembers: decl.rawMembers, span: decl.span },
       file,
     )) {
       own.set(value.name, classScope ? renameValue(value, classScope) : value);
@@ -1598,14 +1627,18 @@ export function elaborateProgram(
     const defaultSignatures = new Map<string, { context: Constraint[]; type: Type }>();
     for (const member of decl.members) {
       if (member.tag !== "signature" || member.isDefault !== true) continue;
-      defaultSignatures.set(member.name, parseSignature(member.type, vars));
+      const parsed = parseSignature(member.type, vars);
+      defaultSignatures.set(member.name, {
+        context: parsed.context.map((c) => ({ cls: c.cls, types: c.types.map(deFamily) })),
+        type: deFamily(parsed.type),
+      });
     }
     for (const member of decl.members) {
       if (member.tag !== "signature" || member.isDefault === true) continue;
       const declared = defaultSignatures.get(member.name);
       methods.push({
         name: member.name,
-        type: parseType(member.type, vars),
+        type: deFamily(parseType(member.type, vars)),
         hasDefault: own.has(member.name),
         ...(declared ? { defaultContext: declared.context, defaultType: declared.type } : {}),
       });
@@ -1613,7 +1646,7 @@ export function elaborateProgram(
     }
     elaborator.classes.set(decl.name, {
       name: decl.name,
-      parameters: decl.parameters,
+      parameters,
       variables,
       superclasses: supers,
       fundeps,
@@ -1654,6 +1687,18 @@ export function elaborateProgram(
     const vars = new Map<string, Type>();
     const context = parseSignature(decl.head, vars).context;
     const targets = new TypeParser(TypeParser.tokens(parsed.target), vars).argList();
+    // An instance's `type Index (Map k v) = k` supplies the extra parameter
+    // the class's associated type became. It is parsed against the head's own
+    // variable map, so the `k` on the right is the `k` in `Map k v`.
+    for (const family of info.parameters.slice(targets.length)) {
+      const name = family.startsWith("$assoc$") ? family.slice("$assoc$".length) : family;
+      const written = decl.associatedTypes.find((a) => a.name === name);
+      if (!written?.rhs) {
+        elaborator.report(`instance \`${decl.head}\`: no \`type ${name}\` for the class's associated type`, decl.span);
+        break;
+      }
+      targets.push(parseType(written.rhs, vars));
+    }
     const targetCons = targets.map((t) => headCon(t));
     if (targets.length !== info.variables.length) {
       elaborator.report(`instance \`${decl.head}\`: \`${info.name}\` takes ${info.variables.length} argument(s)`, decl.span);
@@ -2103,6 +2148,8 @@ const PRIMITIVE_TYPES: Record<string, string> = {
   primReadMVar: "MVarPrim a -> a",
   primTryPutMVar: "MVarPrim a -> a -> Bool",
   primIsEmptyMVar: "MVarPrim a -> Bool",
+  primMakeStableName: "a -> StableNamePrim",
+  primStableNameInt: "StableNamePrim -> IntPrim",
   primFork: "a -> ThreadIdPrim",
   primDelay: "IntPrim -> VoidPrim",
 };

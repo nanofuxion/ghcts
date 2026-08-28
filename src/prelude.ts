@@ -233,6 +233,11 @@ instance Real Double where
 instance RealFrac Double where
   fracToDoublePrim (DoubleBox d) = d
 
+-- The JS backend's \`Int\` is 32-bit, exactly as GHC's is on that platform.
+instance Bounded Int where
+  minBound = negate 2147483648
+  maxBound = 2147483647
+
 instance Enum Int where
   toEnum n = n
   fromEnum n = n
@@ -842,6 +847,32 @@ drop n xs = case xs of
 splitAt :: Int -> [a] -> ([a], [a])
 splitAt n xs = (take n xs, drop n xs)
 
+-- These are Prelude names in Haskell, not \`Data.List\` ones: a module that
+-- imports neither still has them.
+takeWhile :: (a -> Bool) -> [a] -> [a]
+takeWhile p xs = case xs of
+  [] -> []
+  (y : ys) -> if p y then y : takeWhile p ys else []
+
+dropWhile :: (a -> Bool) -> [a] -> [a]
+dropWhile p xs = case xs of
+  [] -> []
+  (y : ys) -> if p y then dropWhile p ys else xs
+
+span :: (a -> Bool) -> [a] -> ([a], [a])
+span p xs = (takeWhile p xs, dropWhile p xs)
+
+break :: (a -> Bool) -> [a] -> ([a], [a])
+break p xs = span (\\x -> not (p x)) xs
+
+subtract :: Num a => a -> a -> a
+subtract x y = y - x
+
+-- \`x /= x\` is true of NaN and of nothing else, and \`==\` on a \`Double\` is
+-- JavaScript's \`===\`, which agrees.
+isNaN :: Double -> Bool
+isNaN x = not (x == x)
+
 zip :: [a] -> [b] -> [(a, b)]
 zip xs ys = zipWith (\\x y -> (x, y)) xs ys
 
@@ -916,6 +947,21 @@ fold xs = foldr mappend mempty xs
 foldMapList :: Monoid m => (a -> m) -> [a] -> m
 foldMapList f xs = foldr (\\x acc -> mappend (f x) acc) mempty xs
 
+-- \`foldMap\` cannot be a \`Foldable\` method here (a method's signature carries
+-- no constraint of its own), but it is the same function written outside the
+-- class, which is where every other fold already lives.
+foldMap :: (Foldable t, Monoid m) => (a -> m) -> t a -> m
+foldMap f xs = foldr (\\x acc -> mappend (f x) acc) mempty xs
+
+foldl' :: Foldable t => (b -> a -> b) -> b -> t a -> b
+foldl' f z xs = foldlStrict f z (toList xs)
+
+foldlStrict :: (b -> a -> b) -> b -> [a] -> b
+foldlStrict f z xs = case xs of
+  [] -> z
+  (y : ys) -> case f z y of
+    next -> seq next (foldlStrict f next ys)
+
 -- ------------------------------------------------- Functor/Monad utilities --
 
 (<$>) :: Functor f => (a -> b) -> f a -> f b
@@ -956,6 +1002,27 @@ optional v = fmap (\\x -> Just x) v <|> pure Nothing
 
 someOrNone :: Alternative f => f a -> f [a]
 someOrNone v = some v <|> pure []
+
+ap :: Monad m => m (a -> b) -> m a -> m b
+ap mf mx = mf >>= (\\f -> mx >>= (\\x -> pure (f x)))
+
+liftM :: Monad m => (a -> b) -> m a -> m b
+liftM f ma = ma >>= (\\a -> pure (f a))
+
+liftM2 :: Monad m => (a -> b -> c) -> m a -> m b -> m c
+liftM2 f ma mb = ma >>= (\\a -> mb >>= (\\b -> pure (f a b)))
+
+liftM3 :: Monad m => (a -> b -> c -> d) -> m a -> m b -> m c -> m d
+liftM3 f ma mb mc = ma >>= (\\a -> mb >>= (\\b -> mc >>= (\\c -> pure (f a b c))))
+
+liftM4 :: Monad m => (a -> b -> c -> d -> e) -> m a -> m b -> m c -> m d -> m e
+liftM4 f ma mb mc md = ma >>= (\\a -> mb >>= (\\b -> mc >>= (\\c -> md >>= (\\d -> pure (f a b c d)))))
+
+msum :: (Foldable t, Alternative f) => t (f a) -> f a
+msum xs = foldr (\\x rest -> x <|> rest) empty xs
+
+asum :: (Foldable t, Alternative f) => t (f a) -> f a
+asum xs = msum xs
 
 mapM_ :: (Foldable t, Monad m) => (a -> m b) -> t a -> m ()
 mapM_ f xs = foldr (\\x k -> f x >> k) (pure ()) xs

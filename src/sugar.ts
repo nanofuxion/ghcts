@@ -158,6 +158,12 @@ class Sugar {
         );
       case "record": {
         const info = this.cons.get(p.name);
+        // `Con {}` names a constructor and binds nothing, so it is legal for a
+        // constructor declared *without* record syntax too - miso writes
+        // `IndexToken {}` and `VText {}` exactly to test the tag and ignore
+        // however many arguments the constructor happens to have.
+        if (info && !p.wildcard && p.fields.length === 0)
+          return { tag: "con", name: p.name, args: Array.from({ length: info.arity }, () => ({ tag: "wild", span: p.span }) as const), span: p.span };
         if (!info?.fields) {
           this.report(`\`${p.name}\` has no record fields`, p.span);
           return { tag: "wild", span: p.span };

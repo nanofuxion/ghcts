@@ -10,7 +10,9 @@ export interface Guard { condition?: Expr; pattern?: Pattern; source?: Expr; bod
 export type ListQualifier = { tag: 'guard'; condition: Expr } | { tag: 'generator'; pattern: Pattern; source: Expr };
 export type DoStatement = { tag: 'expr'; expr: Expr } | { tag: 'bind'; pattern: Pattern; source: Expr } | { tag: 'let'; bindings: LocalBinding[] };
 export type Expr = { tag: 'var'; name: string; span: Span } | { tag: 'int'; value: number; span: Span } | { tag: 'double'; value: number; span: Span } | { tag: 'string'; value: string; span: Span } | { tag: 'char'; value: string; span: Span } | { tag: 'unit'; span: Span } | { tag: 'tuple'; items: Expr[]; span: Span } | { tag: 'list'; items: Expr[]; span: Span } | { tag: 'listComp'; body: Expr; qualifiers: ListQualifier[]; span: Span } | { tag: 'jsQuote'; body: string; quoter?: string; span: Span } | { tag: 'record'; constructor: string; fields: Array<{ name: string; value: Expr }>; wildcard?: boolean; span: Span } | { tag: 'recordUpdate'; base: Expr; fields: Array<{ name: string; value: Expr }>; span: Span } | { tag: 'app'; fn: Expr; arg: Expr; span: Span } | { tag: 'lambda'; parameter: string; body: Expr; span: Span } | { tag: 'lambdaCase'; alternatives: CaseAlternative[]; span: Span } | { tag: 'let'; bindings: LocalBinding[]; body: Expr; span: Span } | { tag: 'do'; statements: DoStatement[]; span: Span } | { tag: 'if'; condition: Expr; thenBranch: Expr; elseBranch: Expr; span: Span } | { tag: 'case'; subject: Expr; alternatives: CaseAlternative[]; span: Span } | { tag: 'annot'; expr: Expr; /** The written type, as source text; `src/elaborate.ts` parses it. */ type: string; span: Span } | { tag: 'typeApp'; expr: Expr; /** One `@T` argument, as source text; parsed by `src/elaborate.ts`. */ type: string; span: Span };
-export interface LocalBinding { name: string; patterns: Pattern[]; value: Expr; guards?: Guard[]; whereBindings?: LocalBinding[]; span: Span; }
+/** `strict` is BangPatterns' `let !x = e`: the binding is forced where the
+ * group's body begins, which `src/desugar.ts` renders as a `Case`. */
+export interface LocalBinding { name: string; patterns: Pattern[]; value: Expr; guards?: Guard[]; whereBindings?: LocalBinding[]; strict?: true; span: Span; }
 export interface ValueDeclaration { tag: 'value'; name: string; equations: Array<{ patterns: Pattern[]; guards: Guard[]; whereBindings: LocalBinding[] }>; span: Span; }
 export interface DataDeclaration { tag: 'data'; name: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[] }>;
   /** GHC's `deriving stock`, and a strategy-less clause, which means the same
@@ -37,8 +39,12 @@ export interface TypeAliasDeclaration { tag: 'typeAlias'; name: string; paramete
  * contain associated types or an infix equation that is not yet one of the
  * compact surface `Declaration` forms. */
 export interface ClassMemberSlice { tokens: string[]; span: Span; }
-export interface ClassDeclaration { tag: 'class'; name: string; /** Superclass constraints, one string per item of the `=>` context. */ context: string[]; parameters: string[]; /** `| m -> s, a b -> c`: each dependency names parameters, by name. */ fundeps: Array<{ from: string[]; to: string[] }>; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
-export interface InstanceDeclaration { tag: 'instance'; head: string; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
+/** `associatedTypes` is a class's `type family F a` members, or an instance's
+ * `type F t = rhs` ones. An associated type is read as an extra class
+ * parameter the class's own parameters determine - see `src/elaborate.ts`. */
+export interface AssociatedType { name: string; rhs?: string; }
+export interface ClassDeclaration { tag: 'class'; name: string; associatedTypes: AssociatedType[]; /** Superclass constraints, one string per item of the `=>` context. */ context: string[]; parameters: string[]; /** `| m -> s, a b -> c`: each dependency names parameters, by name. */ fundeps: Array<{ from: string[]; to: string[] }>; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
+export interface InstanceDeclaration { tag: 'instance'; head: string; associatedTypes: AssociatedType[]; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
 /** Parsed but not yet represented in Core.  Keeping these explicit ensures a
  * later phase reports one accurate unsupported-feature diagnostic instead of
  * pretending the declaration was absent. */

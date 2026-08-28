@@ -524,6 +524,198 @@ intersection a b = M.filterWithKey (\\k _ -> member k b) a
 import Data.Set
 type IntSet = Set Int
 `,
+  // containers' \`Seq\` is a finger tree, and its two *pattern synonyms* -
+  // \`Empty\` and \`(:<|)\` - are how every consumer takes it apart. This parser
+  // has no pattern synonyms, so the sequence is declared with those two
+  // spellings as its real constructors: a cons list, matched exactly the way
+  // miso's \`Miso.Runtime\` matches a \`Seq\`.
+  //
+  // What that costs and what it does not. Every answer is the same - the
+  // element order, the folds, the equality, the \`Semigroup\`. What changes is
+  // asymptotics: \`|>\` and \`<>\` are O(n) here where a finger tree gives O(1)
+  // and O(log n). The queues miso puts in a \`Seq\` hold the actions pending for
+  // one component between two frames, so the difference is a constant factor
+  // on a short list, not a change of behaviour.
+  "Data.Sequence": `module Data.Sequence where
+
+data Seq a = Empty | (:<|) a (Seq a)
+
+empty :: Seq a
+empty = Empty
+
+singleton :: a -> Seq a
+singleton x = x :<| Empty
+
+-- Append at the right, which is the whole reason miso reaches for a \\\`Seq\\\`.
+(|>) :: Seq a -> a -> Seq a
+(|>) s x = case s of
+  Empty -> x :<| Empty
+  (y :<| ys) -> y :<| (ys |> x)
+
+(<|) :: a -> Seq a -> Seq a
+(<|) x s = x :<| s
+
+fromList :: [a] -> Seq a
+fromList xs = case xs of
+  [] -> Empty
+  (y : ys) -> y :<| fromList ys
+
+filter :: (a -> Bool) -> Seq a -> Seq a
+filter p s = case s of
+  Empty -> Empty
+  (y :<| ys) -> if p y then y :<| filter p ys else filter p ys
+
+-- The longest prefix whose elements satisfy the predicate, and the rest.
+spanl :: (a -> Bool) -> Seq a -> (Seq a, Seq a)
+spanl p s = case s of
+  Empty -> (Empty, Empty)
+  (y :<| ys) ->
+    if p y
+      then case spanl p ys of
+        (before, after) -> (y :<| before, after)
+      else (Empty, s)
+
+splitAt :: Int -> Seq a -> (Seq a, Seq a)
+splitAt n s =
+  if n <= 0
+    then (Empty, s)
+    else case s of
+      Empty -> (Empty, Empty)
+      (y :<| ys) -> case splitAt (n - 1) ys of
+        (before, after) -> (y :<| before, after)
+
+reverseSeq :: Seq a -> Seq a
+reverseSeq s = fromList (reverse (seqToList s))
+
+seqToList :: Seq a -> [a]
+seqToList s = case s of
+  Empty -> []
+  (y :<| ys) -> y : seqToList ys
+
+instance Functor Seq where
+  fmap f s = case s of
+    Empty -> Empty
+    (y :<| ys) -> f y :<| fmap f ys
+
+instance Foldable Seq where
+  foldr f z s = case s of
+    Empty -> z
+    (y :<| ys) -> f y (foldr f z ys)
+
+instance Eq a => Eq (Seq a) where
+  (==) a b = case a of
+    Empty -> case b of
+      Empty -> True
+      _ -> False
+    (x :<| xs) -> case b of
+      Empty -> False
+      (y :<| ys) -> if x == y then xs == ys else False
+
+instance Semigroup (Seq a) where
+  (<>) a b = case a of
+    Empty -> b
+    (x :<| xs) -> x :<| (xs <> b)
+
+instance Monoid (Seq a) where
+  mempty = Empty
+`,
+  // \`readHex\`/\`showHex\` are what miso's \`Fingerprint\` marshalling is written
+  // in; the rest of \`Numeric\` is not used and not here.
+  "Numeric": `module Numeric where
+
+-- GHC's \\\`readHex\\\` is a \\\`ReadS\\\`: it returns the value and the unconsumed
+-- input, and the empty list when the first character is not a hex digit.
+readHex :: [Char] -> [(Int, [Char])]
+readHex cs = case hexDigit cs of
+  Nothing -> []
+  Just _ -> readHexGo 0 cs
+
+readHexGo :: Int -> [Char] -> [(Int, [Char])]
+readHexGo acc cs = case cs of
+  [] -> (acc, []) : []
+  (c : rest) -> case hexDigit (c : rest) of
+    Nothing -> (acc, c : rest) : []
+    Just d -> readHexGo (acc * 16 + d) rest
+
+hexDigit :: [Char] -> Maybe Int
+hexDigit cs = case cs of
+  [] -> Nothing
+  (c : _) ->
+    let n = ord c
+    in if n >= 48 && n <= 57
+         then Just (n - 48)
+         else if n >= 97 && n <= 102
+           then Just (n - 87)
+           else if n >= 65 && n <= 70 then Just (n - 55) else Nothing
+
+showHex :: Int -> [Char] -> [Char]
+showHex n rest = if n < 0 then rest else showHexGo n rest
+
+showHexGo :: Int -> [Char] -> [Char]
+showHexGo n rest =
+  let d = hexChar (remInt n 16)
+      q = quotInt n 16
+  in if q == 0 then d : rest else showHexGo q (d : rest)
+
+hexChar :: Int -> Char
+hexChar n = chr (if n < 10 then 48 + n else 87 + n)
+
+quotInt :: Int -> Int -> Int
+quotInt (I a) (I b) = I (primIntQuot a b)
+
+remInt :: Int -> Int -> Int
+remInt (I a) (I b) = I (primIntRem a b)
+`,
+  // \`Ix\` is a class in GHC; every use miso makes of it is \`inRange\` on a pair
+  // of \`Char\`s or \`Int\`s, so the class is the one method those two need.
+  "Data.Ix": `module Data.Ix where
+
+class Ord a => Ix a where
+  inRange :: (a, a) -> a -> Bool
+  inRange bounds x = case bounds of
+    (lo, hi) -> lo <= x && x <= hi
+
+instance Ix Int
+instance Ix Char
+`,
+  "Data.Bifunctor": `module Data.Bifunctor where
+
+class Bifunctor p where
+  bimap :: (a -> b) -> (c -> d) -> p a c -> p b d
+  first :: (a -> b) -> p a c -> p b c
+  second :: (c -> d) -> p a c -> p a d
+  first f x = bimap f (\\y -> y) x
+  second g x = bimap (\\y -> y) g x
+
+instance Bifunctor Either where
+  bimap f g e = case e of
+    Left a -> Left (f a)
+    Right c -> Right (g c)
+
+instance Bifunctor (,) where
+  bimap f g p = case p of
+    (a, c) -> (f a, g c)
+`,
+  // \`Const\` is the applicative \`Miso.Lens\` reads a van Laarhoven lens with;
+  // \`Identity\` is the one it writes with.
+  "Data.Functor.Const": `module Data.Functor.Const where
+
+newtype Const a b = Const { getConst :: a }
+
+instance Functor (Const a) where
+  fmap f c = case c of
+    Const x -> Const x
+`,
+  "Control.Category": `module Control.Category where
+
+-- Only the two names miso imports; the class itself would need a kind this
+-- frontend cannot write down.
+id :: a -> a
+id x = x
+
+(.) :: (b -> c) -> (a -> b) -> a -> c
+(.) f g x = f (g x)
+`,
   "Data.JSString": `module Data.JSString where
 
 -- A \`MisoString\` IS a JavaScript string, so every operation here is the
@@ -844,10 +1036,10 @@ intToDigit n = if n < 10 then chr (48 + n) else chr (87 + n)
 -- \\\`import Data.List\\\` brings in resolves to the Prelude, because a name this
 -- module does not export is left exactly as written.
 
+-- The qualified spelling Data.List.foldl' is common; the Prelude's is the
+-- Foldable one, over the same list.
 foldl' :: (b -> a -> b) -> b -> [a] -> b
-foldl' f z xs = case xs of
-  [] -> z
-  (y : ys) -> seq (f z y) (foldl' f (f z y) ys)
+foldl' f z xs = foldlStrict f z xs
 
 nub :: Eq a => [a] -> [a]
 nub xs = nubBy (==) xs
@@ -890,22 +1082,6 @@ sort xs = sortBy compare xs
 sortOn :: Ord b => (a -> b) -> [a] -> [a]
 sortOn f xs = sortBy (\\a b -> compare (f a) (f b)) xs
 
-takeWhile :: (a -> Bool) -> [a] -> [a]
-takeWhile p xs = case xs of
-  [] -> []
-  (y : ys) -> if p y then y : takeWhile p ys else []
-
-dropWhile :: (a -> Bool) -> [a] -> [a]
-dropWhile p xs = case xs of
-  [] -> []
-  (y : ys) -> if p y then dropWhile p ys else xs
-
-span :: (a -> Bool) -> [a] -> ([a], [a])
-span p xs = (takeWhile p xs, dropWhile p xs)
-
-break :: (a -> Bool) -> [a] -> ([a], [a])
-break p xs = span (\\x -> not (p x)) xs
-
 partition :: (a -> Bool) -> [a] -> ([a], [a])
 partition p xs = (filter p xs, filter (\\x -> not (p x)) xs)
 
@@ -929,8 +1105,6 @@ isPrefixOf xs ys = case xs of
 find :: (a -> Bool) -> [a] -> Maybe a
 find p xs = listToMaybe (filter p xs)
 
-subtract :: Num a => a -> a -> a
-subtract x y = y - x
 `,
   "Data.Function": `module Data.Function (id, const, flip, ($), (&), (.), on) where
 on :: (b -> b -> c) -> (a -> b) -> a -> a -> c
@@ -1191,6 +1365,44 @@ throwStep s e = case jsThrow e of
 `,
   "System.IO.Unsafe": `module System.IO.Unsafe (unsafePerformIO) where
 `,
+  // GHC's \\`StableName\\` is pointer identity made observable. \\`h$makeStableName\\`
+  // gives one object per heap object and \\`h$stableNameInt\\` its unique integer,
+  // so comparing the integers *is* comparing the objects - which is what
+  // miso's \\`dirtyCheck\\` asks for before it falls back to \\`Eq\\`.
+  "System.Mem.StableName": `module System.Mem.StableName where
+
+data StableName a = StableName StableNamePrim
+
+makeStableName :: a -> IO (StableName a)
+makeStableName x = IO (\\s -> makeStableNameStep s x)
+
+makeStableNameStep :: RealWorld -> a -> IOResult (StableName a)
+makeStableNameStep s x = case primMakeStableName x of
+  n -> IOResult s (StableName n)
+
+hashStableName :: StableName a -> Int
+hashStableName (StableName n) = case primStableNameInt n of
+  i -> I i
+
+eqStableName :: StableName a -> StableName b -> Bool
+eqStableName a b = hashStableName a == hashStableName b
+
+instance Eq (StableName a) where
+  (==) a b = eqStableName a b
+`,
+  // There is no GHC heap on this backend and nothing to collect, which is what
+  // GHC's own JS backend does with \\`performGC\\`.
+  "System.Mem": `module System.Mem where
+
+performGC :: IO ()
+performGC = pure ()
+
+performMajorGC :: IO ()
+performMajorGC = pure ()
+
+performMinorGC :: IO ()
+performMinorGC = pure ()
+`,
   // ------------------------------------------------------------------ mtl ---
   //
   // Every transformer below is ordinary Haskell, and deliberately so. A
@@ -1217,12 +1429,12 @@ throwStep s e = case jsThrow e of
   // \`MonadTrans\` is missing for a different reason: \`lift :: Monad m => m a ->
   // t m a\` puts a constraint on a *method*, which a class declaration here
   // cannot carry. Nothing in miso calls \`lift\`.
-  "Data.Functor.Identity": `module Data.Functor.Identity (runIdentity) where
+  "Data.Functor.Identity": `module Data.Functor.Identity (Identity, runIdentity) where
 
-newtype Identity a = Identity a
-
-runIdentity :: Identity a -> a
-runIdentity (Identity x) = x
+-- Record syntax, as GHC declares it. Miso.Lens writes
+-- "import Control.Monad.Identity (Identity(..))" and then uses runIdentity:
+-- a separate function of that name would not come with the constructor.
+newtype Identity a = Identity { runIdentity :: a }
 
 instance Functor Identity where
   fmap f m = Identity (f (runIdentity m))
@@ -1969,6 +2181,12 @@ fromArrayCons x i n r = case r of
 
 /** Modules already provided by the project win; everything a library module
  * itself imports is pulled in the same way, transitively. */
+/** The modules this file supplies, by name. Their data constructors stay in
+ * the global namespace: the Prelude and the derived-`Generic` source are
+ * written against `M1`, `Just` and friends by their plain names, and neither
+ * is renamed through any module's scope. */
+export const libraryModuleNames: ReadonlySet<string> = new Set(Object.keys(sources));
+
 export function withLibraryModules(modules: ReadonlyMap<string, Module>): ReadonlyMap<string, Module> {
   const out = new Map(modules);
   const queue = [...modules.values()].flatMap((m) => m.imports.map((i) => i.module));

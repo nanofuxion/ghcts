@@ -171,11 +171,15 @@ test('class dictionary analysis distinguishes signatures, infix methods, and ass
   assert.deepEqual(parsed.diagnostics, []);
   const classDeclaration = parsed.module.ast.declarations.find(declaration => declaration.tag === 'class');
   const instance = parsed.module.ast.declarations.find(declaration => declaration.tag === 'instance');
-  assert.deepEqual(classMembers(classDeclaration).map(member => [member.kind, member.name]), [['associatedType', 'Index'], ['signature', 'combine']]);
+  // An associated type is no longer a raw member slice: the parser lifts it
+  // onto the declaration, where `src/elaborate.ts` reads it as the extra class
+  // parameter the class's own parameter determines.
+  assert.deepEqual(classDeclaration.associatedTypes, [{ name: 'Index' }]);
+  assert.deepEqual(classMembers(classDeclaration).map(member => [member.kind, member.name]), [['signature', 'combine']]);
   assert.deepEqual(instanceMembers(instance).map(member => [member.kind, member.name]), [['method', '<>']]);
   assert.deepEqual(instanceMethodValues(instance).map(value => value.name), ['<>']);
   const table = collectDictionaries([parsed.module.ast]);
-  assert.equal(table.classes.get('Classes.Compose').members[1].name, 'combine');
+  assert.equal(table.classes.get('Classes.Compose').members[0].name, 'combine');
   assert.deepEqual(table.instances[0].values.map(value => value.name), ['<>']);
   assert.deepEqual(instanceHead('Eq Int'), { className: 'Eq', target: 'Int' });
   assert.equal(selectInstance(table, 'Compose', 'Int').instance.methods[0].name, '<>');

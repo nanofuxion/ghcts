@@ -2007,6 +2007,234 @@ const programs = [
     ].join("\n"),
     expect: 275,
   },
+  {
+    // miso's `(mts, bts, web) = unsafePerformIO FFI.getThreads`: a top-level
+    // pattern binding names three values from one right-hand side, and each is
+    // its own lazy selector. Parsed as a function of the pattern, none of the
+    // three was in scope at all.
+    name: "a top-level tuple pattern binding names each of its parts",
+    source: [
+      "module Main where",
+      "threads :: (Int, Int, Int)",
+      "threads = (1, 20, 300)",
+      "(one, twenty, threeHundred) = threads",
+      "main :: IO Int",
+      "main = pure (one + twenty + threeHundred)",
+      "",
+    ].join("\n"),
+    expect: 321,
+  },
+  {
+    // A pattern binding is irrefutable: nothing is matched until a selector is
+    // demanded, so the unmatched half of a diverging pair costs nothing.
+    name: "a pattern binding does not force what is never demanded",
+    source: [
+      "module Main where",
+      "loop :: Int",
+      "loop = loop",
+      "main :: IO Int",
+      "main = pure (let (a, _) = (7, loop) in a)",
+      "",
+    ].join("\n"),
+    expect: 7,
+  },
+  {
+    // `let (_, remaining) = S.spanl ...` in Miso.Runtime: the bound names have
+    // to reach the body, and a wildcard must not become one of them.
+    name: "a let pattern binding binds through a constructor",
+    source: [
+      "module Main where",
+      "split :: [Int] -> (Int, [Int])",
+      "split (z : zs) = (z, zs)",
+      "split [] = (0, [])",
+      "total :: [Int] -> Int",
+      "total [] = 0",
+      "total (z : zs) = z + total zs",
+      "main :: IO Int",
+      "main = pure (let (_, rest) = split [1, 2, 3] in total rest)",
+      "",
+    ].join("\n"),
+    expect: 5,
+  },
+  {
+    // `deltaX, deltaY :: Double` in miso's `ScrollEvent`: one signature, two
+    // fields. Read as one field with an empty type, every selector after it
+    // was off by one.
+    name: "record fields may share one type signature",
+    source: [
+      "module Main where",
+      "data P = P { tag :: Int, lo, hi :: Int, extra :: Int }",
+      "main :: IO Int",
+      "main = pure (let p = P 1 2 3 4 in tag p + lo p * 10 + hi p * 100 + extra p * 1000)",
+      "",
+    ].join("\n"),
+    expect: 4321,
+  },
+  {
+    // `IndexToken {}` in miso's Router: an empty record pattern tests the
+    // constructor and binds nothing, whether or not it was declared with
+    // record syntax.
+    name: "an empty record pattern matches a constructor with no fields",
+    source: [
+      "module Main where",
+      "data T = A Int Int | B",
+      "which :: T -> Int",
+      "which A {} = 1",
+      "which B {} = 2",
+      "main :: IO Int",
+      "main = pure (which (A 9 9) * 10 + which B)",
+      "",
+    ].join("\n"),
+    expect: 12,
+  },
+  {
+    // `let !new = S.insert key keys` in miso's Keyboard subscription parsed as
+    // a binding *named* `!` taking `new` as a parameter, so `new` was unbound
+    // at every use. The bang must also still force, at the `in`.
+    name: "a bang pattern in a let binds its name and forces it",
+    source: [
+      "module Main where",
+      "import Data.IORef",
+      "main :: IO Int",
+      "main = do",
+      "  r <- newIORef (0 :: Int)",
+      "  let !doubled = 21 * 2",
+      "  writeIORef r doubled",
+      "  readIORef r",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // `Empty` and `(:<|)` are pattern synonyms upstream; here they are the
+    // sequence's real constructors, which is what lets Miso.Runtime's queue
+    // code be compiled unchanged.
+    name: "Data.Sequence: enqueue at the back, match at the front",
+    source: [
+      "module Main where",
+      "import qualified Data.Sequence as S",
+      "import Data.Sequence (Seq)",
+      "front :: Seq Int -> Int",
+      "front s = case s of",
+      "  S.Empty -> 0",
+      "  (x S.:<| _) -> x",
+      "main :: IO Int",
+      "main = pure (let q = (S.singleton 1 S.|> 2) S.|> 3",
+      "             in case S.spanl (< 3) q of",
+      "                  (before, after) -> front after * 100 + length before * 10 + front q)",
+      "",
+    ].join("\n"),
+    expect: 321,
+  },
+  {
+    name: "Numeric.readHex and showHex round-trip",
+    source: [
+      "module Main where",
+      "import Numeric (readHex, showHex)",
+      "main :: IO [Char]",
+      'main = pure (case readHex "ff!" of',
+      '  ((v, rest) : _) -> showHex (v + 1) rest',
+      '  [] -> "no")',
+      "",
+    ].join("\n"),
+    expect: "100!",
+  },
+  {
+    // miso's `class At at where type Index at; type IxValue at` - an
+    // associated type is the extra class parameter its own parameter
+    // determines, so `Index at` in a method's type is solved, not computed.
+    name: "associated types are class parameters a fundep determines",
+    source: [
+      "module Main where",
+      "data Box a = Box a",
+      "class Keyed c where",
+      "  type family Index c :: Type",
+      "  type family Elem c :: Type",
+      "  lookupAt :: Index c -> c -> Elem c",
+      "instance Keyed (Box a) where",
+      "  type Index (Box a) = Int",
+      "  type Elem (Box a) = a",
+      "  lookupAt n b = case b of",
+      "    Box x -> x",
+      "instance Keyed [a] where",
+      "  type Index [a] = Int",
+      "  type Elem [a] = a",
+      "  lookupAt n xs = case xs of",
+      "    [] -> lookupAt n xs",
+      "    (y : ys) -> if n <= 0 then y else lookupAt (n - 1) ys",
+      "main :: IO Int",
+      "main = pure (lookupAt 0 (Box 40) + lookupAt 1 [1, 2 :: Int])",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // miso declares `MTS`, `Options`, `ScrollEvent` and `errorCode` in more
+    // than one module. With constructors and record fields global, the second
+    // declaration silently replaced the first and every use of the loser was
+    // an arity or type error.
+    name: "two modules may declare the same constructor and record field",
+    sources: {
+      Left: [
+        "module Left (P(..)) where",
+        "data P = Dup { size :: Int }",
+        "",
+      ].join("\n"),
+      Right: [
+        "module Right (Q(..)) where",
+        "data Q = Dup Int Int | Other { size :: Int }",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import qualified Left as L",
+        "import qualified Right as R",
+        "wide :: R.Q -> Int",
+        "wide q = case q of",
+        "  R.Dup a b -> a * b",
+        "  R.Other n -> R.size (R.Other n)",
+        "main :: IO Int",
+        "main = pure (L.size (L.Dup 7) * 100 + wide (R.Dup 2 3) * 10 + wide (R.Other 1))",
+        "",
+      ].join("\n"),
+    },
+    expect: 761,
+  },
+  {
+    // Pointer identity, which `Miso.Runtime.dirtyCheck` asks for before it
+    // falls back to `Eq`: two stable names of the same heap object compare
+    // equal.
+    name: "System.Mem.StableName is object identity",
+    source: [
+      "module Main where",
+      "import System.Mem.StableName (makeStableName)",
+      "main :: IO Int",
+      "main = do",
+      "  let xs = [1, 2, 3 :: Int]",
+      "  a <- makeStableName xs",
+      "  b <- makeStableName xs",
+      "  pure (if a == b then 42 else 0)",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // `foreign import ccall "sym"` is a call to `h$sym` on GHC's JS backend;
+    // miso's `Miso.Reload` declares four of them and every use of their names
+    // was an unresolved name.
+    name: "a ccall foreign import calls its h$-prefixed symbol",
+    source: [
+      "module Main where",
+      'foreign import javascript unsafe "((n) => { globalThis[String.fromCharCode(104,36)+\'ghcts_twice\'] = (x) => x * 2; return n; })" install :: IntPrim -> IntPrim',
+      'foreign import ccall unsafe "ghcts_twice" twice :: IntPrim -> IntPrim',
+      "main :: IO Int",
+      "main = pure (case install 0 of",
+      "  _ -> case twice 21 of",
+      "    n -> I n)",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

@@ -167,7 +167,7 @@ export function lex(source: string, file: string, defines: ReadonlySet<string> =
  * braces and give diagnostics at the next physical token.
  */
 export function applyLayout(tokens: Token[]): Token[] {
-  const result: Token[] = []; const contexts: Array<{ indent: number; explicit: boolean; delimiterDepth: number }> = []; let pending = false; let delimiterDepth = 0;
+  const result: Token[] = []; const contexts: Array<{ indent: number; explicit: boolean; delimiterDepth: number; fromLet: boolean }> = []; let pending: string | undefined; let delimiterDepth = 0;
   const virtual = (text: '{' | '}' | ';', anchor: Token): Token => ({ kind: 'symbol', text, virtual: true, span: { ...anchor.span, end: anchor.span.start } });
   const nextCode = (from: number) => { let index = from; while (tokens[index]?.kind === 'newline') index++; return tokens[index]; };
   // A character or string literal may have text such as `{`, but only source
@@ -205,11 +205,22 @@ export function applyLayout(tokens: Token[]): Token[] {
       continue;
     }
     if (pending) {
-      pending = false;
-      if (isSymbol(token, '{')) contexts.push({ indent: 0, explicit: true, delimiterDepth });
-      else { contexts.push({ indent: token.span.column, explicit: false, delimiterDepth }); result.push(virtual('{', token)); }
+      const opener = pending;
+      const fromLet = opener === 'let';
+      pending = undefined;
+      if (isSymbol(token, '{')) contexts.push({ indent: 0, explicit: true, delimiterDepth, fromLet });
+      else { contexts.push({ indent: token.span.column, explicit: false, delimiterDepth, fromLet }); result.push(virtual('{', token)); }
     } else if (isSymbol(token, '{')) {
-      contexts.push({ indent: 0, explicit: true, delimiterDepth });
+      contexts.push({ indent: 0, explicit: true, delimiterDepth, fromLet: false });
+    }
+    // The layout parse-error rule, at the one place it always fires: `in`
+    // ends its `let` block.  Indentation cannot do it for `let a = 7 in a`,
+    // where the block never reaches a newline - and closing on `in`
+    // unconditionally would instead close the enclosing `do`, which the
+    // dedent has already left open on purpose.
+    if (token.kind === 'ident' && token.text === 'in' && contexts.at(-1)?.fromLet && !contexts.at(-1)!.explicit) {
+      contexts.pop();
+      result.push(virtual('}', token));
     }
     // An implicit block nested in parentheses/brackets ends before the
     // matching physical delimiter, but a surrounding module block must stay
@@ -224,7 +235,7 @@ export function applyLayout(tokens: Token[]): Token[] {
     }
     result.push(token);
     if (isSymbol(token, '(') || isSymbol(token, '[')) delimiterDepth++;
-    if (token.kind === 'ident' && (['where', 'let', 'of', 'do'].includes(token.text) || (token.text === 'case' && result.at(-2)?.text === '\\'))) pending = true;
+    if (token.kind === 'ident' && (['where', 'let', 'of', 'do'].includes(token.text) || (token.text === 'case' && result.at(-2)?.text === '\\'))) pending = token.text;
   }
   const eof = tokens.at(-1)!; while (contexts.length && !contexts.at(-1)!.explicit) { contexts.pop(); result.splice(result.length - 1, 0, virtual('}', eof)); }
   return result;

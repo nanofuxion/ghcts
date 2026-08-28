@@ -9,6 +9,7 @@ import type {
   ListQualifier,
   LocalBinding,
   Module,
+  Pattern,
   Span,
   ValueDeclaration,
 } from "./ast.js";
@@ -441,6 +442,9 @@ class Parser {
    * order - the order that fixes each one's fingerprint. */
   private readonly staticForms: ValueDeclaration[] = [];
   private moduleName = "Main";
+  /** Declarations a single top-level declaration expanded into - the selectors
+   * of a pattern binding - drained by the module loop after each one. */
+  private readonly queued: Declaration[] = [];
   constructor(
     private readonly tokens: Token[],
     private readonly file: string,
@@ -574,7 +578,7 @@ class Parser {
       }
       const declarationStart = this.index;
       const declaration = this.declaration();
-      if (declaration) declarations.push(declaration);
+      if (declaration) declarations.push(declaration, ...this.queued.splice(0));
       // A type signature is deliberately not yet represented in the small
       // runtime AST, but it has still been consumed successfully.  Do not
       // discard the following value declaration as if signature parsing had
@@ -749,9 +753,7 @@ class Parser {
         };
       }
     }
-    // A top-level tuple pattern binding is valid (`(x, y) = action`).  It
-    // needs Core pattern-binding support later, but parsing it as a synthetic
-    // zero-argument value keeps following declarations recoverable.
+    // A top-level tuple pattern binding is valid (`(x, y) = action`).
     if (this.at("(")) {
       const start = this.current().span;
       let probe = this.index;
@@ -769,18 +771,15 @@ class Parser {
         this.expect("=");
         const value = this.expression();
         this.skipLines();
-        return {
+        const [first, ...rest] = this.patternBindingParts(pattern, value, start);
+        const declaration = (part: { name: string; body: Expr }): ValueDeclaration => ({
           tag: "value",
-          name: `__pattern_${start.start}`,
-          equations: [
-            {
-              patterns: [pattern],
-              guards: [{ body: value }],
-              whereBindings: [],
-            },
-          ],
+          name: part.name,
+          equations: [{ patterns: [], guards: [{ body: part.body }], whereBindings: [] }],
           span: start,
-        };
+        });
+        this.queued.push(...rest.map(declaration));
+        return declaration(first!);
       }
     }
     if (
@@ -957,10 +956,14 @@ class Parser {
         fields = [];
         fieldTypes = [];
         while (!this.at("}") && this.current().kind !== "eof") {
-          const field = this.take();
-          if (field.kind === "ident") {
-            fields.push(field.text);
-            arity++;
+          // `deltaX, deltaY :: Double` declares two fields of one type, and
+          // miso's records use the form freely. Read every name up to the
+          // `::`, then give the one type that follows to all of them.
+          const group: string[] = [];
+          while (this.current().kind !== "eof" && !this.at("}")) {
+            const field = this.take();
+            if (field.kind === "ident") group.push(field.text);
+            if (!this.accept(",")) break;
           }
           this.acceptTypeSignature();
           const type: string[] = [];
@@ -974,7 +977,11 @@ class Parser {
               depth = Math.max(0, depth - 1);
             type.push(this.take().text);
           }
-          fieldTypes.push(type.join(" "));
+          for (const name of group) {
+            fields.push(name);
+            fieldTypes.push(type.join(" "));
+            arity++;
+          }
           this.accept(",");
         }
         this.expect("}");
@@ -1069,7 +1076,7 @@ class Parser {
       return { tag: "unsupported", feature: "foreign export", span: start };
     }
     const callingConvention = this.take();
-    if (callingConvention.text !== "javascript") {
+    if (!["javascript", "ccall", "capi", "prim"].includes(callingConvention.text)) {
       while (
         !this.at(";") &&
         !this.at("}") &&
@@ -1086,6 +1093,12 @@ class Parser {
     if (["unsafe", "safe", "interruptible"].includes(this.current().text))
       this.take();
     const javascript = this.take();
+    // GHC's JS backend gives a C symbol its JavaScript name by prefixing `h$`
+    // (`GHC.StgToJS.FFI`), so a `foreign import ccall "miso_x_store"` is the
+    // function `h$miso_x_store` - which is exactly the shape GHC 9.12 wants
+    // from a `javascript` import string too. Whether that function exists is
+    // the linker's business, as it is for `javascript`.
+    const isC = callingConvention.text !== "javascript";
     let name = this.take();
     // Foreign imports use the same parenthesized spelling for symbolic
     // binders as ordinary declarations (`foreign import ... (<|>) :: ...`).
@@ -1145,12 +1158,13 @@ class Parser {
           name.span.column,
         ),
       );
+    const arity = Math.max(0, signature.length - 1);
     return {
       tag: "foreign",
       name: name.text,
-      javascript: javascript.text,
+      javascript: isC ? `h$${javascript.text}` : javascript.text,
       signature,
-      arity: Math.max(0, signature.length - 1),
+      arity,
       span: start,
     };
   }
@@ -1231,6 +1245,7 @@ class Parser {
     return {
       tag: "class",
       name,
+      associatedTypes: body.associated,
       context,
       parameters: [...new Set(parameters)],
       fundeps,
@@ -1251,6 +1266,7 @@ class Parser {
     return {
       tag: "instance",
       head: header.map((token) => token.text).join(" "),
+      associatedTypes: body.associated,
       members: body.members,
       rawMembers: body.rawMembers,
       span: start,
@@ -1259,15 +1275,16 @@ class Parser {
   private membersAfterWhere(): {
     members: Declaration[];
     rawMembers: import("./ast.js").ClassMemberSlice[];
+    associated: import("./ast.js").AssociatedType[];
   } {
     if (!this.accept("where")) {
       this.skipLines();
-      return { members: [], rawMembers: [] };
+      return { members: [], rawMembers: [], associated: [] };
     }
     this.skipLines();
     if (!this.acceptLayoutOpen()) {
       this.lineEnd();
-      return { members: [], rawMembers: [] };
+      return { members: [], rawMembers: [], associated: [] };
     }
     // Class and instance bodies may contain associated type families and
     // infix pattern equations. Preserve their enclosing token-delimited
@@ -1278,8 +1295,28 @@ class Parser {
     const members: Declaration[] = [];
     const rawMembers: import("./ast.js").ClassMemberSlice[] = [];
     let segment: Token[] = [];
+    const associated: import("./ast.js").AssociatedType[] = [];
     const finish = () => {
       if (!segment.length) return;
+      // An associated type is neither a method signature nor an equation:
+      // `type family Index at :: Type` in a class body, `type Index (Map k v)
+      // = k` in an instance's. Read as a member it invented a method called
+      // `type` that every instance was then missing.
+      if (segment[0]!.text === "type") {
+        const head = segment[1]?.text === "family" ? segment.slice(2) : segment.slice(1);
+        const name = head[0]?.text;
+        const equals = head.findIndex((t) => t.text === "=");
+        if (name && /^[A-Z]/.test(name)) {
+          associated.push({
+            name,
+            ...(equals > 0
+              ? { rhs: head.slice(equals + 1).map((t) => t.text).join(" ") }
+              : {}),
+          });
+          segment = [];
+          return;
+        }
+      }
       rawMembers.push({
         tokens: segment.map(tokenSpelling),
         span: segment[0].span,
@@ -1328,7 +1365,7 @@ class Parser {
       }
       segment.push(token);
     }
-    return { members, rawMembers };
+    return { members, rawMembers, associated };
   }
   private lineEnd() {
     while (
@@ -2299,6 +2336,59 @@ class Parser {
     } else this.skipLines();
     return { tag: "unsupported", feature, span: start };
   }
+  private patternBinders(p: Pattern, into: string[]): void {
+    switch (p.tag) {
+      case "var":
+        into.push(p.name);
+        return;
+      case "as":
+        into.push(p.name);
+        this.patternBinders(p.pattern, into);
+        return;
+      case "con":
+        for (const arg of p.args) this.patternBinders(arg, into);
+        return;
+      case "record":
+        for (const field of p.fields) this.patternBinders(field.pattern, into);
+        return;
+      default:
+        return;
+    }
+  }
+
+  /** GHC's pattern-binding desugaring: `p = e` becomes one binding for `e`
+   * plus one *selector* per variable `p` binds, each `case e' of p -> v`.
+   *
+   * The shape is what makes it lazy, and laziness is the whole point: miso's
+   * `(mts, bts, web) = unsafePerformIO FFI.getThreads` is a top-level binding
+   * whose right-hand side must not run until one of the three is demanded, and
+   * `let (_, remaining) = S.spanl ...` must not force the pair when the other
+   * branch is taken.  Matching the pattern eagerly at the binding site would
+   * be a different program. */
+  private patternBindingParts(
+    pattern: Pattern,
+    value: Expr,
+    span: Span,
+  ): Array<{ name: string; body: Expr }> {
+    const scrutinee = `__pattern_${span.start}`;
+    const binders: string[] = [];
+    this.patternBinders(pattern, binders);
+    return [
+      { name: scrutinee, body: value },
+      ...binders.map((name) => ({
+        name,
+        body: {
+          tag: "case" as const,
+          subject: { tag: "var" as const, name: scrutinee, span },
+          alternatives: [
+            { pattern, body: { tag: "var" as const, name, span } },
+          ],
+          span,
+        },
+      })),
+    ];
+  }
+
   private localBindings(
     terminator?: string,
   ): import("./ast.js").LocalBinding[] {
@@ -2310,18 +2400,22 @@ class Parser {
       this.current().text !== terminator &&
       !this.at("}")
     ) {
+      // BangPatterns: `let !x = e`. Read as a binder named `!` with `x` for a
+      // parameter, this used to leave `x` unbound at every use.
+      const strict = this.at("!") && this.tokens[this.index + 1]?.kind === "ident" ? (this.take(), true) : false;
       if (this.at("(") || this.at("[")) {
         const start = this.current().span;
         const pattern = this.pattern();
         this.expect("=");
         const value = this.expression();
-        bindings.push({
-          name: `__pattern_${start.start}`,
-          patterns: [pattern],
-          value,
-          guards: [{ body: value }],
-          span: start,
-        });
+        for (const part of this.patternBindingParts(pattern, value, start))
+          bindings.push({
+            name: part.name,
+            patterns: [],
+            value: part.body,
+            guards: [{ body: part.body }],
+            span: start,
+          });
         this.skipLines();
         continue;
       }
@@ -2333,13 +2427,14 @@ class Parser {
         const pattern = this.pattern();
         this.expect("=");
         const value = this.expression();
-        bindings.push({
-          name: `__pattern_${name.span.start}`,
-          patterns: [pattern],
-          value,
-          guards: [{ body: value }],
-          span: name.span,
-        });
+        for (const part of this.patternBindingParts(pattern, value, name.span))
+          bindings.push({
+            name: part.name,
+            patterns: [],
+            value: part.body,
+            guards: [{ body: part.body }],
+            span: name.span,
+          });
         this.skipLines();
         continue;
       }
@@ -2380,6 +2475,7 @@ class Parser {
         value: guards[0].body,
         guards,
         whereBindings,
+        ...(strict && patterns.length === 0 ? { strict: true as const } : {}),
         span: name.span,
       });
       this.skipLines();

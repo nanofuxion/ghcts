@@ -48,13 +48,28 @@ export interface ResolvedProgram {
 const flatName = (module: string, name: string): string =>
   `${module.replace(/\./g, "_")}_${name}`;
 
-/** Values a module defines at the top level.  Record selectors are not here:
- * they are synthesised from data declarations inside the elaborator and stay
- * global, along with constructors and class methods. */
-function ownValues(module: Module): string[] {
-  return module.declarations.flatMap((d) =>
-    d.tag === "value" || d.tag === "foreign" ? [d.name] : [],
-  );
+/** Values a module defines at the top level: its bindings, its foreign
+ * imports, and - because miso declares `MTS`, `Options`, `ScrollEvent` and
+ * `errorCode` more than once across its modules - its data constructors and
+ * record fields.  Class methods stay global, as do type and class names. */
+function ownValues(module: Module, withConstructors: boolean): string[] {
+  return module.declarations.flatMap((d) => {
+    if (d.tag === "value" || d.tag === "foreign") return [d.name];
+    if (d.tag === "data" && withConstructors)
+      return d.constructors.flatMap((c) => [c.name, ...(c.fields ?? [])]);
+    return [];
+  });
+}
+
+/** Constructors and record fields, indexed by the type that declares them.
+ * `T(..)` in an export or import list is one name in the surface list, and it
+ * has to carry these with it. */
+function typeMembers(module: Module): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const decl of module.declarations)
+    if (decl.tag === "data")
+      out.set(decl.name, decl.constructors.flatMap((c) => [c.name, ...(c.fields ?? [])]));
+  return out;
 }
 
 function topologicalOrder(
@@ -97,15 +112,29 @@ function topologicalOrder(
   return order;
 }
 
-/** The names an import declaration lets through, before qualification. */
-function selected(imported: ImportDeclaration, exported: Scope): Array<[string, string]> {
+/** The names an import declaration lets through, before qualification.
+ * `members` maps a type of the imported module to its constructors and record
+ * fields, so naming the type in the list brings them too. */
+function selected(
+  imported: ImportDeclaration,
+  exported: Scope,
+  members: ReadonlyMap<string, string[]>,
+): Array<[string, string]> {
   const entries = [...exported];
+  const expand = (names: Iterable<string>): Set<string> => {
+    const out = new Set<string>();
+    for (const name of names) {
+      out.add(name);
+      for (const member of members.get(name) ?? []) out.add(member);
+    }
+    return out;
+  };
   if (imported.exposing) {
-    const wanted = new Set([...imported.exposing, ...(imported.exposingConstructors ?? [])]);
+    const wanted = expand([...imported.exposing, ...(imported.exposingConstructors ?? [])]);
     return entries.filter(([name]) => wanted.has(name));
   }
   if (imported.hiding) {
-    const banned = new Set([...imported.hiding, ...(imported.hidingConstructors ?? [])]);
+    const banned = expand([...imported.hiding, ...(imported.hidingConstructors ?? [])]);
     return entries.filter(([name]) => !banned.has(name));
   }
   return entries;
@@ -114,18 +143,29 @@ function selected(imported: ImportDeclaration, exported: Scope): Array<[string, 
 export function resolveProgram(
   modules: ReadonlyMap<string, Module>,
   root: string,
+  /** Modules whose data constructors stay global - see `libraryModuleNames`. */
+  globalConstructors: ReadonlySet<string> = new Set(),
 ): ResolvedProgram {
   const diagnostics: Diagnostic[] = [];
   const order = topologicalOrder(modules, root, diagnostics);
   const scopes = new Map<string, Scope>();
   const exports = new Map<string, Scope>();
+  const membersByModule = new Map<string, Map<string, string[]>>();
 
   for (const module of order) {
     const isRoot = module.name === root;
+    const scoped = !isRoot && !globalConstructors.has(module.name);
     const scope = new Map<string, string>();
     const own = new Map<string, string>();
-    for (const name of ownValues(module))
+    for (const name of ownValues(module, scoped))
       own.set(name, isRoot ? name : flatName(module.name, name));
+    // The types whose constructors and fields this module can name: its own,
+    // plus every one an import let through.  `Miso.Runtime` writes
+    // `Result(..)` in an import list and `Miso.JSON` only re-exports it, so a
+    // module's index has to carry what it imported as well as what it declared.
+    const visibleMembers = new Map<string, string[]>(
+      [...typeMembers(module)].map(([type, names]) => [type, names.filter((n) => own.has(n))]),
+    );
     // Imports first, own definitions last: a local binding shadows an
     // imported name of the same name, which is what GHC does for a use that
     // would otherwise be ambiguous only in the report.
@@ -133,11 +173,17 @@ export function resolveProgram(
     for (const imported of module.imports) {
       const exported = exports.get(imported.module);
       if (!exported) continue; // not one of ours; names stay as written
-      const visible = selected(imported, exported);
+      const theirs = membersByModule.get(imported.module) ?? new Map<string, string[]>();
+      const visible = selected(imported, exported, theirs);
       const qualifier = imported.alias ?? imported.module;
       for (const [name, flat] of visible) {
         if (!imported.qualified) scope.set(name, flat);
         scope.set(`${qualifier}.${name}`, flat);
+      }
+      const let_ = new Set(visible.map(([name]) => name));
+      for (const [type, names] of theirs) {
+        const kept = names.filter((n) => let_.has(n));
+        if (kept.length) visibleMembers.set(type, [...new Set([...(visibleMembers.get(type) ?? []), ...kept])]);
       }
       fromModule.set(qualifier, new Map(visible));
     }
@@ -150,6 +196,12 @@ export function resolveProgram(
       for (const name of module.exports) {
         const flat = own.get(name) ?? scope.get(name);
         if (flat !== undefined) exported.set(name, flat);
+        // `T(..)` reaches here as the single name `T`; its constructors and
+        // record fields are exported with it.
+        for (const member of visibleMembers.get(name) ?? []) {
+          const memberFlat = own.get(member) ?? scope.get(member);
+          if (memberFlat !== undefined) exported.set(member, memberFlat);
+        }
       }
       for (const name of module.reexports) {
         if (name === module.name) for (const [n, f] of own) exported.set(n, f);
@@ -158,6 +210,10 @@ export function resolveProgram(
     }
     scopes.set(module.name, scope);
     exports.set(module.name, exported);
+    membersByModule.set(
+      module.name,
+      new Map([...visibleMembers].map(([type, names]) => [type, names.filter((n) => exported.has(n))])),
+    );
   }
   return { order, scopes, diagnostics };
 }
@@ -186,12 +242,24 @@ export function renameValue(decl: ValueDeclaration, scope: Scope, flat = decl.na
 }
 
 /** Top-level declarations of one module, renamed for the flat pile. */
-export function renameDeclarations(module: Module, scope: Scope, root: boolean): Declaration[] {
+export function renameDeclarations(module: Module, scope: Scope, root: boolean, scopeConstructors = false): Declaration[] {
   const flatOf = (name: string): string => (root ? name : flatName(module.name, name));
   return module.declarations.map((decl) => {
     if (decl.tag === "value") return renameValue(decl, scope, flatOf(decl.name));
     if (decl.tag === "foreign" || decl.tag === "signature")
       return { ...decl, name: flatOf(decl.name) };
+    // The type name stays global; its constructors and record fields do not,
+    // so the declaration must agree with the scope every use was rewritten
+    // through.
+    if (decl.tag === "data" && scopeConstructors)
+      return {
+        ...decl,
+        constructors: decl.constructors.map((c) => ({
+          ...c,
+          name: flatOf(c.name),
+          ...(c.fields ? { fields: c.fields.map(flatOf) } : {}),
+        })),
+      };
     return decl;
   });
 }
@@ -208,7 +276,13 @@ class Renamer {
     const dot = name.lastIndexOf(".");
     if (dot > 0) {
       const tail = name.slice(dot + 1);
-      if (/^[A-Z]/.test(tail)) return tail;
+      // A `:`-headed tail is an infix constructor (`S.:<|`), which lives in the
+      // same global namespace as `S.Empty`.
+      if (/^[A-Z:]/.test(tail)) return tail;
+      // `Prelude.map`, `Prelude.id`: the Prelude is prepended to every module
+      // and never renamed, so its qualified spelling is its bare one. miso
+      // writes it wherever it has shadowed a Prelude name locally.
+      if (name.slice(0, dot) === "Prelude") return tail;
     }
     return name;
   }
@@ -245,7 +319,10 @@ class Renamer {
       return {
         ...pattern,
         name: this.lookup(pattern.name, shadow),
-        fields: pattern.fields.map((f) => ({ ...f, pattern: this.pattern(f.pattern, shadow) })),
+        // The *label* is the record selector's name, and it moved with the
+        // constructor. A `{..}` wildcard still binds the surface name, which
+        // `src/sugar.ts` reads back off the renamed field list.
+        fields: pattern.fields.map((f) => ({ name: this.lookup(f.name, shadow), pattern: this.pattern(f.pattern, shadow) })),
       };
     return pattern;
   }
@@ -322,13 +399,13 @@ class Renamer {
         return {
           ...expr,
           constructor: this.lookup(expr.constructor, shadow),
-          fields: expr.fields.map((f) => ({ ...f, value: this.expr(f.value, shadow) })),
+          fields: expr.fields.map((f) => ({ name: this.lookup(f.name, shadow), value: this.expr(f.value, shadow) })),
         };
       case "recordUpdate":
         return {
           ...expr,
           base: this.expr(expr.base, shadow),
-          fields: expr.fields.map((f) => ({ ...f, value: this.expr(f.value, shadow) })),
+          fields: expr.fields.map((f) => ({ name: this.lookup(f.name, shadow), value: this.expr(f.value, shadow) })),
         };
       // Only the expression is renamed: types live in one global namespace
       // here, so the written type needs no qualification.
