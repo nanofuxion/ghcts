@@ -2793,9 +2793,17 @@ instance ToJSValue a => ToJSValue (Maybe a) where
 instance ToJSValue a => ToJSValue [a] where
   toJSValue xs = newArray >>= (\\a -> pushAll a xs)
 
+-- \`newArray\` takes no arguments, so a right-hand side that scrutinises
+-- \`newArrayVal\` outside the state thread is a CAF: it is evaluated once and
+-- every list ever marshalled to JavaScript then shares - and appends to - that
+-- one array. Threading the \`RealWorld\` token through, the way \`pushStep\`
+-- below does, is what makes the call happen once per action.
 newArray :: IO JSVal
-newArray = case newArrayVal 0 of
-  v -> pureVal v
+newArray = IO (\\s -> newArrayStep s)
+
+newArrayStep :: RealWorld -> IOResult JSVal
+newArrayStep s = case newArrayVal 0 of
+  v -> IOResult s (JSVal v)
 
 pushAll :: ToJSValue a => JSVal -> [a] -> IO JSVal
 pushAll a xs = case xs of

@@ -1223,6 +1223,31 @@ const programs = [
     expect: 16,
   },
   {
+    // Every marshalled list has to be its OWN JS array. The array is built by a
+    // nullary `newArray`, so if that is left as a CAF it is evaluated once and
+    // every list appends to the same array: the two lists below would then both
+    // come out as one 5-element array. 32 = 3 elements, then 2, and distinct.
+    name: "GHCJS.Marshal: each marshalled list is a fresh JS array",
+    source: [
+      "module Main where",
+      "import qualified GHCJS.Marshal as Marshal",
+      "import GHC.JS.Prim",
+      'foreign import javascript unsafe "((a) => a.length)" jsLength :: JSValPrim -> IntPrim',
+      'foreign import javascript unsafe "((a,b) => a === b ? 1 : 0)" jsSame :: JSValPrim -> JSValPrim -> IntPrim',
+      "main :: IO Int",
+      "main = do",
+      "  a <- Marshal.toJSVal [1, 2, 3 :: Int]",
+      "  b <- Marshal.toJSVal [4, 5 :: Int]",
+      "  pure (width a * 10 + width b + same a b)",
+      "width :: JSVal -> Int",
+      "width (JSVal a) = I (jsLength a)",
+      "same :: JSVal -> JSVal -> Int",
+      "same (JSVal a) (JSVal b) = I (jsSame a b)",
+      "",
+    ].join("\n"),
+    expect: 32,
+  },
+  {
     // `fromJSVal` is the *checked* direction, so asking a JS boolean for an
     // `Int` has to be `Nothing` rather than a coerced 0 or 1. `Nothing`
     // marshals to `null` and decodes back as `Just Nothing`.
