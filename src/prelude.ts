@@ -273,6 +273,11 @@ instance (Eq a, Eq b) => Eq (Either a b) where
 instance (Eq a, Eq b) => Eq (a, b) where
   (==) a b = eqPair (==) (==) a b
 
+-- base writes this \`instance a ~ Char => IsString [a]\`; the improvement that
+-- makes the element \`Char\` lives in the elaborator, so the head can be exact.
+instance IsString [Char] where
+  fromString cs = cs
+
 instance Semigroup [a] where
   (<>) xs ys = append xs ys
 

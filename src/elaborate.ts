@@ -228,7 +228,10 @@ function quantify(vars: TVar[], type: Type, constraints: Constraint[]): Scheme {
 // way, so an instance head that drops the operator has no head constructor at
 // all. `::` is matched only so a kind signature can be recognised and skipped;
 // it is not a type constructor.
-const TYPE_TOKEN = /->|=>|::|:[!#$%&*+./<=>?@\\^|~:-]+|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]/g;
+// A lone `.` is matched only so that `forall a b . t` can be recognised and
+// dropped; the identifier rule already swallows the commoner `forall a b. t`
+// spelling into the token `b.`.
+const TYPE_TOKEN = /->|=>|::|:[!#$%&*+./<=>?@\\^|~:-]+|[A-Za-z_][A-Za-z0-9_'.]*|[[\](),]|\./g;
 
 /** A type constructor written infix. `::` is a kind ascription, not one. */
 const isTypeOperator = (token: string | undefined): boolean => token !== undefined && token !== "::" && /^:/.test(token);
@@ -262,8 +265,26 @@ class TypeParser {
     private readonly depth = 0,
   ) {}
 
+  /** Every variable a type mentions is quantified here anyway, so an explicit
+   * `forall a b.` says nothing this inference does not already assume - but
+   * left in place it is read as a *class*, and `forall f a. C f => t` then
+   * contributes the constraint `forall f a C f` instead of `C f`, silently
+   * dropping the given the body relies on. Drop the quantifier wherever it
+   * appears, which also covers the rank-2 `(forall a. a -> a) -> t`. */
   static tokens(source: string): string[] {
-    return source.match(TYPE_TOKEN) ?? [];
+    const raw: string[] = source.match(TYPE_TOKEN) ?? [];
+    if (!raw.includes("forall")) return raw;
+    const kept: string[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== "forall") {
+        kept.push(raw[i]!);
+        continue;
+      }
+      // Skip the bound variables and the `.` that ends them, whether the dot
+      // stands alone or is glued to the last variable (`b.`).
+      while (++i < raw.length && !raw[i]!.endsWith(".")) continue;
+    }
+    return kept;
   }
 
   /** A constraint's arguments: `MonadState s m` is two types, not the
@@ -300,10 +321,34 @@ class TypeParser {
     return tapp(tapp(tcon(token!), left), this.operators());
   }
 
+  /** Are at least `n` argument atoms available after the head token? Counted
+   * by parsing them and rewinding, since a bracketed argument spans an
+   * unknown number of tokens. Parsing is idempotent here: an atom's only
+   * lasting effect is a type variable registered in `vars`, and re-parsing the
+   * same token returns that same variable. */
+  private countsAtLeast(n: number): boolean {
+    if (n === 0) return true;
+    const saved = this.index;
+    this.index++;
+    let seen = 0;
+    while (seen < n && this.more()) {
+      this.atom();
+      seen++;
+    }
+    this.index = saved;
+    return seen >= n;
+  }
+
   private application(): Type {
     const head = this.tokens[this.index];
     const synonym = head === undefined ? undefined : synonyms.get(unqualify(head));
-    if (synonym && this.depth < 16) {
+    // A synonym has to be *saturated* to be expanded, as in GHC. Types share
+    // one global namespace here (see `src/modules.ts`), so miso's
+    // `type Parser token a` and its unrelated `newtype Parser a` are one name:
+    // reading arity is what keeps `Parser (f a)` the newtype and
+    // `Parser token a` the alias, and what stops a genuinely under-applied
+    // synonym from quietly padding itself out with a fresh variable.
+    if (synonym && this.depth < 16 && this.countsAtLeast(synonym.parameters.length)) {
       this.index++;
       const bound = new Map<string, Type>();
       for (const parameter of synonym.parameters) bound.set(parameter, this.atom());
@@ -782,8 +827,17 @@ class Elaborator {
         this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "Fractional" });
         return t;
       }
-      case "string":
-        return tString;
+      // OverloadedStrings. `[Char]` is not a *default* GHC could write down -
+      // base spells it `instance a ~ Char => IsString [a]`, and there are no
+      // equality constraints here - so it is one instead: an `IsString` wanted
+      // that inference never pins defaults to `[Char]`, exactly as an
+      // unresolved `Num` defaults to `Int`, and at `[Char]` the literal *is*
+      // its own value and needs no dictionary.
+      case "string": {
+        const t = freshVar();
+        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "IsString" });
+        return t;
+      }
       case "char":
         return tcon("Char");
       case "unit":
@@ -828,16 +882,6 @@ class Elaborator {
       }
       case "annot": {
         const written = parseSignature(e.type, new Map(this.current?.tyvars ?? []));
-        // A string literal whose type is *written out* is `fromString` at that
-        // type - GHC's OverloadedStrings, for the one form where the type is
-        // not in doubt, and the form miso spells `"tag" :: MisoString`.
-        // Everywhere else a literal stays `[Char]`: picking an `IsString`
-        // instance by inference needs base's `instance a ~ Char => IsString
-        // [a]`, and there are no equality constraints here to write it with.
-        if (e.expr.tag === "string" && headCon(written.type) !== undefined && !sameType(written.type, tString)) {
-          this.current?.uses.push({ kind: "literal", node: e.expr, type: written.type, cls: "IsString" });
-          return written.type;
-        }
         const t = this.infer(e.expr, env);
         if (!unify(t, written.type))
           this.report(`expression does not have the ascribed type \`${showType(written.type)}\``, e.span);
@@ -1011,6 +1055,14 @@ class Elaborator {
     span: Span,
     depth: number,
   ): boolean {
+    // The `a ~ Char` half of base's `instance a ~ Char => IsString [a]`. Only
+    // improvement can supply it: `"a" ++ "b"` leaves the literal's type as
+    // `[t]`, which is neither ambiguous enough to default nor concrete enough
+    // to match the `IsString [Char]` instance.
+    if (wanted.cls === "IsString" && wanted.types.length === 1) {
+      const t = prune(wanted.types[0]!);
+      if (t.tag === "app" && headCon(t.fn) === "[]" && !sameType(t.arg, tChar)) return unify(t.arg, tChar);
+    }
     const info = this.classes.get(wanted.cls);
     if (!info || info.fundeps.length === 0 || depth > 16) return false;
     const arg = (c: Constraint, i: number): Type | undefined => c.types[i];
@@ -1167,6 +1219,7 @@ class Elaborator {
       // `Int` out, so the same ambiguous variable defaults to `Double`.
       if (classes.includes("Fractional")) unify(t, tcon("Double"));
       else if (classes.includes("Num")) unify(t, tInt);
+      else if (classes.includes("IsString")) unify(t, tString);
     }
   }
 
@@ -1236,6 +1289,9 @@ class Elaborator {
     }
     if (use.kind === "literal" && headCon(use.type) === "IntPrim") return [];
     if (use.kind === "literal" && headCon(use.type) === "DoublePrim") return [];
+    // At `[Char]` a string literal is already the value it denotes, so there is
+    // no `fromString` to apply and no dictionary to find.
+    if (use.kind === "literal" && use.cls === "IsString" && sameType(use.type, tString)) return [];
     const constraints: Constraint[] =
       use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : use.constraints;
     return constraints.map((c) => this.resolve(c.cls, c.types, binding.givens, span) ?? errorExpr(span));
@@ -1273,15 +1329,30 @@ function splitFun(t: Type): { args: Type[]; result: Type } {
  * A newtype is a real single-field data type here - nothing erases the
  * constructor - so GND's `coerce` does not exist to be used. What does exist is
  * the wrapper that GND's coercion stands for: the wrapped type's method with
- * the constructor taken off the arguments and put back on the result. That is
- * sound exactly where the class variable is a whole argument or the whole
- * result; `undefined` (and a diagnostic from the caller) is the answer where it
- * sits under another constructor, since moving a newtype through `[a]` or `f a`
- * needs a coercion this compiler cannot perform.
+ * the constructor taken off the arguments and put back on the result.
+ *
+ * A *coercible* position is one holding a value of this very newtype: the class
+ * variable itself for a class over kind `*` (`Num`, `ToJSON`), or the class
+ * variable applied to arguments that do not mention it for a class over
+ * `* -> *` (`f a` in `fmap`, `f (a -> b)` in `<*>`). Either way the value is
+ * `N x` and unwraps to the wrapped type. A function argument whose *result* is
+ * coercible - `(a -> m b)` in `>>=` - is handled by unwrapping under a lambda.
+ * `undefined` (and a diagnostic from the caller) is the answer anywhere else,
+ * since moving a newtype through `[a]` or `g (f a)` needs a coercion this
+ * compiler cannot perform.
  *
  * The divergence from GHC is strictness, and only that: unwrapping is a `case`,
  * so a method that would not have forced its own argument becomes strict in it.
  */
+/** Is `v` ever *applied* in this type? That is what makes a class variable
+ * higher-kinded, and there is no kind inference here to ask instead. */
+function appliesVar(t: Type, v: TVar): boolean {
+  const p = prune(t);
+  if (p.tag !== "app") return false;
+  const head = prune(p.fn);
+  return (head.tag === "var" && head.v === v) || appliesVar(p.fn, v) || appliesVar(p.arg, v);
+}
+
 function newtypeMethod(
   method: ClassMethod,
   classVar: TVar,
@@ -1290,45 +1361,68 @@ function newtypeMethod(
   span: Span,
 ): ValueDeclaration | undefined {
   const { args, result } = splitFun(method.type);
-  const isClassVar = (t: Type): boolean => {
-    const p = prune(t);
-    return p.tag === "var" && p.v === classVar;
-  };
   const mentions = (t: Type): boolean => typeVars(t).includes(classVar);
-  if (![...args, result].every((t) => isClassVar(t) || !mentions(t))) return undefined;
-  const unwrap = args.map(isClassVar);
+  /** Does this type hold a value of the newtype being derived through? */
+  const coercible = (t: Type): boolean => {
+    let head = prune(t);
+    while (head.tag === "app") {
+      if (mentions(head.arg)) return false;
+      head = prune(head.fn);
+    }
+    return head.tag === "var" && head.v === classVar;
+  };
+  const unwrapExpr = (subject: Expr, name: string): Expr => ({
+    tag: "case",
+    subject,
+    alternatives: [
+      {
+        pattern: { tag: "con", name: con, args: [{ tag: "var", name: `${name}$w`, span }], span },
+        body: variable(`${name}$w`, span),
+      },
+    ],
+    span,
+  });
+  const names = args.map((_, i) => `$n${i}`);
+  // How each argument reaches the wrapped type: `no` passes it through
+  // untouched, `here` unwraps it, `under` unwraps what it returns.
+  const how = args.map((t): "no" | "here" | "under" | "bad" => {
+    if (coercible(t)) return "here";
+    if (!mentions(t)) return "no";
+    const { args: inner, result: innerResult } = splitFun(t);
+    return inner.length > 0 && !inner.some(mentions) && coercible(innerResult) ? "under" : "bad";
+  });
+  if (how.includes("bad")) return undefined;
+  const wrapResult = coercible(result);
+  if (!wrapResult && mentions(result)) return undefined;
   // Nothing to move: the class variable is not in this method's type at all,
   // so there is no way to say which instance the inner call should use.
-  if (!unwrap.some(Boolean) && !isClassVar(result)) return undefined;
-  const names = args.map((_, i) => `$n${i}`);
+  if (!how.some((h) => h !== "no") && !wrapResult) return undefined;
   const inner = applyAll(
     variable(method.name, span),
-    names.map((name, i) =>
-      unwrap[i]
-        ? {
-            tag: "case",
-            subject: variable(name, span),
-            alternatives: [
-              {
-                pattern: { tag: "con", name: con, args: [{ tag: "var", name: `${name}$w`, span }], span },
-                body: variable(`${name}$w`, span),
-              },
-            ],
-            span,
-          }
-        : variable(name, span),
-    ),
+    names.map((name, i): Expr => {
+      if (how[i] === "here") return unwrapExpr(variable(name, span), name);
+      if (how[i] !== "under") return variable(name, span);
+      // `\x -> unwrap (k x)`: the argument is a function into the newtype, and
+      // the inner call needs one into the wrapped type.
+      const parameter = `${name}$x`;
+      return {
+        tag: "lambda",
+        parameter,
+        body: unwrapExpr(apply(variable(name, span), variable(parameter, span)), name),
+        span,
+      };
+    }),
   );
   return valueDecl(
     method.name,
     names.map((name): Pattern => ({ tag: "var", name, span })),
-    isClassVar(result)
+    wrapResult
       ? apply(
           variable(con, span),
           // With no argument at the wrapped type, only the ascription says
           // which instance the inner call means - otherwise it selects this
           // very instance and loops.
-          unwrap.some(Boolean) ? inner : { tag: "annot", expr: inner, type: wrapped, span },
+          how.some((h) => h !== "no") ? inner : { tag: "annot", expr: inner, type: wrapped, span },
         )
       : inner,
     span,
@@ -1400,8 +1494,17 @@ export function elaborateProgram(
   // Expanded wherever a type is parsed, so `MisoString` and `Text` are one
   // type and an instance written at either head is found from both.
   synonyms = new Map();
+  // Types share one global namespace here (see `src/modules.ts`), so a `type`
+  // in one module and a `data`/`newtype` of the same name in another collide -
+  // miso has two of each (`Parser`, `Object`). Where the synonym takes
+  // parameters, arity tells the two apart at every use (see
+  // `TypeParser.application`); where it is nullary nothing can, and the
+  // declared type wins, because its constructors, patterns and instances all
+  // key on `tcon(name)` and would otherwise be unreachable.
+  const declaredTypes = new Set(declarations.flatMap((d) => (d.tag === "data" ? [d.name] : [])));
   for (const decl of declarations) {
     if (decl.tag !== "typeAlias" || !/^[A-Z]/.test(decl.name)) continue;
+    if (decl.parameters.length === 0 && declaredTypes.has(decl.name)) continue;
     synonyms.set(decl.name, { parameters: decl.parameters, target: decl.target });
   }
 
@@ -1590,9 +1693,13 @@ export function elaborateProgram(
     cls: string,
     decl: DataDeclaration,
     build: (vars: Type[]) => { context: Constraint[]; methods: Map<string, ValueDeclaration> } | undefined,
+    /** Parameters the instance head keeps. A class over `* -> *` is derived at
+     * `C N`, not `C (N a)`, so its last parameter is abstracted away rather
+     * than named - and must not scope over the methods either. */
+    headArity = decl.parameters.length,
   ): void => {
     const vars = decl.parameters.map(() => freshVar());
-    const target = vars.reduce<Type>(tapp, tcon(decl.name));
+    const target = vars.slice(0, headArity).reduce<Type>(tapp, tcon(decl.name));
     const emitCon = instanceKey([target]);
     if (elaborator.instances.has(`${cls} ${emitCon}`)) return;
     const built = build(vars);
@@ -1604,7 +1711,7 @@ export function elaborateProgram(
       emitCon,
       context: built.context,
       params: built.context.map((c, i) => ({ cls: c.cls, types: c.types, name: `$d${i}` })),
-      vars: new Map(decl.parameters.map((p, i) => [p, vars[i]!])),
+      vars: new Map(decl.parameters.slice(0, headArity).map((p, i) => [p, vars[i]!])),
       methods: built.methods,
       span: decl.span,
     });
@@ -1641,7 +1748,19 @@ export function elaborateProgram(
       }));
     }
 
-    for (const cls of decl.derivingNewtype ?? []) {
+    // GeneralizedNewtypeDeriving. A bare `deriving` clause on a newtype means
+    // the coercion strategy for every class GHC has no stock rule for - which
+    // is what miso's `newtype Parser a = ... deriving (Functor, Applicative,
+    // Monad)` says. The stock-derivable classes are excluded because their
+    // stock instance is *not* the wrapped type's: `deriving Show` on a newtype
+    // prints the constructor. `Functor` is the exception GHC also makes - for a
+    // newtype the two strategies agree - and it is the one this needs.
+    const STOCK = ["Eq", "Ord", "Show", "Read", "Enum", "Bounded", "Ix", "Generic", "Data", "Lift"];
+    const byCoercion = [
+      ...(decl.derivingNewtype ?? []),
+      ...(decl.newtype === true ? decl.deriving.filter((c) => !STOCK.includes(c)) : []),
+    ];
+    for (const cls of new Set(byCoercion)) {
       const info = elaborator.classes.get(cls);
       const con = decl.constructors[0];
       const wrapped = con?.fieldTypes?.[0]?.replace(/^\s*!/, "").trim();
@@ -1652,25 +1771,54 @@ export function elaborateProgram(
         );
         continue;
       }
-      deriveInstance(cls, decl, (vars) => {
-        const scope = new Map(decl.parameters.map((p, i) => [p, vars[i]!] as const));
-        const underlying = parseType(wrapped, scope);
-        const methods = new Map<string, ValueDeclaration>();
-        for (const method of info.methods) {
-          const built = newtypeMethod(method, info.variables[0]!, con.name, wrapped, decl.span);
-          if (!built) {
-            elaborator.report(
-              `\`deriving newtype ${cls}\`: \`${method.name}\` mentions the class variable somewhere the newtype's constructor cannot be moved through`,
-              decl.span,
-            );
-            return undefined;
+      // A class over `* -> *` - one whose variable is *applied* in a method's
+      // type - is derived at the newtype's head: `Functor Parser`, from
+      // `Functor (Either MisoString)`. That needs the newtype's own last
+      // parameter to be the wrapped type's last argument, so that `Parser x`
+      // and `Either MisoString x` are the same values one constructor apart.
+      const classVar = info.variables[0]!;
+      const higherKinded = info.methods.some((m) => appliesVar(m.type, classVar));
+      const headArity = decl.parameters.length - (higherKinded ? 1 : 0);
+      if (headArity < 0) {
+        elaborator.report(`\`deriving newtype ${cls}\`: \`${decl.name}\` has no parameter to abstract`, decl.span);
+        continue;
+      }
+      deriveInstance(
+        cls,
+        decl,
+        (vars) => {
+          const scope = new Map(decl.parameters.map((p, i) => [p, vars[i]!] as const));
+          let underlying = parseType(wrapped, scope);
+          if (higherKinded) {
+            const applied = prune(underlying);
+            const last = vars[decl.parameters.length - 1]!;
+            if (applied.tag !== "app" || !sameType(applied.arg, last)) {
+              elaborator.report(
+                `\`deriving newtype ${cls}\`: \`${wrapped}\` does not end in \`${decl.parameters.at(-1)}\`, so the constructor cannot be moved through it`,
+                decl.span,
+              );
+              return undefined;
+            }
+            underlying = applied.fn;
           }
-          methods.set(method.name, built);
-        }
-        // GND's context is the constraint on the wrapped type, not on the
-        // parameters: `instance C (Maybe a) => C (Wrap a)`.
-        return { context: [{ cls, types: [underlying] }], methods };
-      });
+          const methods = new Map<string, ValueDeclaration>();
+          for (const method of info.methods) {
+            const built = newtypeMethod(method, classVar, con.name, wrapped, decl.span);
+            if (!built) {
+              elaborator.report(
+                `\`deriving newtype ${cls}\`: \`${method.name}\` mentions the class variable somewhere the newtype's constructor cannot be moved through`,
+                decl.span,
+              );
+              return undefined;
+            }
+            methods.set(method.name, built);
+          }
+          // GND's context is the constraint on the wrapped type, not on the
+          // parameters: `instance C (Maybe a) => C (Wrap a)`.
+          return { context: [{ cls, types: [underlying] }], methods };
+        },
+        headArity,
+      );
     }
   }
 

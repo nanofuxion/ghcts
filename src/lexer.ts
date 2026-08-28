@@ -50,6 +50,17 @@ export function lex(source: string, file: string, defines: ReadonlySet<string> =
     }
     if (source.startsWith('{-#', index)) { const end = source.indexOf('#-}', index + 3); if (end < 0) { diagnostics.push(error('E_LEX', 'Unterminated pragma', file, line, column)); break; } column += end + 3 - index; index = end + 3; continue; }
     if (/\d/.test(ch)) {
+      // `0x1F`, `0o17`, `0b1011` are one token each, and `Number` reads all
+      // three prefixes exactly as Haskell writes them. Without this, `0xDBFF`
+      // lexes as `0` followed by the identifier `xDBFF`.
+      const base = ch === '0' ? /^[xX][0-9A-Fa-f]|^[oO][0-7]|^[bB][01]/.exec(source.slice(index + 1, index + 3)) : null;
+      if (base) {
+        const digits = /[xX]/.test(base[0]![0]!) ? /[0-9A-Fa-f]/ : /[0-7]/;
+        index += 2; column += 2;
+        while (index < source.length && digits.test(source[index]!)) { index++; column++; }
+        emit('int', source.slice(start, index), start, startLine, startColumn);
+        continue;
+      }
       while (index < source.length && /\d/.test(source[index])) { index++; column++; }
       // A fraction (and an exponent, which only a fraction may carry here)
       // makes this a *different* literal, not a longer integer: `2.5` must not

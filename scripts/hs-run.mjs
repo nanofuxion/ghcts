@@ -1905,6 +1905,108 @@ const programs = [
     ].join("\n"),
     expect: 111,
   },
+  {
+    // `forall f a.` was read as the *class* `forall` applied to four types, so
+    // the constraint that follows it was silently lost and `@f` had no given.
+    name: "an explicit forall does not eat the context that follows it",
+    source: [
+      "module Main where",
+      "class Tagged f where",
+      "  tag :: f Int -> Int",
+      "instance Tagged Maybe where",
+      "  tag m = case m of",
+      "    Just n -> n",
+      "    Nothing -> 0",
+      "both :: forall f . Tagged f => f Int -> f Int -> Int",
+      "both a b = tag a + tag b",
+      "main :: IO Int",
+      "main = pure (both (Just 20) (Just 22))",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
+  {
+    // Type names are one global namespace, so a `type Wrap a b` in one place
+    // and a `newtype Wrap a` in another are the same name. A synonym has to be
+    // saturated to be expanded, which is what keeps the two apart.
+    name: "an under-applied synonym is not the synonym",
+    sources: {
+      Other: [
+        "module Other where",
+        "type Wrap token a = [(token, a)]",
+        "pairs :: Wrap Int Int -> Int",
+        "pairs xs = case xs of",
+        "  ((k, v) : _) -> k + v",
+        "  [] -> 0",
+        "",
+      ].join("\n"),
+      Main: [
+        "module Main where",
+        "import Other",
+        "newtype Wrap a = Wrap a",
+        "unwrap :: Wrap a -> a",
+        "unwrap (Wrap x) = x",
+        "main :: IO Int",
+        "main = pure (unwrap (Wrap 1) + pairs [(2, 3)])",
+        "",
+      ].join("\n"),
+    },
+    expect: 6,
+  },
+  {
+    // OverloadedStrings: a literal is `fromString` at whatever type inference
+    // finds, `[Char]` when it finds nothing, and `[Char]` is reached by
+    // improvement when only the *element* is open (`"a" ++ "b"`).
+    name: "a string literal takes the type its use gives it",
+    source: [
+      "module Main where",
+      "data Tag = Tag [Char]",
+      "instance IsString Tag where",
+      "  fromString cs = Tag cs",
+      "name :: Tag -> [Char]",
+      "name (Tag cs) = cs",
+      "main :: IO [Char]",
+      'main = pure (name "mi" ++ "so")',
+      "",
+    ].join("\n"),
+    expect: "miso",
+  },
+  {
+    // GeneralizedNewtypeDeriving at kind `* -> *`: the instance is at the
+    // newtype's *head*, and every method moves the constructor through one
+    // application - including `>>=`, whose second argument returns one.
+    name: "deriving newtype: Functor, Applicative and Monad on a wrapper",
+    source: [
+      "module Main where",
+      "newtype P a = P { unP :: Either [Char] a } deriving (Functor, Applicative, Monad)",
+      "step :: Int -> P Int",
+      "step n = if n > 3 then P (Left \"too big\") else pure (n * 2)",
+      "run :: Int -> P Int",
+      "run k = do",
+      "  x <- step k",
+      "  y <- step 1",
+      "  pure (x + y)",
+      "value :: P Int -> Int",
+      "value p = case unP (fmap (\\n -> n + 1) p) of",
+      "  Right v -> v",
+      "  Left _ -> 0",
+      "main :: IO Int",
+      "main = pure (value (run 2) * 100 + value (run 9))",
+      "",
+    ].join("\n"),
+    expect: 700,
+  },
+  {
+    // `0xDBFF` used to lex as `0` followed by the identifier `xDBFF`.
+    name: "hexadecimal, octal and binary literals",
+    source: [
+      "module Main where",
+      "main :: IO Int",
+      "main = pure (0xff + 0o17 + 0b101)",
+      "",
+    ].join("\n"),
+    expect: 275,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
