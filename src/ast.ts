@@ -25,6 +25,12 @@ export type Expr = { tag: 'var'; name: string; span: Span } | { tag: 'int'; valu
 export interface LocalBinding { name: string; patterns: Pattern[]; value: Expr; guards?: Guard[]; whereBindings?: LocalBinding[]; strict?: true; /** A `let`/`where` type signature, as source text; `src/elaborate.ts` parses it. */ signature?: string; span: Span; }
 export interface ValueDeclaration { tag: 'value'; name: string; equations: Array<{ patterns: Pattern[]; guards: Guard[]; whereBindings: LocalBinding[] }>; span: Span; }
 export interface DataDeclaration { tag: 'data'; name: string; /** The name as the declaring module wrote it: `deriving Generic`'s `datatypeName` and `deriving Show`'s output are the surface name, not the module-scoped one. */ surfaceName?: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[];
+    /** The constructor's own context, one source string per constraint:
+     * `forall a. Show a => MkShowable a` keeps `["Show a"]`.  Each constraint
+     * becomes a real dictionary *field*, stored ahead of the declared ones, so
+     * `arity` here is still the count of declared fields only - see
+     * `src/elaborate.ts`, which is where the two are added together. */
+    context?: string[];
     /** The names as the declaring module wrote them, kept because `deriving
      * Show` prints them and every other pass wants the renamed ones. */
     surface?: { name: string; fields?: string[] } }>;

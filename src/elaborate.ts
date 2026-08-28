@@ -768,10 +768,11 @@ type Env = Map<string, EnvEntry>;
 
 /** A dictionary-needing occurrence, recorded during inference and turned into
  * real syntax only once constraint solving has finished. */
-type Use =
+type Use = { locals?: readonly Given[] } & (
   | { kind: "apply"; node: Expr; emit: string; constraints: Constraint[] }
   | { kind: "literal"; node: Expr; type: Type; cls: "Num" | "Fractional" | "IsString" }
-  | { kind: "group"; node: Expr; target: string };
+  | { kind: "group"; node: Expr; target: string }
+);
 
 /** What a binding was told, or worked out, about its own constraints. */
 interface Given {
@@ -796,6 +797,10 @@ interface Binding {
    * `forall` a signature's variables do not scope over its body in GHC either. */
   tyvars: ReadonlyMap<string, Type>;
   givens: Given[];
+  /** Every dictionary a constructor pattern in this body brought into scope,
+   * flattened.  Scoping is per `Use` (see `Use.locals`); this list exists only
+   * so defaulting knows those types are already spoken for. */
+  patternGivens: Given[];
   uses: Use[];
   /** Every numeric literal pattern, with the type it was matched at.  The
    * representation is settled only once the binding is fully inferred. */
@@ -823,7 +828,35 @@ class Elaborator {
    * place a type exists, and the answer is only final once unification has
    * finished, so the *type* is recorded here and pruned at rewrite time. */
   private readonly binderTypes = new Map<Pattern | Expr, Type>();
+  /** How many dictionary fields a constructor carries ahead of its declared
+   * ones.  Read back when the data declarations are handed to `desugar`, which
+   * is what keeps the constructor's arity and this pass's view of it in step. */
+  readonly conDictFields = new Map<string, number>();
+  /** The binder names a constructor *pattern* gives those fields, so
+   * `rewritePattern` can put them back as the pattern's leading arguments. */
+  readonly conPatternDicts = new Map<Pattern, string[]>();
+  /** Dictionaries in scope from the constructor patterns enclosing whatever is
+   * being inferred right now.  A stack, because a given from one alternative's
+   * pattern must not discharge a constraint in a sibling's body. */
+  private patternGivens: Given[] = [];
+  private nextPatternDict = 0;
   private current?: Binding;
+
+  /** Run `f` with whatever constructor patterns it matches in scope, and drop
+   * them again afterwards. */
+  private scoped<T>(f: () => T): T {
+    const depth = this.patternGivens.length;
+    try {
+      return f();
+    } finally {
+      this.patternGivens.length = depth;
+    }
+  }
+
+  private addUse(use: Use): void {
+    if (!this.current) return;
+    this.current.uses.push(this.patternGivens.length ? { ...use, locals: [...this.patternGivens] } : use);
+  }
 
   /** Is this binder's type the erased state token? See `Pattern.voidRep`. */
   isVoidRep(node: Pattern | Expr): boolean {
@@ -880,7 +913,19 @@ class Elaborator {
           for (const arg of p.args) this.inferPattern(arg, env);
           return freshVar();
         }
-        let type = instantiate(scheme).type;
+        const instance = instantiate(scheme);
+        let type = instance.type;
+        // The mirror image of building one: the dictionary fields are matched
+        // out and become *givens* for whatever this pattern scopes over, which
+        // is the only reason a body can call a class method at the existential
+        // type the pattern just unpacked.
+        if (instance.constraints.length) {
+          const names = instance.constraints.map(() => `$dx${this.nextPatternDict++}`);
+          this.conPatternDicts.set(p, names);
+          const bound = instance.constraints.map((c, i) => ({ cls: c.cls, types: c.types, name: names[i]! }));
+          this.patternGivens.push(...bound);
+          this.current?.patternGivens.push(...bound);
+        }
         for (const arg of p.args) {
           const argType = this.inferPattern(arg, env);
           const result = freshVar();
@@ -901,14 +946,14 @@ class Elaborator {
     switch (e.tag) {
       case "int": {
         const t = freshVar();
-        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "Num" });
+        this.addUse({ kind: "literal", node: e, type: t, cls: "Num" });
         return t;
       }
       // A fractional literal wants `Fractional`, not `Num`: `0.5 :: Int` is a
       // type error in Haskell and must stay one here.
       case "double": {
         const t = freshVar();
-        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "Fractional" });
+        this.addUse({ kind: "literal", node: e, type: t, cls: "Fractional" });
         return t;
       }
       // OverloadedStrings. `[Char]` is not a *default* GHC could write down -
@@ -919,7 +964,7 @@ class Elaborator {
       // its own value and needs no dictionary.
       case "string": {
         const t = freshVar();
-        this.current?.uses.push({ kind: "literal", node: e, type: t, cls: "IsString" });
+        this.addUse({ kind: "literal", node: e, type: t, cls: "IsString" });
         return t;
       }
       case "char":
@@ -1034,29 +1079,37 @@ class Elaborator {
     if (entry) {
       if (entry.tag === "mono") return entry.type;
       if (entry.tag === "group") {
-        this.current?.uses.push({ kind: "group", node: e, target: entry.name });
+        this.addUse({ kind: "group", node: e, target: entry.name });
         return entry.type;
       }
       const { type, constraints } = instantiate(entry.scheme, typeArgs);
       if (constraints.length || entry.emit !== e.name) {
-        this.current?.uses.push({ kind: "apply", node: e, emit: entry.emit, constraints });
+        this.addUse({ kind: "apply", node: e, emit: entry.emit, constraints });
       }
       return type;
     }
     const con = this.constructors.get(e.name);
-    if (con) return instantiate(con, typeArgs).type;
+    if (con) {
+      // Building a constructor that has a context *stores* the dictionaries the
+      // construction site solved, so the occurrence takes them as its leading
+      // arguments exactly as an overloaded function's would.
+      const { type, constraints } = instantiate(con, typeArgs);
+      if (constraints.length) this.addUse({ kind: "apply", node: e, emit: e.name, constraints });
+      return type;
+    }
     this.report(`\`${e.name}\` is not in scope`, e.span);
     return freshVar();
   }
 
   private inferAlternatives(alts: CaseAlternative[], scrutinee: Type, result: Type, env: Env, span: Span): void {
-    for (const alt of alts) {
-      const inner = new Map(env);
-      if (!unify(scrutinee, this.inferPattern(alt.pattern, inner))) this.report("pattern does not match the scrutinee type", span);
-      this.inferQualifiers(alt.qualifiers, inner, span);
-      const body = this.infer(alt.body, inner);
-      if (!unify(result, body)) this.report(`case alternatives have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
-    }
+    for (const alt of alts)
+      this.scoped(() => {
+        const inner = new Map(env);
+        if (!unify(scrutinee, this.inferPattern(alt.pattern, inner))) this.report("pattern does not match the scrutinee type", span);
+        this.inferQualifiers(alt.qualifiers, inner, span);
+        const body = this.infer(alt.body, inner);
+        if (!unify(result, body)) this.report(`case alternatives have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
+      });
   }
 
   /** A `let`/`where` group, in dependency order, generalising as it goes.
@@ -1107,17 +1160,18 @@ class Elaborator {
         if (!unify(t, written.type))
           this.report(`\`${b.name}\` does not have its declared type \`${showType(written.type)}\``, b.span);
       }
-      for (const binding of members) {
-        const scope = new Map(inner);
-        let result = types.get(binding)!;
-        for (const pattern of binding.patterns) {
-          const argType = this.inferPattern(pattern, scope);
-          const next = freshVar();
-          if (!unify(result, tfun(argType, next))) this.report("binding parameters do not match its type", binding.span);
-          result = next;
-        }
-        this.inferGuards(binding.guards ?? [{ body: binding.value }], binding.whereBindings ?? [], result, scope, binding.span);
-      }
+      for (const binding of members)
+        this.scoped(() => {
+          const scope = new Map(inner);
+          let result = types.get(binding)!;
+          for (const pattern of binding.patterns) {
+            const argType = this.inferPattern(pattern, scope);
+            const next = freshVar();
+            if (!unify(result, tfun(argType, next))) this.report("binding parameters do not match its type", binding.span);
+            result = next;
+          }
+          this.inferGuards(binding.guards ?? [{ body: binding.value }], binding.whereBindings ?? [], result, scope, binding.span);
+        });
       const constrained = new Set<TVar>();
       for (const use of this.current?.uses ?? [])
         if (use.kind === "apply")
@@ -1149,31 +1203,34 @@ class Elaborator {
     for (const guard of guards) {
       // Each guard gets its own copy: a `p <- e` binds for the rest of *this*
       // guard's qualifiers and its body, and for nothing after it.
-      const inner = new Map(scope);
-      this.inferQualifiers(guard.qualifiers, inner, span);
-      // The two types are in the message on purpose. "different types" alone
-      // says nothing a reader can act on, and every fix in this file's
-      // vicinity - `(,)` read as a type named `,`, a synonym's context handed
-      // back as its type, a `String` pattern pinning a `MisoString` scrutinee -
-      // was found by reading the pair.
-      const body = this.infer(guard.body, inner);
-      if (!unify(result, body)) this.report(`guarded bodies have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
+      this.scoped(() => {
+        const inner = new Map(scope);
+        this.inferQualifiers(guard.qualifiers, inner, span);
+        // The two types are in the message on purpose. "different types" alone
+        // says nothing a reader can act on, and every fix in this file's
+        // vicinity - `(,)` read as a type named `,`, a synonym's context handed
+        // back as its type, a `String` pattern pinning a `MisoString` scrutinee -
+        // was found by reading the pair.
+        const body = this.infer(guard.body, inner);
+        if (!unify(result, body)) this.report(`guarded bodies have different types: \`${showType(result)}\` vs \`${showType(body)}\``, span);
+      });
     }
   }
 
   inferBinding(binding: Binding, env: Env): void {
     this.current = binding;
-    for (const equation of binding.decl.equations) {
-      const scope = new Map(env);
-      let result = binding.monoType;
-      for (const pattern of equation.patterns) {
-        const argType = this.inferPattern(pattern, scope);
-        const next = freshVar();
-        if (!unify(result, tfun(argType, next))) this.report(`\`${binding.name}\` has inconsistent equation arities`, binding.decl.span);
-        result = next;
-      }
-      this.inferGuards(equation.guards, equation.whereBindings, result, scope, binding.decl.span);
-    }
+    for (const equation of binding.decl.equations)
+      this.scoped(() => {
+        const scope = new Map(env);
+        let result = binding.monoType;
+        for (const pattern of equation.patterns) {
+          const argType = this.inferPattern(pattern, scope);
+          const next = freshVar();
+          if (!unify(result, tfun(argType, next))) this.report(`\`${binding.name}\` has inconsistent equation arities`, binding.decl.span);
+          result = next;
+        }
+        this.inferGuards(equation.guards, equation.whereBindings, result, scope, binding.decl.span);
+      });
     this.current = undefined;
   }
 
@@ -1391,7 +1448,9 @@ class Elaborator {
       if (t.tag !== "var") continue;
       // A variable the binding is quantified over is not ambiguous: it is a
       // dictionary parameter, and defaulting it would erase the polymorphism.
-      if (binding.givens.some((g) => g.types.some((gt) => sameType(gt, t)))) continue;
+      // Nor is a variable a constructor pattern unpacked: it is existential,
+      // and a dictionary matched out of the value already stands for it.
+      if ([...binding.givens, ...binding.patternGivens].some((g) => g.types.some((gt) => sameType(gt, t)))) continue;
       const classes = wanted.filter((other) => other.types.length === 1 && sameType(other.types[0]!, t)).map((other) => other.cls);
       // Haskell's `default (Integer, Double)`: a `Fractional` wanted rules
       // `Int` out, so the same ambiguous variable defaults to `Double`.
@@ -1484,9 +1543,12 @@ class Elaborator {
   /** The dictionaries a use needs, in the order its callee expects them. */
   dictionariesFor(use: Use, binding: Binding): Expr[] {
     const span = spanOf(use.node);
+    // A dictionary unpacked by an enclosing constructor pattern comes first: it
+    // is the more local given, and for an existential type it is the only one.
+    const givens = use.locals ? [...use.locals, ...binding.givens] : binding.givens;
     if (use.kind === "group") {
       const target = this.bindings.get(use.target);
-      return (target?.givens ?? []).map((g) => this.resolve(g.cls, g.types, binding.givens, span) ?? errorExpr(span));
+      return (target?.givens ?? []).map((g) => this.resolve(g.cls, g.types, givens, span) ?? errorExpr(span));
     }
     if (use.kind === "literal" && headCon(use.type) === "IntPrim") return [];
     if (use.kind === "literal" && headCon(use.type) === "DoublePrim") return [];
@@ -1495,7 +1557,7 @@ class Elaborator {
     if (use.kind === "literal" && use.cls === "IsString" && sameType(use.type, tString)) return [];
     const constraints: Constraint[] =
       use.kind === "literal" ? [{ cls: use.cls, types: [use.type] }] : use.constraints;
-    return constraints.map((c) => this.resolve(c.cls, c.types, binding.givens, span) ?? errorExpr(span));
+    return constraints.map((c) => this.resolve(c.cls, c.types, givens, span) ?? errorExpr(span));
   }
 }
 
@@ -1774,12 +1836,33 @@ export function elaborateProgram(
       }, tcon(decl.name));
       const fields = (con.fieldTypes ?? Array.from({ length: con.arity }, () => "_field")).map((f) => parseType(f, vars));
       const type = fields.reduceRight((acc, field) => tfun(field, acc), result);
+      // A constructor's context is parsed one constraint at a time, and each
+      // one contributes exactly one dictionary field whether it parsed or not:
+      // the field count is a *layout* fact, shared with `desugar` through the
+      // arity below, so it can never depend on how well a constraint read.
+      const context = (con.context ?? []).map(
+        (source, i): Constraint =>
+          parseSignature(`${source} => Int`, vars).context[0] ?? { cls: `?${i}`, types: [freshVar()] },
+      );
       // The datatype's own parameters are quantified first, in declaration
       // order, so `Proxy @flag` binds what GHC binds. Occurrence order - which
       // is the order the fields mention them in - would put `MkPair @a @b` of
-      // `data Pair a b = MkPair b a` the wrong way round.
+      // `data Pair a b = MkPair b a` the wrong way round.  A variable only the
+      // context mentions is quantified too, or it would be one shared variable
+      // for every use of the constructor in the program.
       const ordered = [...params, ...typeVars(type).filter((v) => !params.includes(v))];
-      elaborator.constructors.set(con.name, quantify(ordered, type, []));
+      for (const c of context)
+        for (const t of c.types) for (const v of typeVars(t)) if (!ordered.includes(v)) ordered.push(v);
+      elaborator.constructors.set(con.name, quantify(ordered, type, context));
+      if (context.length === 0) continue;
+      // GHC refuses to derive for a constructor with existentials or a context
+      // ("Constructor `MkShowable' has existentials or constraints in its
+      // type"), and the derived code here would be built at the declared arity
+      // and silently miss the dictionary fields.
+      const strategies = [...decl.deriving, ...(decl.derivingAnyclass ?? []), ...(decl.derivingNewtype ?? [])];
+      if (strategies.length)
+        elaborator.report(`cannot derive \`${strategies.join(", ")}\` for \`${decl.name}\`: \`${con.name}\` has a constructor context`, decl.span);
+      elaborator.conDictFields.set(con.name, context.length);
     }
   }
   const listVar = freshVar();
@@ -2181,6 +2264,7 @@ export function elaborateProgram(
         : undefined,
       tyvars,
       givens: [],
+      patternGivens: [],
       uses: [],
       intPatterns: [],
       monoType: signature ? signature.type : freshVar(),
@@ -2315,7 +2399,22 @@ export function elaborateProgram(
     deriving: [],
     span: NOWHERE,
   };
-  const out: Declaration[] = [listData, ...declarations.filter((d) => d.tag === "data" || d.tag === "foreign")];
+  // A constructor with a context is one field wider per constraint, and
+  // `desugar` builds its `DataCon` straight from `arity`.  Widening here rather
+  // than in the parser keeps the count identical to the one this pass actually
+  // parsed a constraint for, and leaves a context-free constructor's
+  // declaration byte-for-byte the object it always was.
+  const withDictFields = (d: Declaration): Declaration =>
+    d.tag === "data" && d.constructors.some((c) => elaborator.conDictFields.has(c.name))
+      ? {
+          ...d,
+          constructors: d.constructors.map((c) => ({ ...c, arity: c.arity + (elaborator.conDictFields.get(c.name) ?? 0) })),
+        }
+      : d;
+  const out: Declaration[] = [
+    listData,
+    ...declarations.filter((d) => d.tag === "data" || d.tag === "foreign").map(withDictFields),
+  ];
   for (const info of elaborator.classes.values()) out.push(...classDeclarations(info));
   for (const instance of elaborator.instances.values()) {
     const built = instanceDeclaration(elaborator, instance);
@@ -2910,9 +3009,17 @@ function rewritePattern(elaborator: Elaborator, p: Pattern): Pattern {
       // `src/desugar.ts` represents `()` as the machine integer 0, so matching
       // it is matching that literal - strict, as GHC's `()` pattern is, and on
       // the representation the value side already produces.
-      return p.name === "()" && p.args.length === 0
-        ? { tag: "int", value: 0, span: p.span }
-        : { ...p, args: p.args.map((arg) => rewritePattern(elaborator, arg)) };
+      if (p.name === "()" && p.args.length === 0) return { tag: "int", value: 0, span: p.span };
+      // The dictionary fields are stored ahead of the declared ones, so the
+      // match binds them ahead of them too - which is exactly what makes the
+      // rewritten pattern as wide as the constructor's real arity.
+      return {
+        ...p,
+        args: [
+          ...(elaborator.conPatternDicts.get(p) ?? []).map((name): Pattern => ({ tag: "var", name, span: p.span })),
+          ...p.args.map((arg) => rewritePattern(elaborator, arg)),
+        ],
+      };
     // The state token is the one type with no runtime value at all, so a
     // binder at that type has to say so before types are erased.
     case "var":

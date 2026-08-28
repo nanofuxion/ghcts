@@ -3165,6 +3165,65 @@ const programs = [
     },
     expect: 42,
   },
+  // Existential constructor contexts. The constraints are real fields, stored
+  // ahead of the declared ones: building one stores the dictionary the
+  // construction site solved, matching one binds it and makes it a given.
+  {
+    name: "existential: a class the body actually calls",
+    source: [
+      "module Main where",
+      "data Showable = forall a . Show a => MkShowable a",
+      "render :: Showable -> [Char]",
+      "render (MkShowable x) = show x",
+      "main = render (MkShowable True) ++ render (MkShowable (42 :: Int))",
+      "",
+    ].join("\n"),
+    expect: "True42",
+  },
+  {
+    name: "existential: two constraints from one constructor",
+    source: [
+      "module Main where",
+      "data Keyed = forall a . (Eq a, Show a) => Keyed a a",
+      "describe :: Keyed -> [Char]",
+      "describe (Keyed x y) = show (x == y) ++ show x",
+      "main = describe (Keyed (1 :: Int) 1) ++ describe (Keyed True False)",
+      "",
+    ].join("\n"),
+    expect: "True1FalseTrue",
+  },
+  {
+    // miso's own shape: `SomeComponent` lives inside `View`, so the dictionary
+    // travels in the tree and is only unpacked where the node is matched.
+    name: "existential: stored in a data structure and pulled back out",
+    source: [
+      "module Main where",
+      "data Some = forall a . Show a => Some a",
+      "data Tree = Node [Tree] | Leaf Some",
+      "flatten :: Tree -> [Char]",
+      "flatten (Leaf (Some x)) = show x",
+      "flatten (Node kids) = concatMap flatten kids",
+      "main = flatten (Node [Leaf (Some (1 :: Int)), Node [Leaf (Some True)], Leaf (Some 'z')])",
+      "",
+    ].join("\n"),
+    expect: "1True'z'",
+  },
+  {
+    // A pattern's dictionary is in scope for that pattern's body and nothing
+    // else. Here the constraint is at `Int` on both sides, so a given that
+    // outlived its alternative would be picked for the second `==` too - and
+    // would name a binder that is not in scope there.
+    name: "existential: a matched dictionary does not escape its alternative",
+    source: [
+      "module Main where",
+      "data Boxed a = Eq a => MkBoxed a",
+      "leak :: Boxed Int -> [Char]",
+      "leak b = show (case b of MkBoxed x -> x == 3) ++ show ((1 :: Int) == 1)",
+      "main = leak (MkBoxed 3)",
+      "",
+    ].join("\n"),
+    expect: "TrueTrue",
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

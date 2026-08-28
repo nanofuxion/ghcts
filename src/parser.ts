@@ -405,6 +405,25 @@ function expandDeclarationQuotes(declaration: Declaration): Declaration {
     };
   return declaration;
 }
+/** One string per constraint of a `(C a, D b) =>` context.  The count is what
+ * fixes how many dictionary fields the constructor gains, so the split has to
+ * be exactly at the context's own commas and nowhere inside a nested type. */
+function splitConstraints(tokens: readonly string[]): string[] {
+  const inner = tokens[0] === "(" && tokens[tokens.length - 1] === ")" ? tokens.slice(1, -1) : tokens;
+  const parts: string[][] = [[]];
+  let depth = 0;
+  for (const token of inner) {
+    if (token === "(" || token === "[") depth++;
+    else if (token === ")" || token === "]") depth--;
+    else if (depth === 0 && token === ",") {
+      parts.push([]);
+      continue;
+    }
+    parts[parts.length - 1]!.push(token);
+  }
+  return parts.map((part) => part.join(" ")).filter((part) => part.length > 0);
+}
+
 function tokenSpelling(token: Token): string {
   if (token.kind === "string") return JSON.stringify(token.text);
   if (token.kind === "char") {
@@ -959,27 +978,30 @@ class Parser {
           if (variable.text === "." || variable.text.endsWith(".")) break;
         }
       }
+      // A constructor's context is not decoration: each constraint becomes a
+      // dictionary field of the constructor, so the spelling is kept rather
+      // than skipped.  `probe` lands on the `=>` if there is one.
+      let context: string[] | undefined;
+      let probe = this.index;
       if (this.at("(")) {
-        let probe = this.index;
         let depth = 0;
         do {
           const token = this.tokens[probe++];
           if (token?.text === "(") depth++;
           else if (token?.text === ")") depth--;
         } while (depth > 0 && probe < this.tokens.length);
-        if (this.tokens[probe]?.text === "=>") {
-          while (this.index < probe) this.take();
-          this.take();
-        }
       } else {
-        let probe = this.index;
         while (
           probe < this.tokens.length &&
           !["=>", "|", ";", "deriving"].includes(this.tokens[probe]?.text ?? "")
         )
           probe++;
-        if (this.tokens[probe]?.text === "=>")
-          while (this.index <= probe) this.take();
+      }
+      if (this.tokens[probe]?.text === "=>") {
+        const spelling: string[] = [];
+        while (this.index < probe) spelling.push(this.take().text);
+        this.take();
+        context = splitConstraints(spelling);
       }
       const constructor = this.conName();
       let arity = 0;
@@ -1059,7 +1081,7 @@ class Parser {
           this.take();
         }
       }
-      constructors.push({ name: constructor, arity, fields, fieldTypes });
+      constructors.push({ name: constructor, arity, fields, fieldTypes, context });
       if (fields) this.recordFieldsByCon.set(constructor, fields);
     } while (this.accept("|"));
     // The three GHC deriving strategies build three different instances, so
