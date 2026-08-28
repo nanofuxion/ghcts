@@ -667,6 +667,51 @@ const programs = [
     probe: "globalThis.$hsProbe",
     expect: 42,
   },
+  {
+    // Every import above is written in the unlifted vocabulary the backend
+    // speaks (`IntPrim -> IntPrim`) and wrapped into `IO` by hand. Real
+    // libraries do not: miso writes `IO`-returning imports over the BOXED
+    // `Int`/`JSVal`/`JSString`, and the desugarer has to marshal both ends
+    // (GHC's `dsFCall`). An unwrapped `IO` result is not an `IO` action at
+    // all, so `>>=` takes `.d1` of a plain JavaScript number - which is how
+    // this fails without the wrapper.
+    name: "foreign import returning IO: an action, run once per use",
+    source: [
+      "module Main where",
+      'foreign import javascript unsafe "((n) => { globalThis.$hsFfiIO = (globalThis.$hsFfiIO || 0) * 10 + n; return globalThis.$hsFfiIO; })" bump :: Int -> IO Int',
+      "main :: IO Int",
+      "main = do",
+      "  bump 1",
+      "  bump 2",
+      "  bump 3",
+      "",
+    ].join("\n"),
+    expect: 123,
+  },
+  {
+    // `JSVal` and `JSString` are one-field boxes the BACKEND does not unbox
+    // (only Int/Char/Double are `isUnboxableCon`), so an unmarshalled import
+    // hands JavaScript the heap object: `o[k]` with a closure for `k` is
+    // `undefined`. The `case u of ()` pins the other half of `boxResult` - an
+    // `IO ()` import must yield the unit, not whatever JavaScript returned.
+    name: "foreign import over JSVal/JSString: both ends marshalled",
+    source: [
+      "module Main where",
+      "import GHC.JS.Prim",
+      "import qualified Data.JSString as J",
+      'foreign import javascript unsafe "(() => ({}))" newObj :: IO JSVal',
+      'foreign import javascript unsafe "((k,v,o) => { o[k] = v + 1; })" setProp :: J.JSString -> Int -> JSVal -> IO ()',
+      'foreign import javascript unsafe "((k,o) => o[k])" getProp :: J.JSString -> JSVal -> IO Int',
+      "main :: IO Int",
+      "main = do",
+      "  o <- newObj",
+      '  u <- setProp (J.pack "n") 41 o',
+      '  n <- getProp (J.pack "n") o',
+      "  pure (case u of () -> n)",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
   // Library modules (src/library.ts). Each of these is here because a wrong
   // implementation would fail silently rather than fail to compile.
   {

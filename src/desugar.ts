@@ -25,6 +25,7 @@ import type {
   CaseAlternative,
   Declaration,
   Expr,
+  ForeignDeclaration,
   Guard,
   GuardQualifier,
   LocalBinding,
@@ -751,6 +752,84 @@ class Desugarer {
       ? [[{ tag: "Rec", pairs: binders.map((b, i) => [b, rhss[i]!] as [Binder, CoreExpr]) }], inner]
       : [binders.map((b, i): CoreBind => ({ tag: "NonRec", binder: b, rhs: rhss[i]! })), inner];
   }
+
+  /** GHC's `dsFCall`: the body of a foreign import whose Haskell type says
+   * more than "call this with these registers".
+   *
+   *   - `unboxArg`: an argument whose type is a one-field box over a primitive
+   *     (`Int`, `Char`, `JSVal`, `JSString`, ...) is opened with a `case`, so
+   *     JavaScript is handed the machine value rather than the heap object.
+   *   - `boxResult`: a result of that shape is closed back up, and an `IO`
+   *     result becomes an actual `IO` action - `IO (\s -> IOResult s r)` -
+   *     rather than the raw value. Without this an `IO`-returning import
+   *     evaluates at the point it is *applied*, and hands `unIO` something
+   *     with no `IO` constructor to take apart.
+   *
+   * The call sits in a `case` scrutinee, exactly as `boxResult` puts it there:
+   * a constructor field is a lazy position, and an `unsafe` foreign call
+   * deferred into a thunk would run at an arbitrary later moment. */
+  foreignBody(
+    decl: ForeignDeclaration,
+    op: StgOp,
+    params: readonly Binder[],
+    args: ReadonlyArray<DataCon | undefined>,
+    result: DataCon | undefined,
+    payload: string | undefined,
+  ): CoreExpr {
+    const opened = params.map((p, i) => (args[i] === undefined ? p : mkBinder(`${p.name}u`)));
+    const unbox = (body: CoreExpr): CoreExpr =>
+      params.reduceRight((rest, p, i) => {
+        const con = args[i];
+        return con === undefined
+          ? rest
+          : {
+              tag: "Case",
+              scrutinee: varOf(p),
+              binder: mkBinder(`${p.name}b`),
+              alts: [{ con: { tag: "DataAlt", con }, binders: [opened[i]!], body: rest }],
+            };
+      }, body);
+    const called = call(op, decl.arity, opened);
+    const box = (v: CoreExpr): CoreExpr => (result === undefined ? v : { tag: "Con", con: result, args: [v] });
+    if (payload === undefined) return unbox(box(called));
+
+    const io = this.cons.get("IO");
+    const ioResult = this.cons.get("IOResult");
+    if (io === undefined || ioResult === undefined) {
+      this.diagnostics.push(
+        error(
+          "GHCTS-DESUGAR",
+          `foreign import \`${decl.name}\` returns IO, but IO is not in scope`,
+          this.file,
+          decl.span.line,
+          decl.span.column,
+        ),
+      );
+      return unbox(box(called));
+    }
+    // The state token is void: it occupies no register and no payload slot.
+    const state = mkBinder(`${decl.name}$s`, { arity: 0 });
+    const value = mkBinder(`${decl.name}$r`);
+    // `IO ()` has no result to hand back. GHC's `boxResult` drops the call's
+    // value and returns the unit, which keeps a JavaScript function that
+    // returns nothing from putting `undefined` where `()` belongs.
+    const returned: CoreExpr = isUnitType(payload) ? { tag: "Lit", lit: int(0) } : box(varOf(value));
+    const body: CoreExpr = {
+      tag: "Case",
+      scrutinee: called,
+      binder: value,
+      alts: [
+        {
+          con: { tag: "DEFAULT" },
+          binders: [],
+          body: { tag: "Con", con: ioResult, args: [varOf(state), returned] },
+        },
+      ],
+    };
+    // Unboxing goes INSIDE the state lambda: `getProp_ffi k o` only builds the
+    // action, and must not force `k` until that action is run.
+    return { tag: "Con", con: io, args: [mkLams([state], unbox(body))] };
+  }
 }
 
 interface MatchRow {
@@ -764,6 +843,43 @@ interface MatchRow {
 }
 
 const varOf = (binder: Binder): CoreExpr => ({ tag: "Var", binder });
+
+const call = (op: StgOp, arity: number, args: readonly Binder[]): CoreExpr => ({
+  tag: "Op",
+  op,
+  arity,
+  args: args.map(varOf),
+});
+
+/** The head type constructor of one `->`-separated piece of a foreign import's
+ * signature, which `src/parser.ts` hands over as its tokens joined by spaces.
+ * `undefined` unless the piece *begins* with a type name, so `( JSVal , JSVal )`
+ * and `JSVal -> IO ()` are not mistaken for `JSVal`. */
+const headTypeCon = (text: string): string | undefined => /^\s*([A-Z][A-Za-z0-9_'.]*)/.exec(text)?.[1];
+
+/** `IO t` -> `t`; anything else -> `undefined`. `\b` keeps `IOResult a` out. */
+const ioPayload = (text: string): string | undefined => /^\s*IO\b(.*)$/.exec(text)?.[1]?.trim();
+
+const isUnitType = (text: string): boolean => text.replace(/\s+/g, "") === "()";
+
+/** Types a foreign import marshals across: one constructor, one field, and
+ * that field a primitive - GHC's `unboxArg`/`boxResult` condition that the
+ * wrapped type be unlifted, spelled in this frontend's `...Prim` convention
+ * (see the header of src/library.ts). `data JSVal = JSVal JSValPrim` is one;
+ * `data Bool = False | True` is not, and needs none - the backend already
+ * represents it as a JavaScript boolean. */
+function boxTypes(module: Module, cons: ReadonlyMap<string, DataCon>): Map<string, DataCon> {
+  const out = new Map<string, DataCon>();
+  for (const decl of module.declarations) {
+    if (decl.tag !== "data" || decl.constructors.length !== 1) continue;
+    const con = decl.constructors[0]!;
+    const field = headTypeCon(con.fieldTypes?.[0] ?? "");
+    const dataCon = cons.get(con.name);
+    if (con.arity === 1 && field?.endsWith("Prim") === true && dataCon !== undefined)
+      out.set(decl.name, dataCon);
+  }
+  return out;
+}
 
 /** `let !x = e in b` is GHC's `case e of x -> b`: the group is still a `Let`,
  * and a `Case` on each strict binder in front of the body forces it exactly
@@ -907,21 +1023,33 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
 
   const binds: CoreBind[] = [];
 
+  const boxes = boxTypes(module, d.cons);
   for (const decl of foreigns) {
     // A foreign import is a saturated foreign call under enough lambdas to
     // consume its declared arguments; `arity` comes from the signature's
-    // top-level arrows. The wrapper is still emitted for an unsaturated use;
-    // a saturated call goes straight to the foreign call (see `foreignOps`).
+    // top-level arrows.
     const params = Array.from({ length: decl.arity }, (_, i) => mkBinder(`ffi${i}`));
     const op: StgOp = {
       tag: "StgFCallOp",
       target: { javascript: decl.javascript, safety: "unsafe" },
     };
-    d.foreignOps.set(decl.name, { op, arity: decl.arity });
+    // The declared type is not decoration: JavaScript is handed machine
+    // values, and every one of `getProp_ffi :: JSString -> JSVal -> IO JSVal`'s
+    // three is a heap object in Haskell. GHC's desugarer bridges that in
+    // `dsFCall` (GHC/HsToCore/Foreign/Call.hs) with `unboxArg` on each
+    // argument and `boxResult` on the result, and this is that pair.
+    const payload = ioPayload(decl.signature[decl.arity] ?? "");
+    const result = boxes.get(headTypeCon(payload ?? decl.signature[decl.arity] ?? "") ?? "");
+    const args = Array.from({ length: decl.arity }, (_, i) => boxes.get(headTypeCon(decl.signature[i] ?? "") ?? ""));
+    const marshalled = payload !== undefined || result !== undefined || args.some((a) => a !== undefined);
+    // Without marshalling the wrapper is the bare call, and a saturated use of
+    // it can go straight to the call itself (see `foreignOps`). With it, the
+    // wrapper IS the marshalling and inlining the call would skip it.
+    if (!marshalled) d.foreignOps.set(decl.name, { op, arity: decl.arity });
     binds.push({
       tag: "NonRec",
       binder: d.top.get(decl.name)!,
-      rhs: mkLams(params, { tag: "Op", op, arity: decl.arity, args: params.map(varOf) }),
+      rhs: mkLams(params, marshalled ? d.foreignBody(decl, op, params, args, result, payload) : call(op, decl.arity, params)),
     });
   }
 
