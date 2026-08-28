@@ -607,12 +607,47 @@ class Desugarer {
     // constructor group above, so once every constructor has an alternative
     // the DEFAULT one is unreachable.
     const exhaustive = typeName !== undefined && alts.length === this.conCount.get(typeName);
+    if (exhaustive) {
+      return { tag: "Case", scrutinee: { tag: "Var", binder: subject }, binder: mkBinder("c"), alts };
+    }
+    const missing = this.onlyMissingCon(typeName, alts);
     return {
       tag: "Case",
       scrutinee: { tag: "Var", binder: subject },
       binder: mkBinder("c"),
-      alts: exhaustive ? alts : [{ con: { tag: "DEFAULT" }, binders: [], body: defaultBody() }, ...alts],
+      alts: [
+        missing === undefined
+          ? { con: { tag: "DEFAULT" }, binders: [], body: defaultBody() }
+          : {
+              con: { tag: "DataAlt", con: missing },
+              binders: Array.from({ length: missing.arity }, (_, i) => mkBinder(`${missing.name}_f${i}`)),
+              body: defaultBody(),
+            },
+        ...alts,
+      ],
     };
+  }
+
+  /** GHC's `refineDefaultAlt`: if the alternatives already name every
+   * constructor of the type but one, the DEFAULT alternative can only be that
+   * one constructor, so say so.
+   *
+   * This is not tidying. Codegen only compiles a two-alternative `Bool` case to
+   * a truthiness test when BOTH alternatives are DataAlts (GHC's `genAlts`,
+   * mirrored in `src/stg-js/expr.ts`); otherwise it switches on the tag word
+   * `x.f.a`. But a `Bool` has no tag word - `tagToEnum#` and a nullary `True` /
+   * `False` both produce a raw JS boolean - so `case b of True -> ...; _ -> ...`
+   * compiled to a tag switch reads `.f` off `true` and dies. GHC never hits
+   * that because it refines the DEFAULT away first. */
+  onlyMissingCon(typeName: string | undefined, alts: readonly CoreAlt[]): DataCon | undefined {
+    if (typeName === undefined) return undefined;
+    const all = [...this.cons.values()].filter((con) => con.typeName === typeName);
+    // Constructors are registered lazily, so an incomplete table would make
+    // "all but one" a lie. Only trust it once it holds the whole type.
+    if (all.length !== this.conCount.get(typeName)) return undefined;
+    const covered = new Set(alts.flatMap((alt) => (alt.con.tag === "DataAlt" ? [alt.con.con.name] : [])));
+    const missing = all.filter((con) => !covered.has(con.name));
+    return missing.length === 1 ? missing[0] : undefined;
   }
 
   /** Inside one alternative, prepend the constructor's fields as new columns.

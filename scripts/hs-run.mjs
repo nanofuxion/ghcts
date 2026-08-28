@@ -3649,6 +3649,34 @@ const programs = [
     ].join("\n"),
     expect: "7",
   },
+  {
+    // A `Bool` has no tag word: `tagToEnum#` and a nullary `True`/`False` both
+    // produce a raw JS boolean, so codegen may only compile a `Bool` case to a
+    // truthiness test - never to a switch on `x.f.a`. It gets that right for
+    // two DataAlts, which is all `if` and guards ever produce. A source-level
+    // `case` with a wildcard reaches it as `[DEFAULT, True]` instead, and the
+    // tag switch then read `.f` off `true`. GHC never gets there because
+    // `refineDefaultAlt` turns that DEFAULT into `False` first; the desugarer
+    // now does too. miso's `initialize` dies on exactly this shape:
+    // `case (live, maybeKey) of (True, Just k) -> ...; _ -> ...`.
+    name: "a wildcard Bool alternative is refined to the missing constructor",
+    source: [
+      "module Main where",
+      "pick :: Bool -> Int",
+      "pick b = case b of",
+      "  True -> 1",
+      "  _ -> 2",
+      // The pair scrutinee is miso's own shape: the `Bool` reaches the inner
+      // case as a constructor field, not as a freshly compared value.
+      "both :: Bool -> Maybe Int -> Int",
+      "both b m = case (b, m) of",
+      "  (True, Just n) -> n",
+      "  _ -> 0",
+      "main = pick (3 < (4 :: Int)) + pick (5 < (4 :: Int)) + both True (Just 39) + both False (Just 9)",
+      "",
+    ].join("\n"),
+    expect: 42,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
