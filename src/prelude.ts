@@ -272,7 +272,7 @@ instance Num Int where
   -- machine value machine: a primitive call in an argument or a field is
   -- evaluated where it stands, but a Haskell function's result there is a
   -- THUNK - and \`I\` is an unboxed constructor, so the field would BE it.
-  fromInteger (Integer b) = I (primIntegerToInt b)
+  fromInteger n = case integerToIntPrim n of m -> I m
 
 instance Show Int where
   -- GHC's \`showSignedInt\`: a negative number is parenthesised at any
@@ -355,7 +355,7 @@ instance Real Int where
   toDoublePrim (I n) = primIntToDouble n
 
 instance Integral Int where
-  toInteger (I n) = Integer (primIntegerFromInt n)
+  toInteger (I n) = integerFromIntPrim n
 
 instance Eq Double where
   (==) (DoubleBox a) (DoubleBox b) = primDoubleEq a b
@@ -371,7 +371,7 @@ instance Num Double where
   (-) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleSub a b)
   (*) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleMul a b)
   negate (DoubleBox a) = DoubleBox (primDoubleNeg a)
-  fromInteger (Integer b) = DoubleBox (primIntegerToDouble b)
+  fromInteger n = case integerToDoublePrim n of d -> DoubleBox d
 
 instance Fractional Double where
   (/) (DoubleBox a) (DoubleBox b) = DoubleBox (primDoubleDiv a b)
@@ -397,7 +397,7 @@ instance Num Float where
   (-) (FloatBox a) (FloatBox b) = FloatBox (primFloatSub a b)
   (*) (FloatBox a) (FloatBox b) = FloatBox (primFloatMul a b)
   negate (FloatBox a) = FloatBox (primFloatNeg a)
-  fromInteger (Integer b) = FloatBox (primDoubleToFloat (primIntegerToDouble b))
+  fromInteger n = FloatBox (primDoubleToFloat (integerToDoublePrim n))
 
 instance Fractional Float where
   (/) (FloatBox a) (FloatBox b) = FloatBox (primFloatDiv a b)
@@ -865,75 +865,323 @@ digitChar n = C (primChr (primIntAdd n 48))
 -- --------------------------------------------- Integer, Int64 and Word64 ---
 --
 -- GHC's \`Integer\` is \`ghc-bignum\`'s \`IS Int# | IP BigNat# | IN BigNat#\` over
--- the \`h$ghcbn_*\` primitives, and \`Int64\`/\`Word64\` are \`I64# Int64#\`/
--- \`W64# Word64#\` over a two-slot unboxed value. Both carriers live in the
--- backend. What is reachable from the frontend alone is a \`foreign import\`,
--- and the platform already has an exact integer of unbounded width: a JS
--- \`BigInt\`. So the box holds one, exactly as \`data ByteString = ByteString
--- JSValPrim\` holds a real \`Uint8Array\`.
+-- 32-bit limbs, and its \`Int64\`/\`Word64\` are a pair of 32-bit halves. What GHC
+-- never emits is a JS \`BigInt\`, and neither may this compiler: the target
+-- engine has none. PrimJS refuses to decode a packed bundle that contains any
+-- \`BigInt\` syntax at all - "RangeError: BigInt is too large to allocate", with
+-- \`32n\` as the largest literal in the bundle - and miso's own JS installs
+-- JSBI as \`globalThis.BigInt\`, whose objects throw the moment they meet a
+-- native \`BigInt\` literal. So the carrier is a bignum in Haskell:
 --
--- That is honest by the test \`Data.ByteString\` states: a \`BigInt\` can hold
--- every value an \`Integer\` can, which is what \`Int64\` aliased to \`Int\` could
--- never have said. \`Int64\` and \`Word64\` ride the same carrier and differ only
--- in the wrap applied after every operation - \`BigInt.asIntN\` / \`asUintN\` at
--- 64 bits - which is what makes them wrap at their own width rather than grow.
+--   \`Big neg limbs\` is sign-magnitude, \`limbs\` least significant first, in
+--   base 2^15, with no trailing zero limb. Zero is \`Big False []\`, so every
+--   value has exactly one representation and a longer limb list is always the
+--   bigger magnitude - which is what lets \`magCmp\` decide on structure alone.
+--
+-- Base 2^15 and not 2^31 because a limb product has to be exact and \`Int\` here
+-- is the backend's 32-bit machine int: \`x * y + carry <= (2^15-1)^2 + 2^15\`
+-- stays under 2^31, and \`primIntMul\` is \`Math.imul\`, which wraps a wider
+-- product silently rather than rounding it loudly.
+--
+-- \`Int64\` and \`Word64\` ride the same carrier and differ only in the wrap
+-- applied after every operation - \`bigNarrow64\`/\`bigMask64\`, which are what
+-- \`BigInt.asIntN\`/\`asUintN\` at 64 bits were - so they wrap at their own width
+-- rather than grow.
 --
 -- They are declared here, and not in \`Data.Int\`/\`Data.Word\`, because
 -- \`Fingerprint\` is two \`Word64\` halves and \`Fingerprint\` is wired in: \`static\`
 -- is a keyword form that needs no import (see StaticPtr, below).
-data Integer = Integer JSValPrim
-data Int64 = I64 JSValPrim
-data Word64 = W64 JSValPrim
+data Big = Big Bool [Int]
+data Integer = Integer Big
+data Int64 = I64 Big
+data Word64 = W64 Big
 
-foreign import javascript unsafe "((n) => BigInt(n))" primIntegerFromInt :: IntPrim -> JSValPrim
+-- \`quot\`/\`rem\` on one limb. Both primops are exact on a JS number of any
+-- width - \`(x/y)|0\` and \`x % y\` - which is what lets the halves of a 32-bit
+-- word be split out of a value that does not fit an \`Int\`.
+quotSmall :: Int -> Int -> Int
+quotSmall (I a) (I b) = I (primIntQuot a b)
+
+remSmall :: Int -> Int -> Int
+remSmall (I a) (I b) = I (primIntRem a b)
+
+lowLimb :: Int -> Int
+lowLimb t = remSmall t 32768
+
+highLimb :: Int -> Int
+highLimb t = quotSmall t 32768
+
+unInt :: Int -> IntPrim
+unInt (I n) = n
+
+-- Drop trailing zero limbs, so that magnitudes stay comparable by structure.
+magNorm :: [Int] -> [Int]
+magNorm ds = case ds of
+  [] -> []
+  (x : xs) -> magNormStep x (magNorm xs)
+
+magNormStep :: Int -> [Int] -> [Int]
+magNormStep x xs = if nullList xs && x == 0 then [] else x : xs
+
+-- -1, 0 or 1. The recursion reaches the most significant limb first, so the
+-- deepest difference is the one that decides - and an exhausted list is the
+-- smaller magnitude precisely because both are normalised.
+magCmp :: [Int] -> [Int] -> Int
+magCmp a b = case a of
+  [] -> if nullList b then 0 else negate 1
+  (x : xs) -> case b of
+    [] -> 1
+    (y : ys) -> magCmpStep (magCmp xs ys) x y
+
+magCmpStep :: Int -> Int -> Int -> Int
+magCmpStep c x y = if c == 0 then magCmpLimb x y else c
+
+magCmpLimb :: Int -> Int -> Int
+magCmpLimb x y = if x == y then 0 else if x < y then negate 1 else 1
+
+magAdd :: [Int] -> [Int] -> Int -> [Int]
+magAdd a b c = case a of
+  [] -> magCarry b c
+  (x : xs) -> case b of
+    [] -> magCarry a c
+    (y : ys) -> magAddStep (x + y + c) xs ys
+
+magAddStep :: Int -> [Int] -> [Int] -> [Int]
+magAddStep t xs ys = lowLimb t : magAdd xs ys (highLimb t)
+
+magCarry :: [Int] -> Int -> [Int]
+magCarry ds c = if c == 0 then ds else magCarryInto ds c
+
+magCarryInto :: [Int] -> Int -> [Int]
+magCarryInto ds c = case ds of
+  [] -> c : []
+  (x : xs) -> magCarryStep (x + c) xs
+
+magCarryStep :: Int -> [Int] -> [Int]
+magCarryStep t xs = lowLimb t : magCarry xs (highLimb t)
+
+-- \`a\` must be at least \`b\`; every caller compares first. A limb difference is
+-- in [-2^15, 2^15), so one borrow always brings it back into range.
+magSub :: [Int] -> [Int] -> Int -> [Int]
+magSub a b w = case a of
+  [] -> []
+  (x : xs) -> case b of
+    [] -> magSubStep (x - w) xs []
+    (y : ys) -> magSubStep (x - y - w) xs ys
+
+magSubStep :: Int -> [Int] -> [Int] -> [Int]
+magSubStep t xs ys = if t < 0 then (t + 32768) : magSub xs ys 1 else t : magSub xs ys 0
+
+magMul :: [Int] -> [Int] -> [Int]
+magMul a b = case b of
+  [] -> []
+  (y : ys) -> magAdd (magMulLimb a y 0) (magShift (magMul a ys)) 0
+
+-- Multiply by one limb. An empty magnitude stays empty, so the shift never
+-- introduces the trailing zero limb the representation forbids.
+magShift :: [Int] -> [Int]
+magShift ds = if nullList ds then [] else 0 : ds
+
+magMulLimb :: [Int] -> Int -> Int -> [Int]
+magMulLimb ds y c = case ds of
+  [] -> if c == 0 then [] else c : []
+  (x : xs) -> magMulLimbStep (x * y + c) xs y
+
+magMulLimbStep :: Int -> [Int] -> Int -> [Int]
+magMulLimbStep t xs y = lowLimb t : magMulLimb xs y (highLimb t)
+
+-- Quotient and remainder by a small positive divisor, as long division does it
+-- on paper: the recursion reaches the most significant limb first and the
+-- remainder flows back down. \`r * 32768 + limb\` must stay exact, which caps
+-- the divisor at 2^16.
+magDivSmall :: [Int] -> Int -> ([Int], Int)
+magDivSmall ds n = case ds of
+  [] -> ([], 0)
+  (x : xs) -> magDivStep (magDivSmall xs n) x n
+
+magDivStep :: ([Int], Int) -> Int -> Int -> ([Int], Int)
+magDivStep qr x n = case qr of
+  (qs, r) -> magDivJoin (r * 32768 + x) qs n
+
+magDivJoin :: Int -> [Int] -> Int -> ([Int], Int)
+magDivJoin cur qs n = (quotSmall cur n : qs, remSmall cur n)
+
+-- Repeated division by 10^4 - the largest power of ten for which
+-- \`r * 32768 + limb\` still fits in 31 bits. Every group but the leading one
+-- is zero-padded, which is what makes the concatenation the decimal number.
+magDecimal :: [Int] -> [Char]
+magDecimal ds = case magDivSmall ds 10000 of
+  (qs, r) -> magDecimalStep (magNorm qs) r
+
+magDecimalStep :: [Int] -> Int -> [Char]
+magDecimalStep qs r = if nullList qs then showInt r else magDecimal qs ++ pad4 (showInt r)
+
+pad4 :: [Char] -> [Char]
+pad4 s = replicate (4 - length s) '0' ++ s
+
+bigZero :: Big
+bigZero = Big False []
+
+-- The one place a \`Big\` is built: normalising here is what keeps zero
+-- unsigned and magnitudes unique.
+bigOf :: Bool -> [Int] -> Big
+bigOf neg ds = case magNorm ds of
+  m -> if nullList m then bigZero else Big neg m
+
+bigAdd :: Big -> Big -> Big
+bigAdd (Big na a) (Big nb b) = if na == nb then bigOf na (magAdd a b 0) else bigAddSub (magCmp a b) na a b
+
+-- Opposite signs: the larger magnitude keeps its sign and the smaller is
+-- subtracted from it.
+bigAddSub :: Int -> Bool -> [Int] -> [Int] -> Big
+bigAddSub c na a b =
+  if c == 0 then bigZero else if c > 0 then bigOf na (magSub a b 0) else bigOf (not na) (magSub b a 0)
+
+bigNeg :: Big -> Big
+bigNeg (Big n ds) = if nullList ds then bigZero else Big (not n) ds
+
+bigSub :: Big -> Big -> Big
+bigSub x y = bigAdd x (bigNeg y)
+
+bigMul :: Big -> Big -> Big
+bigMul (Big na a) (Big nb b) = bigOf (if na then not nb else nb) (magMul a b)
+
+bigCmp :: Big -> Big -> Int
+bigCmp (Big na a) (Big nb b) =
+  if na then (if nb then magCmp b a else negate 1) else (if nb then 1 else magCmp a b)
+
+bigEq :: Big -> Big -> Bool
+bigEq x y = bigCmp x y == 0
+
+bigLt :: Big -> Big -> Bool
+bigLt x y = bigCmp x y < 0
+
+bigLe :: Big -> Big -> Bool
+bigLe x y = bigCmp x y <= 0
+
+bigGt :: Big -> Big -> Bool
+bigGt x y = bigCmp x y > 0
+
+bigGe :: Big -> Big -> Bool
+bigGe x y = bigCmp x y >= 0
+
+bigIsNeg :: Big -> Bool
+bigIsNeg (Big n ds) = n
+
+bigShow :: Big -> [Char]
+bigShow (Big neg ds) = if neg then '-' : magDecimal ds else magDecimal ds
+
 -- GHC's \`integerToInt#\` keeps the low bits of a machine word, and the machine
--- word on this backend is 32 bits wide (see \`Literal\` in src/stg.ts).
-foreign import javascript unsafe "((b) => Number(BigInt.asIntN(32, b)))" primIntegerToInt :: JSValPrim -> IntPrim
--- \`Math.trunc\` first: \`BigInt\` refuses a Number with a fractional part
--- outright, where \`truncate\`/\`round\` have already decided which whole number
--- they mean.
-foreign import javascript unsafe "((d) => BigInt(Math.trunc(d)))" primIntegerFromDouble :: DoublePrim -> JSValPrim
-foreign import javascript unsafe "((b) => Number(b))" primIntegerToDouble :: JSValPrim -> DoublePrim
-foreign import javascript unsafe "((a,b) => a + b)" primBigIntAdd :: JSValPrim -> JSValPrim -> JSValPrim
-foreign import javascript unsafe "((a,b) => a - b)" primBigIntSub :: JSValPrim -> JSValPrim -> JSValPrim
-foreign import javascript unsafe "((a,b) => a * b)" primBigIntMul :: JSValPrim -> JSValPrim -> JSValPrim
-foreign import javascript unsafe "((b) => -b)" primBigIntNeg :: JSValPrim -> JSValPrim
-foreign import javascript unsafe "((a,b) => a === b)" primBigIntEq :: JSValPrim -> JSValPrim -> Bool
-foreign import javascript unsafe "((a,b) => a < b)" primBigIntLt :: JSValPrim -> JSValPrim -> Bool
-foreign import javascript unsafe "((a,b) => a <= b)" primBigIntLe :: JSValPrim -> JSValPrim -> Bool
-foreign import javascript unsafe "((a,b) => a > b)" primBigIntGt :: JSValPrim -> JSValPrim -> Bool
-foreign import javascript unsafe "((a,b) => a >= b)" primBigIntGe :: JSValPrim -> JSValPrim -> Bool
-foreign import javascript unsafe "((b) => b < 0n)" primBigIntIsNeg :: JSValPrim -> Bool
-foreign import javascript unsafe "((b) => b.toString())" primBigIntShow :: JSValPrim -> JSStringPrim
-foreign import javascript unsafe "((b) => BigInt.asIntN(64, b))" primNarrow64 :: JSValPrim -> JSValPrim
-foreign import javascript unsafe "((b) => BigInt.asUintN(64, b))" primMask64 :: JSValPrim -> JSValPrim
+-- word on this backend is 32 bits wide (see \`Literal\` in src/stg.ts). \`Int\`
+-- arithmetic IS that truncation - \`primIntAdd\` is \`(a+b)|0\` and \`primIntMul\`
+-- is \`Math.imul\` - so the Horner sum below discards everything above bit 31 by
+-- itself, and negating it is the two's complement of the low word.
+bigToIntPrim :: Big -> IntPrim
+bigToIntPrim (Big neg ds) = unInt (if neg then negate (magLow32 ds) else magLow32 ds)
+
+magLow32 :: [Int] -> Int
+magLow32 ds = case ds of
+  [] -> 0
+  (x : xs) -> x + 32768 * magLow32 xs
+
+-- Most significant limb first, so each step rounds once and everything below
+-- 2^53 - which is every value a \`Double\` holds exactly anyway - is exact.
+bigToDoublePrim :: Big -> DoublePrim
+bigToDoublePrim (Big neg ds) = if neg then primDoubleNeg (magToDouble ds) else magToDouble ds
+
+magToDouble :: [Int] -> DoublePrim
+magToDouble ds = case ds of
+  [] -> 0.0
+  (x : xs) -> primDoubleAdd (primDoubleMul (magToDouble xs) 32768.0) (intToDoublePrim x)
+
+intToDoublePrim :: Int -> DoublePrim
+intToDoublePrim (I n) = primIntToDouble n
+
+-- \`d\` is whole by the time it arrives, so \`d % 32768\` and \`(d - r) / 32768\`
+-- are both exact: the divisor is a power of two and the remainder is below
+-- 2^15. That is what carries a \`Double\` as large as 1e308 across without
+-- losing a bit it actually held.
+bigFromDoublePrim :: DoublePrim -> Big
+bigFromDoublePrim d =
+  if primDoubleLt d 0.0 then bigOf True (magFromDouble (primDoubleNeg d)) else bigOf False (magFromDouble d)
+
+magFromDouble :: DoublePrim -> [Int]
+magFromDouble d = if primDoubleLt d 1.0 then [] else magFromDoubleStep (primDoubleRem d 32768.0) d
+
+magFromDoubleStep :: DoublePrim -> DoublePrim -> [Int]
+magFromDoubleStep r d =
+  I (primDoubleToInt r) : magFromDouble (primDoubleDiv (primDoubleSub d r) 32768.0)
+
+-- 2^64 and 2^63 as magnitudes: 64 = 4 * 15 + 4, so both are four zero limbs
+-- and one small top limb.
+pow64 :: [Int]
+pow64 = 0 : 0 : 0 : 0 : 16 : []
+
+pow63 :: [Int]
+pow63 = 0 : 0 : 0 : 0 : 8 : []
+
+-- The low 64 bits of a magnitude: four whole limbs and the low four bits of
+-- the fifth.
+magLow64 :: [Int] -> Int -> [Int]
+magLow64 ds k = case ds of
+  [] -> []
+  (x : xs) -> if k > 0 then x : magLow64 xs (k - 1) else remSmall x 16 : []
+
+-- What \`BigInt.asUintN(64, b)\` was: the value modulo 2^64, so a negative one
+-- comes back as its two's complement.
+bigMask64 :: Big -> Big
+bigMask64 (Big neg ds) = bigMask64Of neg (magNorm (magLow64 ds 4))
+
+bigMask64Of :: Bool -> [Int] -> Big
+bigMask64Of neg m = if not neg then bigOf False m else if nullList m then bigZero else bigOf False (magSub pow64 m 0)
+
+-- And \`BigInt.asIntN(64, b)\`: the same value read as signed, so everything at
+-- or above 2^63 is 2^64 less than it looks.
+bigNarrow64 :: Big -> Big
+bigNarrow64 b = case bigMask64 b of
+  Big n m -> if magCmp m pow63 < 0 then bigOf False m else bigOf True (magSub pow64 m 0)
 
 -- What \`src/desugar.ts\` wraps a machine literal in when the \`fromInteger\` it
--- feeds is not one of the shapes \`overloadedLit\` short-cuts.
+-- feeds is not one of the shapes \`overloadedLit\` short-cuts. The literal
+-- arrives untouched (\`boxIntegerLit\`), so it is a JS number of any magnitude
+-- and not a 32-bit one: going through \`DoublePrim\` is what keeps
+-- \`4611686018427387904 :: Int64\` exact, where \`Int\` arithmetic would wrap it.
 integerFromIntPrim :: IntPrim -> Integer
-integerFromIntPrim n = Integer (primIntegerFromInt n)
+integerFromIntPrim n = Integer (bigFromDoublePrim (primIntToDouble n))
 
 integerFromDoublePrim :: DoublePrim -> Integer
-integerFromDoublePrim d = Integer (primIntegerFromDouble d)
+integerFromDoublePrim d = Integer (bigFromDoublePrim d)
+
+-- What \`Data.Int\`/\`Data.Word\` narrow to their own width. Taking the boxed
+-- \`Integer\` rather than its payload keeps every one of those instances
+-- independent of how a \`Big\` is laid out.
+integerToIntPrim :: Integer -> IntPrim
+integerToIntPrim (Integer b) = bigToIntPrim b
+
+integerToDoublePrim :: Integer -> DoublePrim
+integerToDoublePrim (Integer b) = bigToDoublePrim b
+
+integerIsNeg :: Integer -> Bool
+integerIsNeg (Integer b) = bigIsNeg b
 
 instance Eq Integer where
-  (==) (Integer a) (Integer b) = primBigIntEq a b
+  (==) (Integer a) (Integer b) = bigEq a b
 
 instance Ord Integer where
-  (<) (Integer a) (Integer b) = primBigIntLt a b
-  (<=) (Integer a) (Integer b) = primBigIntLe a b
-  (>) (Integer a) (Integer b) = primBigIntGt a b
-  (>=) (Integer a) (Integer b) = primBigIntGe a b
+  (<) (Integer a) (Integer b) = bigLt a b
+  (<=) (Integer a) (Integer b) = bigLe a b
+  (>) (Integer a) (Integer b) = bigGt a b
+  (>=) (Integer a) (Integer b) = bigGe a b
 
 instance Num Integer where
-  (+) (Integer a) (Integer b) = Integer (primBigIntAdd a b)
-  (-) (Integer a) (Integer b) = Integer (primBigIntSub a b)
-  (*) (Integer a) (Integer b) = Integer (primBigIntMul a b)
-  negate (Integer a) = Integer (primBigIntNeg a)
+  (+) (Integer a) (Integer b) = Integer (bigAdd a b)
+  (-) (Integer a) (Integer b) = Integer (bigSub a b)
+  (*) (Integer a) (Integer b) = Integer (bigMul a b)
+  negate (Integer a) = Integer (bigNeg a)
   fromInteger n = n
 
 instance Real Integer where
-  toDoublePrim (Integer b) = primIntegerToDouble b
+  toDoublePrim (Integer b) = bigToDoublePrim b
 
 instance Integral Integer where
   toInteger n = n
@@ -943,28 +1191,28 @@ instance Show Integer where
 
 -- A negative number is parenthesised at any precedence above 6, exactly as
 -- \`showSignedInt\` does it for \`Int\`.
-showsBigInt :: Int -> JSValPrim -> [Char] -> [Char]
+showsBigInt :: Int -> Big -> [Char] -> [Char]
 showsBigInt d b s =
-  if primBigIntIsNeg b && d > 6 then '(' : jsAscii (primBigIntShow b) ++ (')' : s) else jsAscii (primBigIntShow b) ++ s
+  if bigIsNeg b && d > 6 then '(' : bigShow b ++ (')' : s) else bigShow b ++ s
 
 instance Eq Int64 where
-  (==) (I64 a) (I64 b) = primBigIntEq a b
+  (==) (I64 a) (I64 b) = bigEq a b
 
 instance Ord Int64 where
-  (<) (I64 a) (I64 b) = primBigIntLt a b
-  (<=) (I64 a) (I64 b) = primBigIntLe a b
-  (>) (I64 a) (I64 b) = primBigIntGt a b
-  (>=) (I64 a) (I64 b) = primBigIntGe a b
+  (<) (I64 a) (I64 b) = bigLt a b
+  (<=) (I64 a) (I64 b) = bigLe a b
+  (>) (I64 a) (I64 b) = bigGt a b
+  (>=) (I64 a) (I64 b) = bigGe a b
 
 instance Num Int64 where
-  (+) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntAdd a b))
-  (-) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntSub a b))
-  (*) (I64 a) (I64 b) = I64 (primNarrow64 (primBigIntMul a b))
-  negate (I64 a) = I64 (primNarrow64 (primBigIntNeg a))
-  fromInteger (Integer b) = I64 (primNarrow64 b)
+  (+) (I64 a) (I64 b) = I64 (bigNarrow64 (bigAdd a b))
+  (-) (I64 a) (I64 b) = I64 (bigNarrow64 (bigSub a b))
+  (*) (I64 a) (I64 b) = I64 (bigNarrow64 (bigMul a b))
+  negate (I64 a) = I64 (bigNarrow64 (bigNeg a))
+  fromInteger (Integer b) = I64 (bigNarrow64 b)
 
 instance Real Int64 where
-  toDoublePrim (I64 b) = primIntegerToDouble b
+  toDoublePrim (I64 b) = bigToDoublePrim b
 
 instance Integral Int64 where
   toInteger (I64 b) = Integer b
@@ -973,23 +1221,23 @@ instance Show Int64 where
   showsPrec d (I64 b) s = showsBigInt d b s
 
 instance Eq Word64 where
-  (==) (W64 a) (W64 b) = primBigIntEq a b
+  (==) (W64 a) (W64 b) = bigEq a b
 
 instance Ord Word64 where
-  (<) (W64 a) (W64 b) = primBigIntLt a b
-  (<=) (W64 a) (W64 b) = primBigIntLe a b
-  (>) (W64 a) (W64 b) = primBigIntGt a b
-  (>=) (W64 a) (W64 b) = primBigIntGe a b
+  (<) (W64 a) (W64 b) = bigLt a b
+  (<=) (W64 a) (W64 b) = bigLe a b
+  (>) (W64 a) (W64 b) = bigGt a b
+  (>=) (W64 a) (W64 b) = bigGe a b
 
 instance Num Word64 where
-  (+) (W64 a) (W64 b) = W64 (primMask64 (primBigIntAdd a b))
-  (-) (W64 a) (W64 b) = W64 (primMask64 (primBigIntSub a b))
-  (*) (W64 a) (W64 b) = W64 (primMask64 (primBigIntMul a b))
-  negate (W64 a) = W64 (primMask64 (primBigIntNeg a))
-  fromInteger (Integer b) = W64 (primMask64 b)
+  (+) (W64 a) (W64 b) = W64 (bigMask64 (bigAdd a b))
+  (-) (W64 a) (W64 b) = W64 (bigMask64 (bigSub a b))
+  (*) (W64 a) (W64 b) = W64 (bigMask64 (bigMul a b))
+  negate (W64 a) = W64 (bigMask64 (bigNeg a))
+  fromInteger (Integer b) = W64 (bigMask64 b)
 
 instance Real Word64 where
-  toDoublePrim (W64 b) = primIntegerToDouble b
+  toDoublePrim (W64 b) = bigToDoublePrim b
 
 instance Integral Word64 where
   toInteger (W64 b) = Integer b
@@ -997,7 +1245,7 @@ instance Integral Word64 where
 -- A \`Word64\` is masked to [0, 2^64), so it never prints a sign and never needs
 -- the parentheses \`Int64\` does.
 instance Show Word64 where
-  showsPrec d (W64 b) s = jsAscii (primBigIntShow b) ++ s
+  showsPrec d (W64 b) s = bigShow b ++ s
 
 -- ---------------------------------------------------------------- numeric ---
 
@@ -1564,14 +1812,47 @@ data StaticPtr a = StaticPtr StaticKey a
 -- What \`src/parser.ts\` builds each \`static\` form's key out of: the two halves
 -- of one \`Word64\`, as \`md5\` hands them over.
 word64FromHalves :: IntPrim -> IntPrim -> Word64
-word64FromHalves hi lo = W64 (primWord64FromHalves hi lo)
+word64FromHalves hi lo = W64 (bigFromHalves hi lo)
 
-foreign import javascript unsafe "((hi,lo) => (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0))" primWord64FromHalves :: IntPrim -> IntPrim -> JSValPrim
+-- 2^32 is 4 * 2^30, so the high half lands two limbs up shifted left by two
+-- bits: its low 13 bits finish limb 2 (3 + 8191 * 4 is 32767, exactly one
+-- limb, so no carry), the next 15 are limb 3 and the top 4 are limb 4.
+bigFromHalves :: IntPrim -> IntPrim -> Big
+bigFromHalves hi lo = bigFromHalvesUnsigned (I (primUnsigned32 hi)) (I (primUnsigned32 lo))
+
+bigFromHalvesUnsigned :: Int -> Int -> Big
+bigFromHalvesUnsigned hi lo =
+  bigOf False (remSmall lo 32768 : remSmall (quotSmall lo 32768) 32768 : quotSmall lo 1073741824 + 4 * remSmall hi 8192 : remSmall (quotSmall hi 8192) 32768 : quotSmall hi 268435456 : [])
+
 -- Unsigned, because that is what \`h$hs_spt_insert\` was given when the key was
--- four \`Int\`s and what the table's keys are still compared as.
-foreign import javascript unsafe "((b) => Number(BigInt.asUintN(32, b >> 32n)))" primWord64Hi :: JSValPrim -> IntPrim
-foreign import javascript unsafe "((b) => Number(BigInt.asUintN(32, b)))" primWord64Lo :: JSValPrim -> IntPrim
-foreign import javascript unsafe "((b) => b.toString(16).padStart(16, '0'))" primWord64Hex :: JSValPrim -> JSStringPrim
+-- four \`Int\`s and what the table's keys are still compared as. The magnitude
+-- arithmetic that produces each half is 32-bit \`Int\` arithmetic, so the value
+-- arrives with bit 31 read as a sign; \`>>> 0\` is the one thing JS has that
+-- reads it back as the unsigned word it is.
+foreign import javascript unsafe "((n) => n >>> 0)" primUnsigned32 :: IntPrim -> IntPrim
+
+bigLo32 :: Big -> IntPrim
+bigLo32 (Big neg ds) = primUnsigned32 (unInt (magLow32 ds))
+
+-- Bits 32 and up: drop the two whole limbs below bit 30, then divide the rest
+-- by 4. A \`Word64\` is below 2^64, so what is left IS the high word.
+bigHi32 :: Big -> IntPrim
+bigHi32 (Big neg ds) = primUnsigned32 (unInt (magLow32 (fst (magDivSmall (drop 2 ds) 4))))
+
+-- Sixteen hex digits, zero-padded, which is what \`b.toString(16)\` padded to
+-- 16 was: the value is masked to 64 bits, so sixteen digits is exactly it.
+bigHex16 :: Big -> [Char]
+bigHex16 (Big neg ds) = hexDigits ds 16 []
+
+hexDigits :: [Int] -> Int -> [Char] -> [Char]
+hexDigits ds n acc = if n == 0 then acc else hexDigitsStep (magDivSmall ds 16) n acc
+
+hexDigitsStep :: ([Int], Int) -> Int -> [Char] -> [Char]
+hexDigitsStep qr n acc = case qr of
+  (qs, r) -> hexDigits (magNorm qs) (n - 1) (hexDigitChar r : acc)
+
+hexDigitChar :: Int -> Char
+hexDigitChar (I n) = C (primChr (if primIntLt n 10 then primIntAdd n 48 else primIntAdd n 87))
 
 deRefStaticPtr :: StaticPtr a -> a
 deRefStaticPtr p = case p of
@@ -1596,7 +1877,7 @@ showFingerprint :: Fingerprint -> [Char]
 showFingerprint (Fingerprint a b) = hex16 a ++ hex16 b
 
 hex16 :: Word64 -> [Char]
-hex16 (W64 b) = jsAscii (primWord64Hex b)
+hex16 (W64 b) = bigHex16 b
 
 -- The static pointer table is the RTS's (rts/js/staticpointer.js), not a
 -- Haskell \`Map\`: \`unsafeLookupStaticPtr\` has to find an entry that a *different*
@@ -1616,7 +1897,7 @@ sptRegisterStep :: RealWorld -> StaticPtr a -> IOResult ()
 sptRegisterStep s p = case p of
   StaticPtr k v -> case k of
     Fingerprint (W64 a) (W64 b) ->
-      case primSptInsert (primWord64Hi a) (primWord64Lo a) (primWord64Hi b) (primWord64Lo b) p of
+      case primSptInsert (bigHi32 a) (bigLo32 a) (bigHi32 b) (bigLo32 b) p of
         _ -> IOResult s ()
 
 -- What \`src/elaborate.ts\` puts in front of \`main\`. It is a plain function and
@@ -1629,17 +1910,23 @@ sptRegisterThenStep :: RealWorld -> StaticPtr a -> IO b -> IOResult b
 sptRegisterThenStep s p m = case sptRegisterStep s p of
   IOResult t u -> unIO m t
 
+-- The halves are split at the primop calls themselves, and not passed down as
+-- four \`IntPrim\`s: a machine value in a *Haskell* function's argument is not a
+-- strict position, so \`sptLookup (bigHi32 x) ..\` would hand over four THUNKS
+-- where the table wants four numbers - and the table would key on them. A
+-- primop's argument is strict, so each split below is evaluated where it
+-- stands. (This is the same rule the constructor fields in \`Data.Int\` follow.)
 unsafeLookupStaticPtr :: StaticKey -> IO (Maybe (StaticPtr a))
 unsafeLookupStaticPtr k = case k of
-  Fingerprint (W64 x) (W64 y) ->
-    sptLookup (primWord64Hi x) (primWord64Lo x) (primWord64Hi y) (primWord64Lo y)
+  Fingerprint (W64 x) (W64 y) -> sptLookup x y
 
-sptLookup :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> IO (Maybe (StaticPtr a))
-sptLookup a b c d = if primIntEq (primSptHas a b c d) 0 then pure Nothing else sptFetch a b c d
+sptLookup :: Big -> Big -> IO (Maybe (StaticPtr a))
+sptLookup x y =
+  if primIntEq (primSptHas (bigHi32 x) (bigLo32 x) (bigHi32 y) (bigLo32 y)) 0 then pure Nothing else sptFetch x y
 
 -- Split from the test above because the miss returns \`null\`, and \`null\` in a
 -- position something may enter is not a value - it is the crash one step later.
-sptFetch :: IntPrim -> IntPrim -> IntPrim -> IntPrim -> IO (Maybe (StaticPtr a))
-sptFetch a b c d = case primSptGet a b c d of
+sptFetch :: Big -> Big -> IO (Maybe (StaticPtr a))
+sptFetch x y = case primSptGet (bigHi32 x) (bigLo32 x) (bigHi32 y) (bigLo32 y) of
   p -> pure (Just p)
 `;

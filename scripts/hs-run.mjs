@@ -139,6 +139,21 @@ function compile(sources, file) {
   };
 }
 
+/** Native `BigInt` syntax in the emitted module.
+ *
+ * The target engine is PrimJS, which has no BigInt at all: it refuses to
+ * decode a packed bundle that contains a `32n` literal ("RangeError: BigInt is
+ * too large to allocate"), and miso's own JS installs JSBI as
+ * `globalThis.BigInt`, whose objects throw the moment they meet one. GHC emits
+ * no BigInt either - `Integer` is ghc-bignum over 32-bit limbs.
+ *
+ * This is checked on every program because it is invisible in an answer: a
+ * `BigInt` carrier gives the RIGHT answer under node and cannot be loaded at
+ * all on the device, which is how it got in the first time. Only the emitted
+ * module is scanned; the RTS is GHC's own `rts/js/arith.js`, byte for byte,
+ * and its 64-bit quot/rem helpers are BigInt in GHC's linked output too. */
+const nativeBigInt = (js) => js.match(/\bBigInt\b|(?<![\w$.])\d[\d_]*n\b/);
+
 /** `probe` is a JS expression read *after* the program has run, which is the
  * only way to observe an `IO ()`: its value carries nothing, so the proof that
  * it ran has to come from the effect it had. Property order in the object
@@ -2628,11 +2643,11 @@ const programs = [
     expect: 63,
   },
   {
-    // `Integer` is GHC's arbitrary-precision integer, and here it is a JS
-    // `BigInt` behind `data Integer = Integer JSValPrim` - the move
-    // `Data.ByteString` makes for a `Uint8Array`. What that buys is exactness
-    // at every width: 2^60 + 1 is a value a JS *number* cannot hold, and 2^200
-    // is one no 64-bit carrier could. `round`/`truncate` land here too, since
+    // `Integer` is GHC's arbitrary-precision integer, and here it is a bignum
+    // in Haskell - sign plus base-2^15 limbs - because the target engine has no
+    // `BigInt` and GHC emits none either. What that buys is exactness at every
+    // width: 2^60 + 1 is a value a JS *number* cannot hold, and 2^200 is one no
+    // 64-bit carrier could. `round`/`truncate` land here too, since
     // they now decide on a `Double` and convert once at the end instead of
     // truncating through a 32-bit `Int` on the way out.
     name: "Integer is arbitrary precision, not a JS number",
@@ -2659,8 +2674,8 @@ const programs = [
     expect: 255,
   },
   {
-    // `Int64`/`Word64` ride the same `BigInt` carrier and differ only in the
-    // wrap after every operation - `BigInt.asIntN` / `asUintN` at 64 bits. So
+    // `Int64`/`Word64` ride the same bignum carrier and differ only in the
+    // wrap after every operation - signed or unsigned, at 64 bits. So
     // they hold every value GHC's do and overflow where GHC's do: maxBound + 1
     // is minBound, 2^64 as a `Word64` is 0, and 2^62 + 1 - 2^62 is 1 rather
     // than 0, which is what a JS number would have made it.
@@ -2743,6 +2758,66 @@ const programs = [
       "",
     ].join("\n"),
     expect: 7,
+  },
+  {
+    // The carrier, not the answers. Every case above proves the arithmetic and
+    // would have kept passing on a `BigInt` carrier - which is exactly how one
+    // reached a device that cannot load it. `nativeBigInt` scans the emitted
+    // JS of every program in this file, and this one is the program that names
+    // all four types that ever held a `BigInt`, so the scan has them to see.
+    //
+    // Only powers of two appear as literals: a source literal is a JS number
+    // by the time the lexer is done with it, so 2^62 is exact and
+    // 9223372036854775807 would not have been.
+    name: "Integer, Int64, Word64 and Fingerprint emit no native BigInt",
+    source: [
+      "module Main where",
+      "import Data.Int (Int64)",
+      "import Data.Word (Word64)",
+      "import GHC.Natural (naturalFromInteger)",
+      "import GHC.Fingerprint (Fingerprint(Fingerprint))",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if show (2 * 4611686018427387904 :: Integer) == \"9223372036854775808\" then 1 else 0",
+      "  , if show (2 * 4611686018427387904 :: Int64) == \"-9223372036854775808\" then 2 else 0",
+      "  , if show (2 * 4611686018427387904 :: Word64) == \"9223372036854775808\" then 4 else 0",
+      "  , if (4 * 4611686018427387904 :: Word64) == 0 then 8 else 0",
+      "  , if show (naturalFromInteger 4611686018427387904) == \"4611686018427387904\" then 16 else 0",
+      "  , if show (Fingerprint 255 4294967296) == \"00000000000000ff0000000100000000\" then 32 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 63,
+  },
+  {
+    // `Data.Char` classifies through the RTS's own Unicode tables
+    // (`rts/js/unicode.js`), which are GHC's. Nothing else in this file calls
+    // one, and the regexes they replaced - `/\p{Lu}/u` and six siblings - were
+    // right under node and a SyntaxError in the bundler, so a gate that never
+    // packs cannot tell the two apart by any answer. This one at least proves
+    // the tables are linked, reached, and say what GHC says.
+    //
+    // `isPunctuation '+'` is False on purpose: the old `\p{P}|\p{S}` called
+    // every symbol punctuation too, and GHC keeps those apart.
+    name: "Data.Char classifies by GHC's Unicode tables, not a regex",
+    source: [
+      "module Main where",
+      "import Data.Char (isUpper, isLower, isAlpha, isAlphaNum, isSpace, isPunctuation, isControl, toLower, toUpper)",
+      "",
+      "main :: IO Int",
+      "main = pure (sum",
+      "  [ if isAlpha '\\233' && isLower '\\233' then 1 else 0",
+      "  , if isUpper '\\201' && not (isLower '\\201') then 2 else 0",
+      "  , if toLower '\\201' == '\\233' && toUpper '\\233' == '\\201' then 4 else 0",
+      "  , if isAlphaNum '\\1635' && not (isAlpha '\\1635') then 8 else 0",
+      "  , if isPunctuation '-' && not (isPunctuation '+') then 16 else 0",
+      "  , if isSpace '\\8195' && not (isSpace 'a') then 32 else 0",
+      "  , if isControl '\\7' && not (isControl 'a') then 64 else 0",
+      "  ])",
+      "",
+    ].join("\n"),
+    expect: 127,
   },
   {
     // A rank-2 argument, which is miso's `Miso.Lens.fromVL`. `VL` is used at
@@ -3611,6 +3686,12 @@ for (const program of cases) {
   }
   for (const d of compiled.diagnostics) console.log(`        ${formatDiagnostic(d)}`);
   if (show) console.log(`--- ${program.name} (${compiled.symbol}) ---\n${compiled.emitted}\n`);
+  const bigint = nativeBigInt(compiled.emitted);
+  if (bigint) {
+    console.log(`  FAIL  ${program.name}: emitted native BigInt syntax \`${bigint[0]}\`, which the target engine cannot load`);
+    failures++;
+    continue;
+  }
   try {
     const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded, compiled.wrapped);
     if (program.throws !== undefined) {

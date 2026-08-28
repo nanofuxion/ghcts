@@ -726,32 +726,36 @@ remInt :: Int -> Int -> Int
 remInt (I a) (I b) = I (primIntRem a b)
 `,
   // GHC's \`Natural\` is \`ghc-bignum\`'s own arbitrary-precision unsigned
-  // integer. Here it rides the same \`BigInt\` carrier \`Integer\` does, and stays
-  // a DISTINCT type for the reason \`Data.ByteString\` gives: the two hold
-  // different value sets. A \`Natural\` is never negative, and
+  // integer. Here it holds an \`Integer\` and stays a DISTINCT type for the
+  // reason \`Data.ByteString\` gives: the two hold different value sets. A
+  // \`Natural\` is never negative, and
   // \`naturalFromInteger\` is the one place that is enforced - as it is in GHC.
   "GHC.Natural": `module GHC.Natural (Natural, naturalToInteger, naturalFromInteger) where
 
-data Natural = Natural JSValPrim
+-- The box holds the \\\`Integer\\\` itself rather than its payload, so nothing here
+-- depends on how a bignum is laid out.
+data Natural = Natural Integer
 
 naturalToInteger :: Natural -> Integer
-naturalToInteger (Natural b) = Integer b
+naturalToInteger (Natural n) = n
 
 naturalFromInteger :: Integer -> Natural
-naturalFromInteger (Integer b) =
-  if primBigIntIsNeg b then error "naturalFromInteger: negative" else Natural b
+naturalFromInteger n =
+  if integerIsNeg n then error "naturalFromInteger: negative" else Natural n
 
 instance Eq Natural where
-  (==) (Natural a) (Natural b) = primBigIntEq a b
+  (==) (Natural a) (Natural b) = a == b
 
 instance Ord Natural where
-  (<) (Natural a) (Natural b) = primBigIntLt a b
-  (<=) (Natural a) (Natural b) = primBigIntLe a b
-  (>) (Natural a) (Natural b) = primBigIntGt a b
-  (>=) (Natural a) (Natural b) = primBigIntGe a b
+  (<) (Natural a) (Natural b) = a < b
+  (<=) (Natural a) (Natural b) = a <= b
+  (>) (Natural a) (Natural b) = a > b
+  (>=) (Natural a) (Natural b) = a >= b
 
+-- A \\\`Natural\\\` is never negative, so it never needs the parentheses
+-- \\\`showsPrec\\\` at \\\`Integer\\\` would add.
 instance Show Natural where
-  showsPrec d (Natural b) s = jsAscii (primBigIntShow b) ++ s
+  showsPrec d (Natural n) s = showsPrec 0 n s
 `,
   // \`Ix\` is a class in GHC; every use miso makes of it is \`inRange\` on a pair
   // of \`Char\`s or \`Int\`s, so the class is the one method those two need.
@@ -1167,20 +1171,37 @@ lazyTextFromJSString s = s
 `,
   "Data.Char": `module Data.Char where
 
--- Classification is JavaScript's, because JavaScript's regular expressions
--- carry the same Unicode general categories GHC's \\\`Data.Char\\\` is defined in
--- terms of. The ASCII-only predicates (\\\`isDigit\\\`, \\\`isHexDigit\\\`, \\\`isOctDigit\\\`)
--- are spelled out rather than using \\\\d, which in a Unicode regex is wider than
--- GHC's.
-foreign import javascript unsafe "((c) => /\\\\p{Lu}|\\\\p{Lt}/u.test(String.fromCodePoint(c)))" jsIsUpper :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{Ll}/u.test(String.fromCodePoint(c)))" jsIsLower :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{L}/u.test(String.fromCodePoint(c)))" jsIsAlpha :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{L}|\\\\p{Nd}|\\\\p{Nl}|\\\\p{No}/u.test(String.fromCodePoint(c)))" jsIsAlphaNum :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{Cc}/u.test(String.fromCodePoint(c)))" jsIsControl :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{P}|\\\\p{S}/u.test(String.fromCodePoint(c)))" jsIsPunctuation :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => /\\\\p{Zs}/u.test(String.fromCodePoint(c)))" jsIsUnicodeSpace :: CharPrim -> Bool
-foreign import javascript unsafe "((c) => String.fromCodePoint(c).toLowerCase().codePointAt(0))" jsToLower :: CharPrim -> CharPrim
-foreign import javascript unsafe "((c) => String.fromCodePoint(c).toUpperCase().codePointAt(0))" jsToUpper :: CharPrim -> CharPrim
+-- Classification is the RTS's, which is GHC's own: \\\`rts/js/unicode.js\\\` carries
+-- the generated Unicode tables \\\`Data.Char\\\` is defined in terms of, and
+-- ghc-internal's \\\`GHC.Internal.Unicode\\\` calls exactly these functions -
+-- \\\`h$u_iswupper\\\` IS \\\`u_iswupper\\\` from GHC's cbits/WCsubst.c, so \\\`isUpper\\\`
+-- here is \\\`Lu\\\` or \\\`Lt\\\` because that is what GHC's is.
+--
+-- It used to be JavaScript's \\\`/\\\\p{Lu}/u\\\`, which is the same general category
+-- on a full engine and is not available at all on this one: rspeedy's bytecode
+-- step rejects a unicode property escape outright ("invalid escape sequence in
+-- regular expression"), so a bundle containing one never packs. GHC's own
+-- \\\`all.js\\\` contains no \\\`\\\\p{\\\` either, for the same reason it needs none.
+--
+-- The ASCII-only predicates (\\\`isDigit\\\`, \\\`isHexDigit\\\`, \\\`isOctDigit\\\`) stay
+-- spelled out, because GHC's are ASCII-only too.
+foreign import javascript unsafe "((c) => h$u_iswupper(c) !== 0)" jsIsUpper :: CharPrim -> Bool
+foreign import javascript unsafe "((c) => h$u_iswlower(c) !== 0)" jsIsLower :: CharPrim -> Bool
+foreign import javascript unsafe "((c) => h$u_iswalpha(c) !== 0)" jsIsAlpha :: CharPrim -> Bool
+foreign import javascript unsafe "((c) => h$u_iswalnum(c) !== 0)" jsIsAlphaNum :: CharPrim -> Bool
+foreign import javascript unsafe "((c) => h$u_iswcntrl(c) !== 0)" jsIsControl :: CharPrim -> Bool
+-- \\\`h$u_gencat\\\` returns the \\\`GeneralCategory\\\` constructor's own index, so
+-- these two are the ranges GHC's \\\`isPunctuation\\\` and \\\`isSeparator\\\` name:
+-- Connector..Other punctuation is 11 to 17, and \\\`Space\\\` (Zs) is 22. The regex
+-- this replaces was \\\`\\\\p{P}|\\\\p{S}\\\`, which also called every SYMBOL punctuation
+-- - GHC keeps those apart, and \\\`+\\\` is not punctuation to it.
+foreign import javascript unsafe "((c) => { const g = h$u_gencat(c); return g >= 11 && g <= 17; })" jsIsPunctuation :: CharPrim -> Bool
+foreign import javascript unsafe "((c) => h$u_gencat(c) === 22)" jsIsUnicodeSpace :: CharPrim -> Bool
+-- GHC's simple case mappings, one code point to one code point.
+-- \\\`String.prototype.toLowerCase\\\` is a FULL mapping: it can hand back two code
+-- points (\\\`'İ'\\\`), of which \\\`codePointAt(0)\\\` silently kept the first.
+foreign import javascript unsafe "((c) => h$u_towlower(c))" jsToLower :: CharPrim -> CharPrim
+foreign import javascript unsafe "((c) => h$u_towupper(c))" jsToUpper :: CharPrim -> CharPrim
 
 isUpper :: Char -> Bool
 isUpper (C c) = jsIsUpper c
@@ -1808,9 +1829,9 @@ import Foreign.StablePtr
   // Every intermediate stays inside 32 bits (two 16-bit factors reach 2^30),
   // so nothing here rounds.
   //
-  // `Int64` is declared in `src/prelude.ts` - a JS `BigInt` behind
-  // `I64 JSValPrim`, wrapped with `BigInt.asIntN` after every operation -
-  // because `Fingerprint` is two `Word64` halves and `Fingerprint` is wired in.
+  // `Int64` is declared in `src/prelude.ts` - a Haskell bignum behind
+  // `I64 Big`, narrowed to 64 bits after every operation - because
+  // `Fingerprint` is two `Word64` halves and `Fingerprint` is wired in.
   // This module is the one that names it, as `GHC.StaticPtr` names `StaticKey`.
   "Data.Int": `module Data.Int (Int8, Int16, Int32, Int64) where
 
@@ -1850,8 +1871,9 @@ instance Num Int8 where
     n -> I8 n
   negate (I8 a) = case narrow8 (primIntNeg a) of
     n -> I8 n
-  fromInteger (Integer b) = case narrow8 (primIntegerToInt b) of
-    m -> I8 m
+  fromInteger n = case integerToIntPrim n of
+    m -> case narrow8 m of
+      k -> I8 k
 
 instance Real Int8 where
   toDoublePrim (I8 a) = primIntToDouble a
@@ -1877,8 +1899,9 @@ instance Num Int16 where
     n -> I16 n
   negate (I16 a) = case narrow16 (primIntNeg a) of
     n -> I16 n
-  fromInteger (Integer b) = case narrow16 (primIntegerToInt b) of
-    m -> I16 m
+  fromInteger n = case integerToIntPrim n of
+    m -> case narrow16 m of
+      k -> I16 k
 
 instance Real Int16 where
   toDoublePrim (I16 a) = primIntToDouble a
@@ -1900,7 +1923,7 @@ instance Num Int32 where
   (-) (I32 a) (I32 b) = I32 (primIntSub a b)
   (*) (I32 a) (I32 b) = I32 (primIntMul a b)
   negate (I32 a) = I32 (primIntNeg a)
-  fromInteger (Integer b) = I32 (primIntegerToInt b)
+  fromInteger n = case integerToIntPrim n of m -> I32 m
 
 instance Real Int32 where
   toDoublePrim (I32 a) = primIntToDouble a
@@ -1942,7 +1965,7 @@ instance Num Word where
   (-) (W a) (W b) = W (primWordSub a b)
   (*) (W a) (W b) = W (primWordMul a b)
   negate (W a) = W (primWordSub (primIntToWord 0) a)
-  fromInteger (Integer b) = W (primIntToWord (primIntegerToInt b))
+  fromInteger n = W (primIntToWord (integerToIntPrim n))
 
 instance Real Word where
   toDoublePrim (W a) = primWordToDouble a
@@ -1965,7 +1988,7 @@ instance Num Word8 where
     n -> W8 n
   negate (W8 a) = case mask8 (primWordSub (primIntToWord 0) a) of
     n -> W8 n
-  fromInteger (Integer b) = case mask8 (primIntToWord (primIntegerToInt b)) of
+  fromInteger n = case mask8 (primIntToWord (integerToIntPrim n)) of
     m -> W8 m
 
 instance Real Word8 where
@@ -1989,7 +2012,7 @@ instance Num Word16 where
     n -> W16 n
   negate (W16 a) = case mask16 (primWordSub (primIntToWord 0) a) of
     n -> W16 n
-  fromInteger (Integer b) = case mask16 (primIntToWord (primIntegerToInt b)) of
+  fromInteger n = case mask16 (primIntToWord (integerToIntPrim n)) of
     m -> W16 m
 
 instance Real Word16 where
@@ -2009,7 +2032,7 @@ instance Num Word32 where
   (-) (W32 a) (W32 b) = W32 (primWordSub a b)
   (*) (W32 a) (W32 b) = W32 (primWordMul a b)
   negate (W32 a) = W32 (primWordSub (primIntToWord 0) a)
-  fromInteger (Integer b) = W32 (primIntToWord (primIntegerToInt b))
+  fromInteger n = W32 (primIntToWord (integerToIntPrim n))
 
 instance Real Word32 where
   toDoublePrim (W32 a) = primWordToDouble a
