@@ -9,6 +9,11 @@ export interface GhctsConfig {
   outDir: string;
   /** Extra CPP symbols, Cabal-style (`NATIVE` or `-DNATIVE`). */
   cpp?: string[];
+  /** Cabal flags to turn on when reading dependencies' `.cabal` files, the
+   * equivalent of `-f native`.  A flag not named here takes the package's own
+   * `default:`.  Distinct from `cpp`: a flag selects which stanza cabal reads,
+   * a CPP symbol selects which lines the preprocessor keeps. */
+  flags?: string[];
 }
 
 export interface Diagnostic {

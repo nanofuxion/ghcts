@@ -11,8 +11,9 @@
  * What comes out is a real `.jsexe`: rts.js, lib.js, out.js, runmain.js, and
  * all.js as their concatenation, in GHC's own order.
  */
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
+import { parseCabalLibrary } from "./cabal.js";
 import { parseModule } from "./parser.js";
 import { elaborateProgram, USER_MAIN } from "./elaborate.js";
 import { RTS_SEATS } from "./prelude.js";
@@ -173,6 +174,38 @@ function ghcModules(config: StgToJSConfig, root: string, bindings: StgBinding[])
   ];
 }
 
+/** Where a dependency lives: the nearest ancestor of one of the source roots
+ * holding `<name>.cabal`.  A source root already points inside the package it
+ * belongs to (miso's is `../../miso/src`), so nothing further has to be
+ * configured to find the package's own JavaScript beside its Haskell. */
+async function packageDir(project: string, config: GhctsConfig, name: string): Promise<string | undefined> {
+  for (const root of config.sourceRoots) {
+    for (let dir = resolve(project, root); ; dir = dirname(dir)) {
+      if (await access(join(dir, `${name}.cabal`)).then(() => true, () => false)) return dir;
+      if (dirname(dir) === dir) break;
+    }
+  }
+  return undefined;
+}
+
+/** Every dependency's `js-sources`, concatenated in declaration order.
+ *
+ * This is the same thing `renderStaticRts` does for the boot packages, for the
+ * packages a project names instead: GHC's linker makes no distinction, lib.js
+ * is every package's `js-sources` in link order.  It matters far more than it
+ * sounds - miso ships its whole runtime this way, and without it `globalThis.miso`
+ * is never defined and the program dies the moment Haskell calls into it. */
+async function packageJs(project: string, config: GhctsConfig): Promise<string> {
+  const sources: string[] = [];
+  for (const name of config.dependencies ?? []) {
+    const dir = await packageDir(project, config, name);
+    if (!dir) continue;
+    const cabal = parseCabalLibrary(await readFile(join(dir, `${name}.cabal`), "utf8"), config.flags ?? []);
+    for (const file of cabal.jsSources) sources.push(await readFile(join(dir, file), "utf8"));
+  }
+  return sources.map((source) => `${source}\n`).join("");
+}
+
 export async function build(options: {
   project: string;
   config: GhctsConfig;
@@ -202,7 +235,15 @@ export async function build(options: {
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
   const stg = coreToStg(desugared.program);
-  const jsexe = link(stgConfig, ghcModules(stgConfig, root, stg.bindings));
+  const linked = link(stgConfig, ghcModules(stgConfig, root, stg.bindings));
+
+  // `link` only knows the boot packages' JavaScript, so the project's own
+  // dependencies join it at the end of lib.js - where GHC puts a leaf package's
+  // js-sources, after the packages it depends on - and all.js is recomposed
+  // from the same four parts in the same order.
+  const packages = await packageJs(project, config);
+  const lib = linked.lib + packages;
+  const jsexe = { ...linked, lib, all: linked.rts + lib + linked.out + linked.runmain };
 
   if (options.emit) {
     const out = join(project, config.outDir, "jsexe");

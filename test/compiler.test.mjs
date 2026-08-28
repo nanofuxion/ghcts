@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { checkModule, classMembers, collectDictionaries, instanceHead, instanceMembers, instanceMethodValues, selectInstance } from '../dist/index.js';
 import { applyLayout, lex, preprocess } from '../dist/lexer.js';
@@ -97,6 +98,54 @@ test('reads source roots, JavaScript assets, and dependencies from a Cabal libra
   const parsed = parseCabalLibrary('name: demo\nlibrary\n  hs-source-dirs: src\n  js-sources: js/runtime.js\n  build-depends: base >=4.18, text\n');
   assert.deepEqual(parsed.jsSources, ['js/runtime.js']);
   assert.deepEqual(parsed.buildDepends, ['base', 'text']);
+});
+
+test('resolves an imported common stanza\'s flag conditionals to one js-sources branch', () => {
+  // miso.cabal's shape verbatim: the js-sources live in a `common` stanza the
+  // library imports, nested two conditionals deep. Reading only the library's
+  // own unindented fields finds no JavaScript at all for this package.
+  const cabal = [
+    'name: demo',
+    'common client',
+    '  if impl(ghcjs) || arch(javascript) || arch(wasm32)',
+    '    if flag(native) && flag(production)',
+    '      js-sources:',
+    '        js/miso-native.prod.js',
+    '    elif flag(production)',
+    '      js-sources:',
+    '        js/miso.prod.js',
+    '    elif flag(native)',
+    '      js-sources:',
+    '        js/miso-native.js',
+    '    else',
+    '      js-sources:',
+    '        js/miso.js',
+    'flag native',
+    '  manual:',
+    '    True',
+    '  default:',
+    '    False',
+    'flag production',
+    '  default:',
+    '    False',
+    'library',
+    '  import:',
+    '    client',
+    '  hs-source-dirs:',
+    '    src',
+    '',
+  ].join('\n');
+  assert.deepEqual(parseCabalLibrary(cabal, ['native', 'production']).jsSources, ['js/miso-native.prod.js']);
+  assert.deepEqual(parseCabalLibrary(cabal, ['production']).jsSources, ['js/miso.prod.js']);
+  assert.deepEqual(parseCabalLibrary(cabal, ['native']).jsSources, ['js/miso-native.js']);
+  assert.deepEqual(parseCabalLibrary(cabal).jsSources, ['js/miso.js']);
+  assert.deepEqual(parseCabalLibrary(cabal, ['native']).sourceDirs, ['src']);
+
+  // The real file, so the test cannot pass against a shape miso does not have.
+  const miso = parseCabalLibrary(readFileSync('references/miso/miso.cabal', 'utf8'), ['native', 'production']);
+  assert.deepEqual(miso.jsSources, ['js/miso-native.prod.js']);
+  assert.ok(miso.cppOptions.includes('-DNATIVE') && miso.cppOptions.includes('-DPRODUCTION'));
+  assert.ok(!miso.cppOptions.includes('-DVANILLA'), 'arch(javascript) must win the impl/arch chain');
 });
 
 test('collects module-owned values, constructors, and record fields before resolution', () => {
