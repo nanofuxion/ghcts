@@ -3065,6 +3065,33 @@ const programs = [
     // `null`
     expect: 4,
   },
+  {
+    // A `ByteString` is a JavaScript Uint8Array and the UTF-8 codecs are the
+    // platform's own, so a round trip through bytes has to survive a character
+    // that is not one byte wide - which is the whole reason bytes are not
+    // aliased to a string here.
+    name: "encodeUtf8 and decodeUtf8 are the real codecs",
+    source: [
+      "module Main where",
+      "import qualified Data.ByteString as B",
+      "import qualified Data.ByteString.Builder as BB",
+      "import qualified Data.Text.Lazy.Encoding as LT",
+      "import Data.JSString (JSString, unpack)",
+      "",
+      "text :: JSString",
+      "text = \"h\\955!\"",
+      "",
+      "main :: IO Int",
+      "main = pure (B.length (LT.encodeUtf8 text) * 100",
+      // The lambda is two UTF-8 bytes, so the encoded length is 4 and the
+      // decoded one is 3.
+      "           + length (unpack (LT.decodeUtf8 (LT.encodeUtf8 text))) * 10",
+      "           + B.length (BB.toLazyByteString (BB.byteString (LT.encodeUtf8 text) <> BB.charUtf8 \'x\')))",
+      "",
+    ].join("\n"),
+    // 4 bytes, 3 characters, 5 bytes once `x` is appended.
+    expect: 435,
+  },
 ];
 
 const file = process.argv.slice(2).find((a) => !a.startsWith("--"));

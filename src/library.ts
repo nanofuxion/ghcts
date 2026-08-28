@@ -1026,6 +1026,106 @@ instance IsString JSString where
 import Data.JSString
 type Text = JSString
 `,
+  // Bytes, as the platform has them: a ByteString is a JavaScript Uint8Array
+  // and the UTF-8 codecs are TextEncoder/TextDecoder, which implement exactly
+  // the encoding `Data.Text.Encoding` names. Aliasing bytes to a string would
+  // have made `decodeUtf8` the identity and silently wrong above ASCII.
+  //
+  // Strict and lazy ByteStrings are one type here, and so are strict and lazy
+  // `Text`. Types share one global namespace (see `src/modules.ts`), and the
+  // two members of each pair differ only in how the same contents are chunked,
+  // never in which contents exist - unlike `Int64` and `Int`, where the
+  // difference is which values the type can hold.
+  "Data.ByteString": `module Data.ByteString where
+
+data ByteString = ByteString JSValPrim
+
+foreign import javascript unsafe "((n) => new Uint8Array(n))" jsBytesEmpty :: IntPrim -> JSValPrim
+foreign import javascript unsafe "((a) => a.length)" jsBytesLength :: JSValPrim -> IntPrim
+foreign import javascript unsafe "((a,b) => { const r = new Uint8Array(a.length + b.length); r.set(a); r.set(b, a.length); return r; })" jsBytesAppend :: JSValPrim -> JSValPrim -> JSValPrim
+foreign import javascript unsafe "((a,b) => a.length === b.length && a.every((x, i) => x === b[i]))" jsBytesEq :: JSValPrim -> JSValPrim -> Bool
+
+empty :: ByteString
+empty = ByteString (jsBytesEmpty 0)
+
+length :: ByteString -> Int
+length (ByteString a) = I (jsBytesLength a)
+
+append :: ByteString -> ByteString -> ByteString
+append (ByteString a) (ByteString b) = ByteString (jsBytesAppend a b)
+
+instance Eq ByteString where
+  (==) (ByteString a) (ByteString b) = jsBytesEq a b
+
+instance Semigroup ByteString where
+  (<>) a b = append a b
+
+instance Monoid ByteString where
+  mempty = empty
+`,
+  "Data.ByteString.Char8": `module Data.ByteString.Char8 (module Data.ByteString) where
+import Data.ByteString
+`,
+  "Data.ByteString.Lazy": `module Data.ByteString.Lazy (module Data.ByteString) where
+import Data.ByteString
+`,
+  // A \`Builder\` is the bytes it has accumulated: \`<>\` is a concatenation the
+  // JavaScript engine does in one copy, so there is nothing a difference list
+  // would buy that a Uint8Array does not already have.
+  "Data.ByteString.Builder": `module Data.ByteString.Builder (module Data.ByteString, Builder, toLazyByteString, byteString, lazyByteString, stringUtf8, charUtf8, toLazyByteStringWith) where
+import Data.ByteString
+import Data.JSString (JSString, pack, singleton)
+import Data.Text.Encoding (encodeUtf8)
+
+type Builder = ByteString
+
+toLazyByteString :: Builder -> ByteString
+toLazyByteString b = b
+
+lazyByteString :: ByteString -> Builder
+lazyByteString b = b
+
+byteString :: ByteString -> Builder
+byteString b = b
+
+stringUtf8 :: [Char] -> Builder
+stringUtf8 s = encodeUtf8 (pack s)
+
+charUtf8 :: Char -> Builder
+charUtf8 c = encodeUtf8 (singleton c)
+`,
+  "Data.Text.Encoding": `module Data.Text.Encoding (encodeUtf8, decodeUtf8, decodeUtf8Lenient, encodeUtf8Builder) where
+import Data.ByteString (ByteString(ByteString))
+import Data.JSString (JSString(JSString))
+
+foreign import javascript unsafe "((s) => new TextEncoder().encode(s))" jsEncodeUtf8 :: JSStringPrim -> JSValPrim
+foreign import javascript unsafe "((a) => new TextDecoder('utf-8').decode(a))" jsDecodeUtf8 :: JSValPrim -> JSStringPrim
+
+encodeUtf8 :: JSString -> ByteString
+encodeUtf8 (JSString s) = ByteString (jsEncodeUtf8 s)
+
+decodeUtf8 :: ByteString -> JSString
+decodeUtf8 (ByteString a) = JSString (jsDecodeUtf8 a)
+
+decodeUtf8Lenient :: ByteString -> JSString
+decodeUtf8Lenient b = decodeUtf8 b
+
+encodeUtf8Builder :: JSString -> ByteString
+encodeUtf8Builder t = encodeUtf8 t
+`,
+  "Data.Text.Lazy": `module Data.Text.Lazy (module Data.JSString, Text, toStrict, fromStrict) where
+import Data.JSString (JSString)
+type Text = JSString
+
+toStrict :: JSString -> JSString
+toStrict t = t
+
+fromStrict :: JSString -> JSString
+fromStrict t = t
+`,
+  "Data.Text.Lazy.Encoding": `module Data.Text.Lazy.Encoding (module Data.Text.Encoding) where
+import Data.Text.Encoding
+`,
   "Data.JSString.Text": `module Data.JSString.Text where
 import Data.JSString (JSString)
 -- \\\`Text\\\` and \\\`JSString\\\` are the same type here (see Data.Text), so the two
