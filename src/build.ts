@@ -17,6 +17,7 @@ import { parseCabalLibrary } from "./cabal.js";
 import { parseModule } from "./parser.js";
 import { elaborateProgram, USER_MAIN } from "./elaborate.js";
 import { RTS_SEATS } from "./prelude.js";
+import { BINDING_OVERRIDES } from "./binding-overrides.js";
 import { desugarModule } from "./desugar.js";
 import { coreToStg } from "./core-to-stg.js";
 import { genUnits, stgToJS } from "./stg-js/codegen.js";
@@ -95,6 +96,22 @@ export async function loadProgram(
     const parsed = parseModule(await readFile(file, "utf8"), relative(project, file), defines);
     diagnostics.push(...parsed.diagnostics);
     if (!parsed.module?.ast) continue;
+    const overrides = BINDING_OVERRIDES[parsed.module.ast.name];
+    if (overrides) {
+      parsed.module.ast.declarations = parsed.module.ast.declarations.map((decl) => {
+        if (decl.tag !== "value") return decl;
+        if (!Object.hasOwn(overrides, decl.name)) return decl;
+        const patch = overrides[decl.name];
+        return {
+          tag: "foreign" as const,
+          name: decl.name,
+          javascript: patch.javascript,
+          signature: patch.signature,
+          arity: Math.max(0, patch.signature.length - 1),
+          span: decl.span,
+        };
+      });
+    }
     modules.set(parsed.module.ast.name, parsed.module.ast);
     for (const imported of parsed.module.ast.imports) queue.push(imported.module);
   }
