@@ -269,6 +269,14 @@ instance Eq Int where
   (==) (I a) (I b) = primIntEq a b
 
 instance Ord Int where
+  -- \`compare\` is given directly rather than left to the class default. The
+  -- default is \`if x <= y then (if y <= x then EQ else LT) else GT\`: two
+  -- dictionary-dispatched \`<=\` calls, where this is two primitive comparisons
+  -- and no dispatch at all. Every ordered container keyed on \`Int\` goes
+  -- through here once per node, so the default costs more than the whole rest
+  -- of the traversal. containers' own \`Data.Map\` relies on \`compare\` being
+  -- the cheap operation for exactly this reason.
+  compare (I a) (I b) = if primIntLt a b then LT else (if primIntEq a b then EQ else GT)
   (<) (I a) (I b) = primIntLt a b
   (<=) (I a) (I b) = primIntLe a b
   (>) (I a) (I b) = primIntGt a b
@@ -705,10 +713,120 @@ rtsStdout = ()
 -- so \`f (errorPrim s)\` would raise before \`f\` ever ran. As an ordinary
 -- Haskell function, \`error s\` is a thunk in a lazy position, exactly as GHC's
 -- is, and only raises when something forces it.
-foreign import javascript unsafe "((s) => { throw new Error('Prelude.error'); })" errorPrim :: [Char] -> a
+-- The real message was previously discarded (\`throw new Error('Prelude.error')\`
+-- unconditionally) - every \`error "..."\` call in any ghcts program showed the
+-- same useless text. Walks the \`[Char]\` cons-list by hand instead of going
+-- through GHC.Types.[]/(:)'s own constructor-entry symbols
+-- (h\$ghczmprimZCGHCziTypesziZC_con_e / ...ZMZN) - those are never generated
+-- by this pipeline for any program (a separate, deeper elaboration gap), so
+-- referencing them here would just trade one ReferenceError for another.
+-- \`.d1\`/\`.d2\` duck-typing is safe specifically because the argument's type is
+-- \`[Char]\`: the only two shapes a value can take there are \`:\` (two fields)
+-- and \`[]\` (no \`d2\`), so nothing else can be mistaken for a cons cell here.
+--
+-- \`errorPrim\` walks the closure's fields directly instead of entering each
+-- thunk (no forcing primitive is exposed to a bare \`foreign import javascript\`
+-- body here), so its argument must already be in WHNF spine-and-leaves *all
+-- the way to the end* before it gets there - JS never forces anything itself,
+-- it just reads whatever fields already happen to be there.
+--
+-- A version built as \`c \`seq\` (c : forceErrorString cs)\` does NOT give that:
+-- returning a lazy \`:\` whose tail is an unforced recursive-call thunk forces
+-- only the *head* eagerly, and nothing downstream ever demands the rest - the
+-- foreign call reads \`$1\` as a whole unforced argument thunk (an ordinary
+-- Haskell function's arguments are passed lazily), so \`errorPrim\` walks off
+-- into thunk closures partway down the spine and its \`typeof cp !== 'number'\`
+-- check quietly stops there (an \`error\` message longer than the first couple
+-- of characters that happened to already be forced showed only those, e.g.
+-- \`"GHCTS-DICT: ..."\` came out as just \`"GH"\`).
+--
+-- The fix walks the *entire* spine and every character's code point in one
+-- strict pass (\`go\`), only returning \`s\` once that whole walk is done: \`go s
+-- \`seq\` s\` forces \`go s\` to WHNF first, and \`go\`'s every recursive call is
+-- itself directly \`seq\`-forced rather than lazily returned, so the walk
+-- can't stop until it reaches \`[]\`. Only *then* is the (now fully-forced,
+-- unchanged) original list hand to \`errorPrim\`.
+forceErrorString :: [Char] -> [Char]
+forceErrorString s = go s \`seq\` s
+  where
+    go [] = ()
+    go (c:cs) = fromEnum c \`seq\` go cs
+
+foreign import javascript unsafe "(($1) => { let msg = ''; try { let xs = $1; while (xs && xs.d2 !== undefined) { const h = xs.d1; const cp = typeof h === 'number' ? h : (h && h.d1); if (typeof cp !== 'number') break; msg += String.fromCodePoint(cp); xs = xs.d2; } } catch (e) {} throw new Error(msg || 'Prelude.error'); })" errorPrim :: [Char] -> a
+
+-- ----------------------------------------------------------- standard IO ---
+--
+-- \`putStr\`, \`putStrLn\`, \`print\` and \`getLine\` are the first functions any
+-- Haskell program reaches for, and until now none of them existed here: even
+-- \`main = print 1\` failed to compile, so every test program had to declare a
+-- \`foreign import javascript\` of its own just to show a result. These are the
+-- GHC.Internal.System.IO definitions, spelled against what this backend has.
+--
+-- The string is packed in JavaScript rather than appended a character at a
+-- time (see \`forceString\` below, and \`Data.JSString.pack\`'s own fast path):
+-- one traversal, one host call. \`putStr\` buffers a partial line because
+-- \`console.log\` always terminates one - the buffer is flushed by the next
+-- \`putStrLn\`, by \`hFlush\`, or at exit, which is what makes
+-- \`putStr "a" >> putStrLn "b"\` print \`ab\` on one line as GHC does.
+foreign import javascript unsafe "(($1) => { const g = globalThis; const NL = String.fromCharCode(10); g.h$outBuf = (g.h$outBuf || '') + $1; const i = g.h$outBuf.lastIndexOf(NL); if (i >= 0) { const done = g.h$outBuf.slice(0, i); g.h$outBuf = g.h$outBuf.slice(i + 1); for (const line of done.split(NL)) console.log(line); } return 0; })" primPutStr :: JSStringPrim -> IntPrim
+
+foreign import javascript unsafe "(() => { const g = globalThis; if (g.h$outBuf) { console.log(g.h$outBuf); g.h$outBuf = ''; } return 0; })" primFlushOut :: IntPrim
+
+
+
+foreign import javascript unsafe "((s,c) => s + String.fromCodePoint(c))" primSnocStr :: JSStringPrim -> CharPrim -> JSStringPrim
+
+foreign import javascript unsafe "(() => '')" primEmptyStr :: IntPrim -> JSStringPrim
+
+-- Forces as it goes, one cons cell at a time. A JS-side walker that read
+-- \`.d1\`/\`.d2\` off the cells directly would be faster, but it cannot tell a
+-- forced \`C#\` box from an unevaluated thunk - both have a \`.d1\`, and a
+-- thunk's is whatever its first free variable happens to be. Reading that as a
+-- code point silently produces the wrong string, or throws \`RangeError:
+-- invalid code point\` when the number is out of range. Only the RTS can force
+-- safely, so packing stays here.
+slowPackStr :: [Char] -> JSStringPrim -> JSStringPrim
+slowPackStr cs acc = case cs of
+  [] -> acc
+  (C c : rest) -> slowPackStr rest (primSnocStr acc c)
+
+packStr :: [Char] -> JSStringPrim
+packStr cs = slowPackStr cs (primEmptyStr 0)
+
+putStr :: [Char] -> IO ()
+putStr cs = IO (\\s -> case primPutStr (packStr cs) of
+  _ -> IOResult s ())
+
+putStrLn :: [Char] -> IO ()
+putStrLn cs = putStr (cs ++ [newlineChar])
+
+newlineChar :: Char
+newlineChar = chr 10
+
+print :: Show a => a -> IO ()
+print x = putStrLn (show x)
+
+hFlush :: () -> IO ()
+hFlush _ = IO (\\s -> case primFlushOut of
+  _ -> IOResult s ())
+
+stdout :: ()
+stdout = ()
+
+stderr :: ()
+stderr = ()
+
+foreign import javascript unsafe "(($1) => { console.error($1); return 0; })" primPutErr :: JSStringPrim -> IntPrim
+
+hPutStr :: () -> [Char] -> IO ()
+hPutStr _ cs = IO (\\s -> case primPutErr (packStr cs) of
+  _ -> IOResult s ())
+
+hPutStrLn :: () -> [Char] -> IO ()
+hPutStrLn h cs = hPutStr h cs
 
 error :: [Char] -> a
-error s = errorPrim s
+error s = errorPrim (forceErrorString s)
 
 undefined :: a
 undefined = error "Prelude.undefined"
@@ -753,9 +871,11 @@ seq :: a -> b -> b
 seq x y = case forceValue x of
   z -> y
 
+-- \`seq\` is a primitive now (src/desugar.ts turns a saturated use into a
+-- \`case\`), so routing \`$!\` through it costs one \`case\` and no call, where
+-- \`forceValue\` was an identity *function* that had to be entered.
 ($!) :: (a -> b) -> a -> b
-($!) f x = case forceValue x of
-  y -> f y
+($!) f x = x \`seq\` f x
 
 (&) :: a -> (a -> b) -> b
 (&) x f = f x
@@ -1765,11 +1885,15 @@ elem x xs = foldr (\\y b -> if x == y then True else b) False xs
 notElem :: (Foldable t, Eq a) => a -> t a -> Bool
 notElem x xs = not (elem x xs)
 
+-- GHC 9's list \`Foldable\` defines both as strict left folds
+-- (\`GHC.Internal.Data.Foldable\`). The lazy \`foldr\` they had here built one
+-- addition thunk per element and only collapsed the chain at the end, which
+-- is both slower and a space leak on a long list.
 sum :: (Foldable t, Num a) => t a -> a
-sum xs = foldr (\\x acc -> x + acc) 0 xs
+sum xs = foldlStrict (\\acc x -> acc + x) 0 (toList xs)
 
 product :: (Foldable t, Num a) => t a -> a
-product xs = foldr (\\x acc -> x * acc) 1 xs
+product xs = foldlStrict (\\acc x -> acc * x) 1 (toList xs)
 
 any :: Foldable t => (a -> Bool) -> t a -> Bool
 any p xs = foldr (\\x b -> if p x then True else b) False xs

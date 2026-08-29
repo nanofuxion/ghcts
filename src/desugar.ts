@@ -403,6 +403,37 @@ class Desugarer {
       if (foreign && scope.get(head.name) === this.top.get(head.name) && lowered.length >= foreign.arity)
         return this.saturateOp(foreign, lowered);
     }
+    if (
+      head.tag === "var" &&
+      head.name === "seq" &&
+      lowered.length >= 2 &&
+      // `seq` is an ordinary Prelude binding here, so "not shadowed" is the
+      // same test the foreign-import short-cut above uses: the name still
+      // resolves to the top-level one.
+      scope.get(head.name) === this.top.get(head.name)
+    ) {
+      // `seq` is a language primitive in GHC, not a library function:
+      // `GHC.Core.Utils.mkCoreApp` turns a saturated `seq a b` into
+      // `case a of _DEFAULT -> b`. ghcts had it as an ordinary two-argument
+      // Prelude function calling a second one (`forceValue`), so every use
+      // allocated a thunk per argument and made two generic-apply calls to
+      // achieve what a `case` does with no allocation at all. That is pure
+      // overhead in exactly the places `seq` exists to appear - strict
+      // accumulators and forcing loops.
+      //
+      // Only a *saturated* occurrence is rewritten, and only where `seq` still
+      // means the Prelude's: shadowed or partially applied, it stays the
+      // ordinary function it always was, so `foldr seq` and friends keep
+      // working.
+      const rest = lowered.slice(2);
+      const forced: CoreExpr = {
+        tag: "Case",
+        scrutinee: lowered[0]!,
+        binder: mkBinder("seq"),
+        alts: [{ con: { tag: "DEFAULT" }, binders: [], body: lowered[1]! }],
+      };
+      return rest.length ? mkApps(forced, rest) : forced;
+    }
     if (head.tag === "var" && !scope.has(head.name)) {
       const con = this.cons.get(head.name);
       if (con) return this.saturateCon(con, lowered);
@@ -516,10 +547,15 @@ class Desugarer {
       guards: [{ qualifiers: alt.qualifiers, body: alt.body }],
       whereBindings: [] as LocalBinding[],
     }));
-    // Naming an already-named scrutinee would add a `case` that enters it a
-    // second time; that is wrong for an unboxed scrutinee and pointless for
-    // any other.
-    if (scrutinee.tag === "Var") return this.match([subject], rows, scope, raise());
+    // A `Var` scrutinee still needs a real `Case` to force it: this frontend
+    // has no strictness analysis, so an ordinary variable reference (a lazy
+    // CAF, a lambda parameter, any binding the caller may not have forced)
+    // cannot be assumed already evaluated just because it is *named*. Only
+    // skipping the wrapper when the scrutinee is unboxed (never a thunk to
+    // begin with) would be sound; unconditionally skipping it for every
+    // `Var` silently dropped the force and shipped the raw closure to
+    // whatever consumed it. Always wrapping costs an extra entry on an
+    // already-evaluated/blackholed thunk, which is cheap and correct.
     return {
       tag: "Case",
       scrutinee,
@@ -820,14 +856,24 @@ class Desugarer {
     const unbox = (body: CoreExpr): CoreExpr =>
       params.reduceRight((rest, p, i) => {
         const con = args[i];
-        return con === undefined
-          ? rest
-          : {
-              tag: "Case",
-              scrutinee: varOf(p),
-              binder: mkBinder(`${p.name}b`),
-              alts: [{ con: { tag: "DataAlt", con }, binders: [opened[i]!], body: rest }],
-            };
+        if (con !== undefined)
+          return {
+            tag: "Case",
+            scrutinee: varOf(p),
+            binder: mkBinder(`${p.name}b`),
+            alts: [{ con: { tag: "DataAlt", con }, binders: [opened[i]!], body: rest }],
+          };
+        // No wrapper type to unwrap, but the argument is still an ordinary
+        // (possibly unevaluated) expression - a recursive call's result, a
+        // thunked accumulator, anything. A primitive-typed FFI parameter is
+        // handed to raw JavaScript with no representation for a Haskell
+        // thunk, so it must be forced even when there is nothing to unbox.
+        return {
+          tag: "Case",
+          scrutinee: varOf(p),
+          binder: p,
+          alts: [{ con: { tag: "DEFAULT" }, binders: [], body: rest }],
+        };
       }, body);
     const called = call(op, decl.arity, opened);
     const box = (v: CoreExpr): CoreExpr => (result === undefined ? v : { tag: "Con", con: result, args: [v] });
@@ -981,9 +1027,28 @@ const voidArity = (voidRep: true | undefined): Partial<Binder> => (voidRep ? { a
 const voidRepOf = (p: Pattern): true | undefined =>
   p.tag === "var" || p.tag === "wild" ? p.voidRep : undefined;
 
-/** See `Pattern.notFun` in src/ast.ts. */
+/** See `Pattern.notFun` in src/ast.ts.
+ *
+ * A `var`/`wild` column only knows this if the elaborator wrote its type down
+ * (`Pattern.notFun`). Every *refutable* column knows it outright, and needs no
+ * type at all: a constructor, record or literal pattern can only ever be
+ * matched against a value of that data type, so the subject standing at that
+ * column is a heap constructor and never a bare function. That is exactly the
+ * fact `genApp` wants in order to emit `h$e(x)` instead of routing the value
+ * through the generic apply, and it is the common case in the Prelude - every
+ * instance method written `(+) (I a) (I b) = ...` forces both arguments
+ * through such a column.
+ *
+ * `newtype` is included deliberately: unlike GHC, ghcts never erases a
+ * newtype's constructor (see `elaborate.ts`'s deriving-newtype note), so a
+ * value matched against one is a real single-field closure here regardless of
+ * what it wraps. */
 const notFunOf = (p: Pattern): true | undefined =>
-  p.tag === "var" || p.tag === "wild" ? p.notFun : undefined;
+  p.tag === "var" || p.tag === "wild"
+    ? p.notFun
+    : p.tag === "con" || p.tag === "record" || p.tag === "int" || p.tag === "char" || p.tag === "string"
+      ? true
+      : undefined;
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;

@@ -32,10 +32,20 @@ const apps = {
     root,
     "references/misogram/dist/lynx/main.lynx.bundle",
   ),
-  "/reference/main.lynx.bundle": join(
+  // Same sources, built by GHC 9.12.2's own JavaScript backend instead of
+  // ghcts, so the two can be run back to back on one device.
+  //
+  //   counter-ghc   checked-in reference bundle
+  //   misogram-ghc  `nix build --override-input miso path:<repo>/references/miso
+  //                  --out-link /tmp/ghc-misogram` in references/misogram
+  //
+  // A route whose file is missing is skipped at startup rather than 404-ing
+  // mid-session, so this list can name a bundle that has not been built yet.
+  "/counter-ghc/main.lynx.bundle": join(
     root,
     "references/miso-lynx/examples/main.lynx.bundle",
   ),
+  "/misogram-ghc/main.lynx.bundle": "/tmp/ghc-misogram/main.lynx.bundle",
 };
 
 const lanAddresses = () => {
@@ -75,13 +85,21 @@ const indexPage = (hosts) => {
 `;
 };
 
+// A bundle that has not been built yet drops out of the table instead of
+// killing the server: the GHC-built comparison routes come from a separate
+// toolchain, and one of them being absent should not stop the ghcts ones from
+// being servable.
 for (const [path, file] of Object.entries(apps)) {
   try {
     await stat(file);
   } catch {
-    console.error(`Missing ${path}\n  expected ${file}\n  pack it first with scripts/pack-lynx.mjs`);
-    process.exit(1);
+    console.error(`skipping ${path}\n  not built: ${file}`);
+    delete apps[path];
   }
+}
+if (Object.keys(apps).length === 0) {
+  console.error("No bundles to serve; pack one first with scripts/pack-lynx.mjs");
+  process.exit(1);
 }
 
 const server = createServer(async (request, response) => {
@@ -132,8 +150,10 @@ const server = createServer(async (request, response) => {
 server.listen(port, "0.0.0.0", () => {
   console.log(`Lynx Explorer — http://<lan-ip>:${port}/…/main.lynx.bundle\n`);
   for (const host of ["127.0.0.1", ...lanAddresses()]) {
-    console.log(`  counter   http://${host}:${port}/counter/main.lynx.bundle`);
-    console.log(`  misogram  http://${host}:${port}/misogram/main.lynx.bundle`);
+    for (const path of Object.keys(apps)) {
+      const name = path.split("/")[1];
+      console.log(`  ${name.padEnd(13)} http://${host}:${port}${path}`);
+    }
     console.log("");
   }
 });

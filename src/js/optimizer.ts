@@ -47,21 +47,67 @@ function jsOptimizeStat(s0: JStat): JStat {
   }
 }
 
-type BlockTrans = (stats: JStat[]) => JStat[];
-type BlockOpt = (loop: BlockTrans, next: BlockTrans) => BlockTrans;
+/** A rewrite that fires on the front of the stream: consume `consumed`
+ * elements, replace them with `replacement` (put back at the front, so a
+ * follow-on rewrite gets another look at it - matching GHC's `loop`). */
+interface FrontRewrite {
+  consumed: number;
+  replacement: JStat[];
+}
 
-const memptyOpt: BlockOpt = (_loop, next) => next;
-const combine = (a: BlockOpt, b: BlockOpt): BlockOpt => (loop, next) => a(loop, b(loop, next));
-const combineAll = (opts: BlockOpt[]): BlockOpt => opts.reduceRight((acc, o) => combine(o, acc), memptyOpt);
+/** `runBlockOpt`/`tailLoop`'s CPS recursion (`opt(recur, id)(xs)`,
+ * `next([jsOptimizeStat(x), ...loop(rest)])`) is GHC's own algorithm over a
+ * lazy, structurally-shared `[JStat]`; the identical recursion over a strict
+ * TypeScript array copies the tail at every level of `[x, ...rest]` and
+ * `[...loop(rest)]`, which is O(n^2) memory and O(n) stack depth for a
+ * whole-program statement list (the linker's largest blocks run into the
+ * hundreds of thousands of statements). This drives the same three rewrite
+ * rules (`declareAssign`, `combineOps`, `deadCodeElim`) with an explicit
+ * loop instead: an index into the immutable input plus a small `pending`
+ * buffer standing in for "the front of the stream still to be examined" -
+ * a rewrite never produces more than the couple of elements the patterns
+ * below match on, so `pending` never grows with the input. Same rewrites,
+ * same order, same result; O(n) time and memory, no recursion. */
+function runBlockOptIter(xs: JStat[]): JStat[] {
+  const out: JStat[] = [];
+  const n = xs.length;
+  let i = 0;
+  let pending: JStat[] = [];
+  const at = (k: number): JStat | undefined => (k < pending.length ? pending[k] : xs[i + (k - pending.length)]);
+  const consume = (k: number): void => {
+    if (k <= pending.length) pending = pending.slice(k);
+    else {
+      i += k - pending.length;
+      pending = [];
+    }
+  };
+  for (;;) {
+    const op1 = at(0);
+    if (op1 === undefined) break;
+    const op2 = at(1);
 
-function runBlockOpt(opt: BlockOpt, xs: JStat[]): JStat[] {
-  const recur: BlockTrans = (ys) => opt(recur, (zs) => zs)(ys);
-  return recur(xs);
+    if (op1.tag === "ReturnStat") {
+      // deadCodeElim: drop everything after a return (see Note [Unsafe
+      // JavaScript optimizations]) - the rest of `pending` and of `xs`.
+      out.push(jsOptimizeStat(op1));
+      return out;
+    }
+
+    const rewrite = tryDeclareAssign(op1, op2) ?? tryCombineOps(op1, op2);
+    if (rewrite !== undefined) {
+      consume(rewrite.consumed);
+      pending = [...rewrite.replacement, ...pending];
+      continue;
+    }
+
+    out.push(jsOptimizeStat(op1));
+    consume(1);
+  }
+  return out;
 }
 
 function jsOptimize_(stats: JStat[]): JStat[] {
-  const opts = combineAll([declareAssign, combineOps, deadCodeElim, tailLoop]);
-  return runBlockOpt(opts, flattenBlocks(stats));
+  return runBlockOptIter(flattenBlocks(stats));
 }
 
 /** recur over a JExpr and optimize the JVals */
@@ -88,13 +134,6 @@ function jValOptimize(v: JVal): JVal {
   }
 }
 
-/** Perform all the optimizations on the tail of a block. */
-const tailLoop: BlockOpt = (loop, next) => (xs) => {
-  if (xs.length === 0) return next([]);
-  const [x, ...rest] = xs;
-  return next([jsOptimizeStat(x), ...loop(rest)]);
-};
-
 /**
    Catch modify and assign operators:
       case 1: i = i + 1; ==> ++i;
@@ -102,15 +141,12 @@ const tailLoop: BlockOpt = (loop, next) => (xs) => {
       case 3: i = i + n; ==> i += n;
       case 4: i = i - n; ==> i -= n;
  */
-const combineOps: BlockOpt = (loop, next) => (xs) => {
-  const [op1, op2, ...rest2] = xs;
-  const tail1 = xs.slice(1);
-
+function tryCombineOps(op1: JStat | undefined, op2: JStat | undefined): FrontRewrite | undefined {
   // var x = expr; return x; ==> return expr;
   if (op1?.tag === "DeclStat" && op1.value !== undefined && op2?.tag === "ReturnStat") {
     const declValue = op1.value, declIdent = op1.ident, ret = op2;
     if (ret.value.tag === "ValExpr" && ret.value.value.tag === "JVar" && ret.value.value.ident === declIdent) {
-      return loop([{ tag: "ReturnStat", value: declValue }, ...rest2]);
+      return { consumed: 2, replacement: [{ tag: "ReturnStat", value: declValue }] };
     }
   }
 
@@ -118,14 +154,14 @@ const combineOps: BlockOpt = (loop, next) => (xs) => {
   if (op1?.tag === "AssignStat" && op1.op === "AssignOp" && op1.lhs.tag === "ValExpr" && op1.lhs.value.tag === "JVar" && op2?.tag === "ReturnStat") {
     const assignIdent = op1.lhs.value.ident, assignRhs = op1.rhs, ret = op2;
     if (ret.value.tag === "ValExpr" && ret.value.value.tag === "JVar" && ret.value.value.ident === assignIdent) {
-      return loop([{ tag: "ReturnStat", value: assignRhs }, ...rest2]);
+      return { consumed: 2, replacement: [{ tag: "ReturnStat", value: assignRhs }] };
     }
   }
 
   // h$sp -= 2; h$sp += 5; ==> h$sp += 3;
   if (op1 && op2) {
     const s1 = isStackAdjust(op1), s2 = isStackAdjust(op2);
-    if (s1 !== undefined && s2 !== undefined) return loop([...mkStackAdjust(s1 + s2), ...rest2]);
+    if (s1 !== undefined && s2 !== undefined) return { consumed: 2, replacement: mkStackAdjust(s1 + s2) };
   }
 
   // x = x + 1; ==> ++x;  x = x - 1; ==> --x;  x = x + n; ==> x += n;  x = x - n; ==> x -= n;
@@ -134,32 +170,27 @@ const combineOps: BlockOpt = (loop, next) => (xs) => {
     const isVar = (e: JExpr, name: string): boolean => e.tag === "ValExpr" && e.value.tag === "JVar" && e.value.ident === name;
     const isOne = (e: JExpr): boolean => e.tag === "ValExpr" && e.value.tag === "JInt" && e.value.value === 1n;
     if (isVar(rhs.left, i)) {
-      if (rhs.op === "AddOp" && isOne(rhs.right)) return loop([{ tag: "UOpStat", op: "PreIncOp", value: ident }, ...tail1]);
-      if (rhs.op === "SubOp" && isOne(rhs.right)) return loop([{ tag: "UOpStat", op: "PreDecOp", value: ident }, ...tail1]);
-      if (rhs.op === "AddOp") return loop([{ tag: "AssignStat", lhs: ident, op: "AddAssignOp", rhs: rhs.right }, ...tail1]);
-      if (rhs.op === "SubOp") return loop([{ tag: "AssignStat", lhs: ident, op: "SubAssignOp", rhs: rhs.right }, ...tail1]);
+      if (rhs.op === "AddOp" && isOne(rhs.right)) return { consumed: 1, replacement: [{ tag: "UOpStat", op: "PreIncOp", value: ident }] };
+      if (rhs.op === "SubOp" && isOne(rhs.right)) return { consumed: 1, replacement: [{ tag: "UOpStat", op: "PreDecOp", value: ident }] };
+      if (rhs.op === "AddOp") return { consumed: 1, replacement: [{ tag: "AssignStat", lhs: ident, op: "AddAssignOp", rhs: rhs.right }] };
+      if (rhs.op === "SubOp") return { consumed: 1, replacement: [{ tag: "AssignStat", lhs: ident, op: "SubAssignOp", rhs: rhs.right }] };
     } else if (isVar(rhs.right, i)) {
       // commutative cases
-      if (rhs.op === "AddOp" && isOne(rhs.left)) return loop([{ tag: "UOpStat", op: "PreIncOp", value: ident }, ...tail1]);
-      if (rhs.op === "AddOp") return loop([{ tag: "AssignStat", lhs: ident, op: "AddAssignOp", rhs: rhs.left }, ...tail1]);
+      if (rhs.op === "AddOp" && isOne(rhs.left)) return { consumed: 1, replacement: [{ tag: "UOpStat", op: "PreIncOp", value: ident }] };
+      if (rhs.op === "AddOp") return { consumed: 1, replacement: [{ tag: "AssignStat", lhs: ident, op: "AddAssignOp", rhs: rhs.left }] };
     }
   }
 
-  return next(xs);
-};
+  return undefined;
+}
 
 /** Catch 'var i; i = q;' ==> 'var i = q;' */
-const declareAssign: BlockOpt = (loop, next) => (xs) => {
-  const [a, b, ...rest] = xs;
+function tryDeclareAssign(a: JStat | undefined, b: JStat | undefined): FrontRewrite | undefined {
   if (a?.tag === "DeclStat" && a.value === undefined && b?.tag === "AssignStat" && b.op === "AssignOp" && b.lhs.tag === "ValExpr" && b.lhs.value.tag === "JVar" && b.lhs.value.ident === a.ident) {
-    return loop([{ tag: "DeclStat", ident: a.ident, value: b.rhs }, ...rest]);
+    return { consumed: 2, replacement: [{ tag: "DeclStat", ident: a.ident, value: b.rhs }] };
   }
-  return next(xs);
-};
-
-/** Eliminate all code after a return statement - see Note [Unsafe JavaScript
- * optimizations]. Doesn't need to loop. */
-const deadCodeElim: BlockOpt = (_loop, next) => (xs) => (xs[0]?.tag === "ReturnStat" ? next([xs[0]]) : next(xs));
+  return undefined;
+}
 
 /** remove nested blocks */
 function flattenBlocks(stats: JStat[]): JStat[] {

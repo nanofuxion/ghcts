@@ -65,6 +65,17 @@ export interface LinkableUnit {
   luOtherExports: string[];
   /** identifiers this unit depends on */
   luIdDeps: Binder[];
+  /** `luIdDeps`, resolved to the generated symbol strings each `Binder`
+   * actually got - computed here, not later, because `identForId` reads a
+   * mutable per-module identifier cache/counter (`GenState.gsIdents` /
+   * `gsIdentMint`): calling it again with a *different* GenState (e.g. a
+   * linker pass after every module has already been compiled) is not
+   * guaranteed to reproduce the same name for a cross-module reference.
+   * The linker's reachability pass (`src/linker/linker.ts`) consumes this
+   * directly instead of re-deriving idents from rendered JS, which the
+   * `oiStat`/`oiStatic`/`oiClInfo` AST alone cannot fully answer - GHC's own
+   * `getDeps` doesn't either; it's exactly why GHC caches `bi_block_deps`. */
+  luDepSymbols: string[];
   /** always link this unit */
   luRequired: boolean;
 }
@@ -114,6 +125,7 @@ function generateGlobalBlock(gs: GenState, m: Module): LinkableUnit {
     luIdExports: [],
     luOtherExports: syms,
     luIdDeps: [],
+    luDepSymbols: [],
     luRequired: false,
   };
 }
@@ -125,6 +137,7 @@ function generateExportsBlock(m: Module): LinkableUnit {
     luIdExports: [],
     luOtherExports: syms,
     luIdDeps: [],
+    luDepSymbols: [],
     luRequired: true,
   };
 }
@@ -153,6 +166,7 @@ function generateBlock(gs: GenState, topBind: StgBinding): LinkableUnit | undefi
     luIdExports: topDeps,
     luOtherExports: [],
     luIdDeps: allDeps,
+    luDepSymbols: allDeps.map((i) => identForId(gs, i)),
     luRequired: required,
   };
 }

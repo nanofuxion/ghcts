@@ -1474,10 +1474,88 @@ class Elaborator {
     this.current = undefined;
   }
 
+  // ------------------------------------------------------- specialization --
+
+  /** Class method name -> the class that declares it, built once on demand.
+   * Two classes cannot declare the same method name here (methods share one
+   * global value namespace, see `src/modules.ts`), so the map is total. */
+  private methodOwner?: Map<string, string>;
+
+  /** GHC's specializer, in the one shape that needs no analysis to justify.
+   *
+   * A class-method occurrence normally becomes `method dict arg...`: the
+   * generic selector is entered, the dictionary is entered, the method's field
+   * is projected out of it, and *that* is finally entered. Four RTS round
+   * trips, and the first three of them are pure overhead whenever the
+   * dictionary is a compile-time constant. GHC emits a direct reference to the
+   * instance's own implementation instead, and at `-O0` too - this is not an
+   * optimisation the source had to ask for.
+   *
+   * The rewrite fires only when the evidence is unambiguous:
+   *
+   *   - the head is a class method, and the first dictionary argument is a
+   *     *bare* reference to an instance's dictionary value, not an application
+   *     of one. An application means a constrained instance (`instance Eq a =>
+   *     Eq [a]`), whose dictionary is a function of dictionaries only known at
+   *     run time;
+   *   - that instance takes no context of its own, so `methodImpl`'s binding
+   *     expects exactly the method's own context dictionaries - which is what
+   *     the remaining arguments already are, in order (see the two
+   *     `addBinding` loops that build instance methods and class defaults);
+   *   - and the instance defines the method itself. A method left to the class
+   *     default is bound as `$dm<Class>$<method>` taking the dictionary back as
+   *     its first argument, so there is nothing to shortcut - the dictionary
+   *     really is needed.
+   *
+   * Anything outside that stays on the generic path, so this can only remove
+   * indirection, never change which implementation runs. */
+  specializeMethod(name: string, args: Expr[]): Expr | undefined {
+    if (this.methodOwner === undefined) {
+      this.methodOwner = new Map();
+      for (const info of this.classes.values())
+        for (const m of info.methods) this.methodOwner.set(m.name, info.name);
+    }
+    const cls = this.methodOwner.get(name);
+    if (cls === undefined) return undefined;
+    const dict = args[0];
+    if (dict === undefined || dict.tag !== "var") return undefined;
+    const prefix = `$f${cls}`;
+    if (!dict.name.startsWith(prefix)) return undefined;
+    const emitCon = dict.name.slice(prefix.length);
+    const instance = this.instances.get(`${cls} ${emitCon}`);
+    if (!instance || instance.context.length > 0 || !instance.methods.has(name)) return undefined;
+    return applyAll(variable(methodImpl(cls, emitCon, name), dict.span), args.slice(1));
+  }
+
   // ------------------------------------------------------------- solving --
 
   addInstance(key: string, info: InstanceInfo): void {
-    this.instances.set(key, info);
+    // Two instances can land on the same key without being duplicates of each
+    // other: `Data.Text.Text`, `Data.Text.Lazy.Text` and `MisoString` all
+    // collapse to the one `JSString` here (see `instanceKey`'s caller), so a
+    // library instancing each of the three "same" head has in fact written
+    // three *different* method bodies for what ghcts treats as one type - one
+    // direct (e.g. `toJSON = String`), the other two routed through a
+    // same-type conversion (`toJSON = toJSON . ms`) that was only ever
+    // sound when the two heads were genuinely distinct types able to carry
+    // separate dictionaries. A later instance overwriting an earlier one
+    // outright would silently replace a working method with one that now
+    // recurses into itself through the very dictionary it belongs to (since
+    // `ms` no longer changes anything ghcts's dictionary lookup can tell
+    // apart) - an infinite loop with no exception, since nothing here is
+    // actually broken from the RTS's point of view. Merging keeps the first
+    // definition of each method name (the earliest, and typically the most
+    // direct, declaration) and only fills in a method a prior instance left
+    // for the class's default, so the redundant instances add nothing but
+    // gaps they happen to fill.
+    const existing = this.instances.get(key);
+    if (existing) {
+      const methods = new Map(existing.methods);
+      for (const [name, value] of info.methods) if (!methods.has(name)) methods.set(name, value);
+      this.instances.set(key, { ...existing, methods });
+    } else {
+      this.instances.set(key, info);
+    }
     const group = this.byClass.get(info.cls);
     if (group) group.push(info);
     else this.byClass.set(info.cls, [info]);
@@ -2233,10 +2311,24 @@ export function elaborateProgram(
         name: member.name,
         surfaceName: member.surfaceName ?? member.name,
         type: deFamily(signature.type),
-        // A constraint already mentioning only the class's own variables is the
-        // class constraint over again, not an extra dictionary parameter.
+        // Drop only a constraint that is *literally* the enclosing class's own
+        // constraint written out again (same class, same parameters in the
+        // same order) - GHC treats that as redundant, not a second dictionary.
+        // A constraint that merely *mentions* only the class's own variables,
+        // such as `Eq a` inside `class C a where f :: Eq a => a -> Bool`, is a
+        // genuine, separate per-method dictionary requirement and must be
+        // kept: the previous filter dropped every such constraint (and any
+        // constraint with no free variables at all, like `Eq Int`, since an
+        // empty variable set can never contain one "not in variables"),
+        // producing method schemes and instance/default bindings missing an
+        // argument GHC's own elaboration passes.
         ownContext: signature.context
-          .filter((c) => c.types.some((t) => typeVars(t).some((v) => !variables.includes(v))))
+          .filter(
+            (c) =>
+              c.cls !== decl.name ||
+              c.types.length !== variables.length ||
+              c.types.some((t, i) => showType(t) !== showType(varType(variables[i]!))),
+          )
           .map((c) => ({ cls: c.cls, types: c.types.map(deFamily) })),
         hasDefault: own.has(member.name),
         ...(declared ? { defaultContext: declared.context, defaultType: declared.type } : {}),
@@ -3244,6 +3336,10 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
     switch (e.tag) {
       case "var": {
         const name = renames.get(e) ?? e.name;
+        if (args && args.length) {
+          const direct = elaborator.specializeMethod(name, args);
+          if (direct) return direct;
+        }
         return args && args.length ? applyAll(variable(name, e.span), args) : variable(name, e.span);
       }
       case "int": {

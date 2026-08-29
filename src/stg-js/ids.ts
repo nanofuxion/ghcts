@@ -158,7 +158,17 @@ export function makeIdentForId(
   const mod = currentModule;
   const suffixNum = num === undefined ? "" : `_${intBS(num)}`;
   const suffixType = idType === IdType.IdPlain ? "" : idType === IdType.IdEntry ? "_e" : "_con_e";
-  const suffixUniq = exported ? "" : `_${uniqueClass}_${word64BS(BigInt(i.unique))}`;
+  // A real top-level declaration is exported *and* has a real source name, so
+  // its OccName is already distinct from every sibling and the name-only
+  // symbol GHC's own convention gives it never collides. `i.internal` marks
+  // the other case: core-to-stg.ts's `atom()` floats a literal-constructor
+  // RHS to the top level (Sinker.hs's `alwaysSinkable`) under the single
+  // literal name "t" every time, and marks it `exported` only so liveness
+  // analysis treats it as global (see the field's own doc comment) - it is
+  // not a real source declaration and two of them collide on the same
+  // name-only symbol otherwise, silently aliasing unrelated literals.
+  const suffixUniq =
+    exported && i.internal !== true ? "" : `_${uniqueClass}_${word64BS(BigInt(i.unique))}`;
   return name(mkJsSymbol(exported, mod, i.name) + suffixNum + suffixType + suffixUniq);
 }
 

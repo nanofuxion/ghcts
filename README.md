@@ -45,8 +45,8 @@ Haskell-to-JavaScript projects:
   structure (parse, module resolution, typechecking) and layout-sensitive
   parsing patterns.
 
-These projects are tracked as git submodules under `references/`. After
-cloning, initialize them with:
+miso, GHCJS, GHC, and aihc are tracked as git submodules under `references/`.
+After cloning, initialize them with:
 
 ```sh
 git submodule update --init --recursive

@@ -570,6 +570,14 @@ class Parser {
     const exports: string[] = [];
     const reexports: string[] = [];
     const declarations: Declaration[] = [];
+    // No `module X where` header: the lexer still opens an implicit
+    // top-level context around every declaration (the Haskell report's own
+    // rule), so it must be entered here the same way the header branch below
+    // enters its own `where`-opened one.
+    if (!this.at("module")) {
+      this.acceptLayoutOpen();
+      this.skipLines();
+    }
     if (this.at("module")) {
       this.take();
       name = this.take().text;

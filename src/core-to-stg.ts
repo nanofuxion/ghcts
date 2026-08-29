@@ -181,13 +181,51 @@ class Converter {
         // return frame was already pushed.
         const scrutinee = this.expr(e.scrutinee, floats);
         const alts = e.alts.map((alt) => this.alt(alt));
-        return done({
-          tag: "StgCase",
-          scrutinee,
-          binder: e.binder,
-          altType: altTypeOf(e.alts, e.scrutinee),
-          alts,
-        });
+        // `case v of b { ... }`: inside the alternatives `b` and `v` denote the
+        // same value, but `b` denotes it already evaluated - it is what the
+        // return frame leaves in R1 - while `v` is still the original,
+        // possibly-unentered pointer. GHC's CoreToStg leaves only `b` behind,
+        // so `v` is not free in the alternatives and the return frame does not
+        // save it. ghcts kept both, which cost a stack slot per frame *and* a
+        // redundant re-entry of an already-forced value at every use.
+        // Rewriting `v` to `b` here is what makes the emitted frame
+        // `h$p2(acc, cont)` rather than `h$p3(n, acc, cont)`, matching GHC.
+        //
+        // Both binders must carry a runtime value for the swap to be
+        // meaningful: a void binder (the state token) occupies no slot, and
+        // `arity === 0` is how that is recorded.
+        const scrutVar =
+          scrutinee.tag === "StgApp" && scrutinee.args.length === 0 ? scrutinee.fn : undefined;
+        const substituted =
+          scrutVar !== undefined &&
+          scrutVar.unique !== e.binder.unique &&
+          scrutVar.arity !== 0 &&
+          e.binder.arity !== 0
+            ? alts.map((alt) => ({ ...alt, body: substBinder(alt.body, scrutVar, e.binder) }))
+            : alts;
+        // A `case` that tests a constructor tag or a literal proves what no
+        // type annotation had to: only a data value can be matched against
+        // `DataAlt`/`LitAlt`, so the scrutinee is a heap constructor and never
+        // a bare function. That is precisely `not (mightBeFunTy (idType i))`,
+        // and it is the fact `genApp` needs to emit `h$e(x)` rather than send
+        // the value through the generic apply. It matters most in the Prelude,
+        // where every instance method written `(+) (I a) (I b) = ...` forces
+        // both of its arguments through exactly such a `case`, twice per
+        // arithmetic operation.
+        const altType = altTypeOf(e.alts, e.scrutinee);
+        if (
+          scrutVar !== undefined &&
+          scrutVar.mightBeFun === undefined &&
+          (altType.tag === "AlgAlt" || altType.tag === "PrimAlt")
+        )
+          scrutVar.mightBeFun = false;
+        // The case binder stands for exactly the scrutinee's value, so what the
+        // scrutinee's type proved about it holds of the binder too. Carrying
+        // this over is what lets `genApp` emit `h$e(x)` instead of routing the
+        // binder through the generic apply (see `Binder.mightBeFun`).
+        if (substituted !== alts && scrutVar!.mightBeFun === false && e.binder.mightBeFun === undefined)
+          e.binder.mightBeFun = false;
+        return done({ tag: "StgCase", scrutinee, binder: e.binder, altType, alts: substituted });
       }
       case "App": {
         const [head, args] = flatten(e);
@@ -326,6 +364,50 @@ function altTypeOf(alts: readonly CoreAlt[], scrutinee: CoreExpr): AltType {
  * shape is unknown here. */
 const altTypeOfExpr = (e: CoreExpr): AltType =>
   e.tag === "Op" || e.tag === "Lit" ? { tag: "PrimAlt" } : { tag: "PolyAlt" };
+
+/** Replace every occurrence of one binder with another throughout an STG
+ * expression. Used for the `case v of b` rewrite in `expr` above.
+ *
+ * Binders are compared by `unique`, and a shadowing binding introduces a
+ * *different* binder object with its own unique, so no scope tracking is
+ * needed: a name that shadows `from` simply never matches it. */
+function substBinder(expr: StgExpr, from: Binder, to: Binder): StgExpr {
+  const sub = (b: Binder): Binder => (b.unique === from.unique ? to : b);
+  const arg = (a: StgArg): StgArg =>
+    a.tag === "StgVarArg" && a.id.unique === from.unique ? { ...a, id: to } : a;
+  const rhs = (r: StgRhs): StgRhs =>
+    r.tag === "StgRhsCon"
+      ? { ...r, args: r.args.map(arg) }
+      : { ...r, freeVars: r.freeVars.map(sub), body: go(r.body) };
+  const go = (e: StgExpr): StgExpr => {
+    switch (e.tag) {
+      case "StgApp":
+        return { ...e, fn: sub(e.fn), args: e.args.map(arg) };
+      case "StgLit":
+        return e;
+      case "StgConApp":
+      case "StgOpApp":
+        return { ...e, args: e.args.map(arg) };
+      case "StgCase":
+        return {
+          ...e,
+          scrutinee: go(e.scrutinee),
+          alts: e.alts.map((a) => ({ ...a, body: go(a.body) })),
+        };
+      case "StgLet":
+      case "StgLetNoEscape":
+        return {
+          ...e,
+          binding:
+            e.binding.tag === "StgNonRec"
+              ? { ...e.binding, rhs: rhs(e.binding.rhs) }
+              : { ...e.binding, pairs: e.binding.pairs.map(([b, r]): [Binder, StgRhs] => [b, rhs(r)]) },
+          body: go(e.body),
+        };
+    }
+  };
+  return go(expr);
+}
 
 function freeVarsOf(expr: StgExpr): Set<Binder> {
   const free = new Set<Binder>();

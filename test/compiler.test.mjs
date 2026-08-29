@@ -161,13 +161,15 @@ test('collects module-owned values, constructors, and record fields before resol
 
 test('inserts virtual layout punctuation without losing source tokens', () => {
   const tokens = applyLayout(lex('main = let\n  x = 1\n  y = 2\nin x + y\n', 'Layout.hs').tokens);
-  assert.deepEqual(tokens.filter(token => token.kind === 'symbol').map(token => token.text), ['=', '{', '=', ';', '=', '}', '+']);
+  // A leading `{`/trailing `}` wrap the whole module now too: the Haskell
+  // report's own top-level layout rule applies even without `module X where`.
+  assert.deepEqual(tokens.filter(token => token.kind === 'symbol').map(token => token.text), ['{', '=', '{', '=', ';', '=', '}', '+', '}']);
 });
 
 test('does not treat a brace character literal as explicit layout punctuation', () => {
   const tokens = applyLayout(lex('main = do\n  token \'{\'\n  value <- next\n  token \'}\'\n', 'CharLayout.hs').tokens);
   assert.deepEqual(tokens.filter(token => token.kind === 'char').map(token => token.text), ['{', '}']);
-  assert.deepEqual(tokens.filter(token => token.virtual).map(token => token.text), ['{', ';', ';', '}']);
+  assert.deepEqual(tokens.filter(token => token.virtual).map(token => token.text), ['{', '{', ';', ';', '}', '}']);
 });
 
 test('retains constraints on ordinary top-level signatures', () => {

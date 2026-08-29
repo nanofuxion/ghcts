@@ -950,8 +950,18 @@ foreign import javascript unsafe "((a,b) => b.startsWith(a))" jsStringIsPrefixOf
 foreign import javascript unsafe "((a,b) => b.endsWith(a))" jsStringIsSuffixOf :: JSStringPrim -> JSStringPrim -> Bool
 foreign import javascript unsafe "((a,b) => b.includes(a))" jsStringIsInfixOf :: JSStringPrim -> JSStringPrim -> Bool
 foreign import javascript unsafe "((n,s) => s.repeat(n < 0 ? 0 : n))" jsStringReplicate :: IntPrim -> JSStringPrim -> JSStringPrim
-foreign import javascript unsafe "((sep,s) => s.split(sep).length)" jsStringSplitCount :: JSStringPrim -> JSStringPrim -> IntPrim
-foreign import javascript unsafe "((sep,s,i) => s.split(sep)[i])" jsStringSplitAt :: JSStringPrim -> JSStringPrim -> IntPrim -> JSStringPrim
+-- \`splitOn\` below asks for the piece count once and then for each piece by
+-- index, so a naive \`s.split(sep)[i]\` re-splits the whole string once per
+-- piece: quadratic in the number of pieces, and quadratic in the input length
+-- on top of that. A JS array cannot be handed back to Haskell here (a raw
+-- array is an object, which the generic apply path treats differently from a
+-- machine value), so the split is memoised on the JS side instead. One entry
+-- is enough: \`splitOnFrom\` walks \`i\` upwards over one fixed \`(sep, s)\` pair,
+-- so every call after the first hits the cache and the whole traversal is one
+-- split. Keyed on both arguments and re-split whenever either changes, so the
+-- result is always the same as the uncached version.
+foreign import javascript unsafe "((sep,s) => { const c = globalThis.h$ghctsSplit; if (c !== undefined && c.sep === sep && c.s === s) return c.a.length; const a = s.split(sep); globalThis.h$ghctsSplit = { sep: sep, s: s, a: a }; return a.length; })" jsStringSplitCount :: JSStringPrim -> JSStringPrim -> IntPrim
+foreign import javascript unsafe "((sep,s,i) => { const c = globalThis.h$ghctsSplit; if (c !== undefined && c.sep === sep && c.s === s) return c.a[i]; const a = s.split(sep); globalThis.h$ghctsSplit = { sep: sep, s: s, a: a }; return a[i]; })" jsStringSplitAt :: JSStringPrim -> JSStringPrim -> IntPrim -> JSStringPrim
 
 -- ------------------------------------------------------------------ core ---
 
@@ -995,6 +1005,12 @@ pack :: [Char] -> JSString
 pack cs = case packOnto cs (jsStringEmpty 0) of
   s -> JSString s
 
+-- Forces one cons cell at a time. A JS-side walker reading \`.d1\`/\`.d2\` off
+-- the cells would be faster, but it cannot tell a forced \`C#\` box from an
+-- unevaluated thunk - both carry a \`.d1\`, and a thunk's is whatever its first
+-- free variable happens to be. Reading that as a code point silently builds
+-- the wrong string, or throws \`RangeError: invalid code point\`. Only the RTS
+-- can force safely, so this stays in Haskell.
 packOnto :: [Char] -> JSStringPrim -> JSStringPrim
 packOnto cs acc = case cs of
   [] -> acc

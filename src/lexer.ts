@@ -221,6 +221,19 @@ export function applyLayout(tokens: Token[]): Token[] {
   // A character or string literal may have text such as `{`, but only source
   // punctuation participates in explicit-brace and delimiter handling.
   const isSymbol = (token: Token, text: string) => token.kind === 'symbol' && token.text === text;
+  // The Haskell report's own top-level rule: `L (t:ts) [] = {n} : L (t:ts) [n]`
+  // when the first lexeme isn't `{` or `module`. Without this, a file with no
+  // `module X where` header never opens an implicit context around its
+  // top-level declarations, so nothing separates consecutive ones - a
+  // signature's type is then scanned by the parser only up to the next
+  // `;`/`}` it finds at *any* depth, which is the first one inside the
+  // following equation's own `do` block, silently swallowing that block's
+  // statements into the signature's (unused) type text.
+  const first = nextCode(0);
+  if (first && first.kind !== 'eof' && !isSymbol(first, '{') && !(first.kind === 'ident' && first.text === 'module')) {
+    contexts.push({ indent: first.span.column, explicit: false, delimiterDepth: 0, fromLet: false });
+    result.push(virtual('{', first));
+  }
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index];
     if (token.kind === 'newline') {
