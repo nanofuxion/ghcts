@@ -2,6 +2,7 @@
   "name": "ghcts",
   "version": "0.1.0",
   "description": "A TypeScript-native Haskell to TypeScript compiler",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
