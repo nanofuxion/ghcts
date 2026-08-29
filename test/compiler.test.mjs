@@ -332,6 +332,15 @@ test('counts each atomic constructor field, including Type then type-variable', 
   );
 });
 
+test('a type synonym for a string literal keeps its quotes', () => {
+  const parsed = parseModule('module M where\ntype Foo = "foo"\n', 'Sym.hs');
+  assert.deepEqual(parsed.diagnostics, []);
+  const alias = parsed.module.ast.declarations.find((declaration) => declaration.tag === 'typeAlias');
+  // `KnownSymbol` solving keys on the quoted spelling, so dropping the quotes
+  // here left `Proxy Foo` with no symbol to match.
+  assert.equal(alias.target, '"foo"');
+});
+
 test('does not treat deriving as a constructor field or type argument', () => {
   const parsed = parseModule(
     'module Model where\ndata Feed = FeedHome | FeedChannel MisoString\n  deriving (Eq)\n',

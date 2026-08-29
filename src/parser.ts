@@ -749,7 +749,11 @@ class Parser {
         !this.at("}") &&
         this.current().kind !== "eof"
       )
-        target.push(this.take().text);
+        // `type Foo = "foo"`: a type-level string literal is spelled with its
+        // quotes everywhere else a type is written, and `KnownSymbol` solving
+        // keys on them (see `elaborate.ts`). Taking `.text` here dropped them,
+        // so the synonym expanded to a bare `foo` no symbol could match.
+        target.push(tokenSpelling(this.take()));
       this.skipLines();
       return {
         tag: "typeAlias",
