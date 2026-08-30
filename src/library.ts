@@ -2881,12 +2881,21 @@ class ToJSValue a where
 class FromJSValue a where
   fromJSValue :: JSVal -> IO (Maybe a)
   fromJSValueUnchecked :: JSVal -> IO a
-  fromJSValueUnchecked x = fromJSValue x >>= forceJSValue
+  fromJSValueUnchecked x = fromJSValue x >>= forceJSValue x
 
-forceJSValue :: Maybe a -> IO a
-forceJSValue m = case m of
-  Nothing -> error "GHCJS.Marshal.fromJSValUnchecked: type mismatch"
+-- The value is carried into the failure on purpose. miso's whole FFI surface
+-- bottoms out here - every fromJSValUnchecked_Int, _Double, _Text and _Bool in
+-- Miso.DSL.FFI delegates to this module, as does Miso.JSON's decoder - so a
+-- bare "type mismatch" names neither the call site nor what arrived, and the
+-- values that reach it are exactly the ones a host supplies, which is where
+-- the surprises live.
+forceJSValue :: JSVal -> Maybe a -> IO a
+forceJSValue v m = case m of
+  Nothing -> case v of
+    JSVal x -> error ("GHCJS.Marshal.fromJSValUnchecked: type mismatch: got " ++ jsAscii (describeJSVal x))
   Just x -> pure x
+
+foreign import javascript unsafe "((v) => { var t = v === null ? 'null' : typeof v; var s; try { s = JSON.stringify(v); } catch (e) { s = String(v); } if (s === undefined) s = String(v); if (s.length > 60) s = s.slice(0, 60) + '...'; return t + ' ' + s; })" describeJSVal :: JSValPrim -> JSStringPrim
 
 toJSVal :: ToJSValue a => a -> IO JSVal
 toJSVal x = toJSValue x
