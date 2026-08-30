@@ -1242,6 +1242,26 @@ const programs = [
     expect: 17,
   },
   {
+    // `fromJSValUnchecked` coerces, it does not check. miso decodes a JSON
+    // boolean by reading it as an `Int` and matching 0 or 1
+    // (`Miso.JSON.fromJSVal_Value`), so routing the unchecked read through the
+    // checked one rejected every boolean in a decoded payload.
+    name: "GHCJS.Marshal: an unchecked Int read coerces a JS boolean",
+    source: [
+      "module Main where",
+      "import qualified GHCJS.Marshal as Marshal",
+      "import GHC.JS.Prim",
+      'foreign import javascript unsafe "((b) => b)" mkBool :: Bool -> JSValPrim',
+      "main :: IO Int",
+      "main = do",
+      "  t <- Marshal.fromJSValUnchecked (JSVal (mkBool True)) :: IO Int",
+      "  f <- Marshal.fromJSValUnchecked (JSVal (mkBool False)) :: IO Int",
+      "  pure (t * 10 + f)",
+      "",
+    ].join("\n"),
+    expect: 10,
+  },
+  {
     // A round trip through JavaScript: 7 goes out as a JS number and comes
     // back as an `Int`, and the list becomes a real JS array (its `.length` is
     // read by JavaScript, not by Haskell) before coming back as `[Int]`.

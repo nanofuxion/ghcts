@@ -2921,6 +2921,9 @@ foreign import javascript unsafe "((x) => x === null || x === undefined)" isNull
 foreign import javascript unsafe "((x) => x)" valToBool :: JSValPrim -> Bool
 foreign import javascript unsafe "((x) => x)" valToDouble :: JSValPrim -> DoublePrim
 foreign import javascript unsafe "((x) => x | 0)" valToInt :: JSValPrim -> IntPrim
+-- The coercions the unchecked reads use, spelled the way JavaScript spells them.
+foreign import javascript unsafe "((x) => +x)" valToNumber :: JSValPrim -> DoublePrim
+foreign import javascript unsafe "((x) => !!x)" valToTruthy :: JSValPrim -> Bool
 foreign import javascript unsafe "((x) => x)" valToString :: JSValPrim -> JSStringPrim
 foreign import javascript unsafe "((x) => x.codePointAt(0))" valToChar :: JSValPrim -> CharPrim
 foreign import javascript unsafe "((x) => x.length)" arrayLengthVal :: JSValPrim -> IntPrim
@@ -3001,8 +3004,15 @@ instance FromJSValue JSVal where
   fromJSValue x = pure (Just x)
   fromJSValueUnchecked x = pure x
 
+-- fromJSValue asks whether the value *is* this type; fromJSValueUnchecked
+-- coerces it, the way JavaScript would. Routing the unchecked one through the
+-- checked one would be stricter than GHCJS, and code written against GHCJS
+-- relies on the coercion: miso decodes a JSON boolean by reading it as an Int
+-- and matching 0 or 1 (Miso.JSON.fromJSVal_Value), which a checked read
+-- rejects outright.
 instance FromJSValue Bool where
   fromJSValue (JSVal x) = if isBoolVal x then fromBoolStep x else pure Nothing
+  fromJSValueUnchecked (JSVal x) = pure (valToTruthy x)
 
 fromBoolStep :: JSValPrim -> IO (Maybe Bool)
 fromBoolStep x = case valToBool x of
@@ -3010,6 +3020,7 @@ fromBoolStep x = case valToBool x of
 
 instance FromJSValue Int where
   fromJSValue (JSVal x) = if isNumberVal x then fromIntStep x else pure Nothing
+  fromJSValueUnchecked (JSVal x) = pure (I (valToInt x))
 
 fromIntStep :: JSValPrim -> IO (Maybe Int)
 fromIntStep x = case valToInt x of
@@ -3017,6 +3028,7 @@ fromIntStep x = case valToInt x of
 
 instance FromJSValue Double where
   fromJSValue (JSVal x) = if isNumberVal x then fromDoubleStep x else pure Nothing
+  fromJSValueUnchecked (JSVal x) = pure (DoubleBox (valToNumber x))
 
 fromDoubleStep :: JSValPrim -> IO (Maybe Double)
 fromDoubleStep x = case valToDouble x of
@@ -3026,6 +3038,7 @@ fromDoubleStep x = case valToDouble x of
 -- the nearest single-precision value to it, which is what \`Math.fround\` gives.
 instance FromJSValue Float where
   fromJSValue (JSVal x) = if isNumberVal x then fromFloatStep x else pure Nothing
+  fromJSValueUnchecked (JSVal x) = pure (FloatBox (primDoubleToFloat (valToNumber x)))
 
 fromFloatStep :: JSValPrim -> IO (Maybe Float)
 fromFloatStep x = case valToDouble x of
