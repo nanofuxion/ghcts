@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { resolve } from 'node:path';
-import { readFile } from 'node:fs/promises';
-import { build, formatDiagnostic } from './index.js';
+import { build, formatDiagnostic, loadConfig } from './index.js';
 import { serveProject } from './server.js';
 
 const [command, ...args] = process.argv.slice(2);
@@ -23,7 +22,7 @@ if (!['build', 'check', 'serve'].includes(command ?? '') || !project || (port !=
   }
 } else {
   const dir = resolve(project);
-  const config = JSON.parse(await readFile(resolve(dir, 'ghcts.json'), 'utf8'));
+  const config = await loadConfig(dir);
   const result = await build({ project: dir, config, emit: command === 'build' });
   for (const diagnostic of result.diagnostics) console.error(formatDiagnostic(diagnostic));
   if (!result.diagnostics.some(d => d.severity === 'error') && command === 'build')

@@ -2,8 +2,7 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
-import { build } from './build.js';
-import { readFile } from 'node:fs/promises';
+import { build, loadConfig } from './build.js';
 import { formatDiagnostic } from './diagnostics.js';
 
 const mimeTypes: Record<string, string> = {
@@ -16,7 +15,7 @@ export interface RunningServer { server: Server; url: string; close(): Promise<v
 
 /** Build a project, then serve its browser output using only Node's standard library. */
 export async function serveProject(options: ServeOptions): Promise<RunningServer> {
-  const config = JSON.parse(await readFile(`${options.project}/ghcts.json`, 'utf8'));
+  const config = await loadConfig(options.project);
   const result = await build({ project: options.project, config });
   if (result.diagnostics.some(d => d.severity === 'error')) throw new Error(result.diagnostics.map(formatDiagnostic).join('\n'));
   // The new pipeline emits a GHC-shaped .jsexe rather than per-target trees,

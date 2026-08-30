@@ -13,7 +13,7 @@
  */
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { parseCabalLibrary } from "./cabal.js";
+import { listCabalTargets, parseCabalLibrary } from "./cabal.js";
 import { parseModule } from "./parser.js";
 import { elaborateProgram, USER_MAIN } from "./elaborate.js";
 import { RTS_SEATS } from "./prelude.js";
@@ -191,6 +191,87 @@ function ghcModules(config: StgToJSConfig, root: string, bindings: StgBinding[])
   ];
 }
 
+/** Finds a dependency with no `ghcts.json` sourceRoot to search from yet: the
+ * nearest ancestor of `project` holding `<name>.cabal`, or a direct child of
+ * that ancestor holding it. The first covers a dependency that IS an
+ * ancestor (`sample-app`'s parent directory is the `miso` checkout itself);
+ * the second covers one that is a sibling of an ancestor (`references/miso`
+ * next to `references/misogram`) - the two shapes every dependency in this
+ * repo actually uses. */
+async function findCabalDir(start: string, name: string): Promise<string | undefined> {
+  const hasIt = (dir: string) => access(join(dir, `${name}.cabal`)).then(() => true, () => false);
+  for (let dir = resolve(start); ; dir = dirname(dir)) {
+    if (await hasIt(dir)) return dir;
+    try {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const child = join(dir, entry.name);
+        if (await hasIt(child)) return child;
+      }
+    } catch {
+      // Unreadable directory: nothing more to find at this level.
+    }
+    if (dirname(dir) === dir) return undefined;
+  }
+}
+
+/** Derives a `GhctsConfig` straight from a project's own `.cabal` file, for a
+ * project with no `ghcts.json` at all - so a checkout with only the `.cabal`
+ * layout it would hand to `cabal build` builds under ghcts too.
+ *
+ * Reads the `.cabal`'s sole `executable` stanza (a `library`-only package has
+ * no runnable entry to guess, and cabal flag selection for a native/WASM
+ * build usually lives outside the app's own file - in a `cabal.project` or a
+ * Makefile - so this only ever derives the plain default build). Each of its
+ * `build-depends` that resolves to a discoverable `<name>.cabal` becomes both
+ * a dependency and a source root; one that does not (miso's boot packages,
+ * which ghcts's own Prelude already covers) is silently skipped, exactly the
+ * set a hand-written `ghcts.json` in this repo already leaves out. */
+export async function deriveCabalConfig(project: string): Promise<GhctsConfig | undefined> {
+  const cabalFile = (await readdir(project)).find((name) => name.endsWith(".cabal"));
+  if (!cabalFile) return undefined;
+  const source = await readFile(join(project, cabalFile), "utf8");
+  const target = listCabalTargets(source).find((t) => t.startsWith("executable:"));
+  if (!target) return undefined;
+
+  const own = parseCabalLibrary(source, [], target);
+  const sourceRoots = own.sourceDirs.length ? own.sourceDirs : ["."];
+  const dependencies: string[] = [];
+  for (const name of own.buildDepends) {
+    if (name === "base") continue;
+    const dir = await findCabalDir(project, name);
+    if (!dir) continue;
+    const depSource = await readFile(join(dir, `${name}.cabal`), "utf8");
+    const dep = parseCabalLibrary(depSource, [], "library");
+    dependencies.push(name);
+    for (const root of dep.sourceDirs.length ? dep.sourceDirs : ["."])
+      sourceRoots.push(relative(project, join(dir, root)));
+  }
+
+  return {
+    version: 1,
+    sourceRoots,
+    entry: { module: "Main", export: "main" },
+    ...(dependencies.length ? { dependencies } : {}),
+    targets: ["browser", "node"],
+    outDir: "dist",
+  };
+}
+
+/** Reads a project's `ghcts.json`, or - when there is none - derives one from
+ * its `.cabal` file (`deriveCabalConfig`). Throws the original ENOENT when
+ * neither exists, so a project that is not a cabal package at all still gets
+ * the familiar "no such file" pointing at `ghcts.json`. */
+export async function loadConfig(project: string): Promise<GhctsConfig> {
+  try {
+    return JSON.parse(await readFile(join(project, "ghcts.json"), "utf8"));
+  } catch (cause) {
+    const derived = await deriveCabalConfig(project);
+    if (derived) return derived;
+    throw cause;
+  }
+}
+
 /** Where a dependency lives: the nearest ancestor of one of the source roots
  * holding `<name>.cabal`.  A source root already points inside the package it
  * belongs to (miso's is `../../miso/src`), so nothing further has to be
@@ -229,7 +310,10 @@ export async function build(options: {
   emit?: boolean;
 }): Promise<BuildResult> {
   const { project, config } = options;
-  const stgConfig = defaultStgToJSConfig;
+  const stgConfig = {
+    ...defaultStgToJSConfig,
+    optimization: config.optimization ?? defaultStgToJSConfig.optimization,
+  };
 
   const loaded = await loadProgram(project, config);
   const diagnostics = [...loaded.diagnostics];

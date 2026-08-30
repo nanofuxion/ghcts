@@ -12,6 +12,8 @@ export interface CabalLibrary {
   jsSources: string[];
   buildDepends: string[];
   cppOptions: string[];
+  /** `main-is`, for an `executable` stanza; empty for a `library`. */
+  mainIs: string[];
 }
 
 /** A stanza also records the `common` stanzas it inherits from. */
@@ -21,7 +23,7 @@ interface Stanza extends CabalLibrary {
 
 const FIELDS: Record<string, keyof Stanza> = {
   'hs-source-dirs': 'sourceDirs', 'js-sources': 'jsSources', 'build-depends': 'buildDepends',
-  'cpp-options': 'cppOptions', 'import': 'imports',
+  'cpp-options': 'cppOptions', 'import': 'imports', 'main-is': 'mainIs',
 };
 
 interface Line { indent: number; text: string }
@@ -30,7 +32,26 @@ interface Line { indent: number; text: string }
  * has already matched, which is what `elif`/`else` test. */
 interface Frame { indent: number; active: boolean; taken: boolean }
 
-export function parseCabalLibrary(source: string, flags: Iterable<string> = []): CabalLibrary {
+/** `target` picks which stanza to read: `"library"` (the default), or
+ * `"executable:<name>"` for one of the package's executables - the shape
+ * ghcts's own dependency-free projects (an app.cabal with no library, just
+ * `executable app`) actually use. */
+/** Every stanza a `.cabal` file declares, as `parseCabalLibrary`'s `target`
+ * values: `"library"` and/or one `"executable:<name>"` per executable.
+ * Lets a caller with no target in mind - deriving a project's config with no
+ * `ghcts.json` to say which one - see what is actually there before picking. */
+export function listCabalTargets(source: string): string[] {
+  const targets: string[] = [];
+  for (const raw of source.split(/\r?\n/)) {
+    const text = raw.replace(/--.*$/, '').trim();
+    if (/^library\b/.test(text)) targets.push('library');
+    const exe = /^executable\s+(\S+)/.exec(text);
+    if (exe) targets.push(`executable:${exe[1]}`);
+  }
+  return targets;
+}
+
+export function parseCabalLibrary(source: string, flags: Iterable<string> = [], target = 'library'): CabalLibrary {
   const lines: Line[] = [];
   for (const raw of source.split(/\r?\n/)) {
     const stripped = raw.replace(/--.*$/, '').replace(/\s+$/, '');
@@ -46,7 +67,7 @@ export function parseCabalLibrary(source: string, flags: Iterable<string> = []):
   const stanza = (name: string): Stanza => {
     const existing = stanzas.get(name);
     if (existing) return existing;
-    const fresh: Stanza = { sourceDirs: [], jsSources: [], buildDepends: [], cppOptions: [], imports: [] };
+    const fresh: Stanza = { sourceDirs: [], jsSources: [], buildDepends: [], cppOptions: [], mainIs: [], imports: [] };
     stanzas.set(name, fresh);
     return fresh;
   };
@@ -59,7 +80,13 @@ export function parseCabalLibrary(source: string, flags: Iterable<string> = []):
   for (const line of lines) {
     if (line.indent === 0) {
       const common = /^common\s+([A-Za-z0-9_-]+)/.exec(line.text);
-      current = /^library\b/.test(line.text) ? stanza('library') : common ? stanza(common[1]) : undefined;
+      {
+        const exe = /^executable\s+(\S+)/.exec(line.text);
+        current = /^library\b/.test(line.text) ? stanza('library')
+          : exe ? stanza(`executable:${exe[1]}`)
+          : common ? stanza(common[1])
+          : undefined;
+      }
       stack = []; fieldName = undefined;
       continue;
     }
@@ -108,8 +135,11 @@ export function parseCabalLibrary(source: string, flags: Iterable<string> = []):
 
   // `import: client` splices a `common` stanza's fields in ahead of the
   // library's own, which is the order cabal itself composes them in.
-  const library = stanzas.get('library') ?? stanza('library');
-  const merged: CabalLibrary = { sourceDirs: [], jsSources: [], buildDepends: [], cppOptions: [] };
+  // `target` names an exact stanza; falling back to `library` (rather than
+  // failing) keeps every existing caller - which never passed `target` - on
+  // its old behaviour.
+  const library = stanzas.get(target) ?? stanzas.get('library') ?? stanza('library');
+  const merged: CabalLibrary = { sourceDirs: [], jsSources: [], buildDepends: [], cppOptions: [], mainIs: [] };
   for (const source of [...library.imports.map(name => stanzas.get(name)), library]) {
     if (!source) continue;
     for (const key of Object.keys(merged) as (keyof CabalLibrary)[]) merged[key].push(...source[key]);

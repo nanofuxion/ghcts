@@ -1,4 +1,4 @@
-export { build, loadProgram } from './build.js';
+export { build, loadConfig, loadProgram } from './build.js';
 export { formatDiagnostic } from './diagnostics.js';
 export { serveProject } from './server.js';
 export { checkModule } from './typecheck.js';

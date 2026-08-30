@@ -7,6 +7,18 @@ import { applyLayout, lex, preprocess } from '../dist/lexer.js';
 import { parseModule } from '../dist/parser.js';
 import { collectInterface } from '../dist/interface.js';
 import { parseCabalLibrary } from '../dist/cabal.js';
+import { deriveCabalConfig } from '../dist/build.js';
+
+test('derives a ghcts.json from an executable-only .cabal, resolving a local dependency', async () => {
+  // sample-app has no ghcts.json - only app.cabal (an `executable` stanza) -
+  // and lives one directory inside the miso checkout, so miso.cabal is its
+  // own parent directory rather than a sibling.
+  const config = await deriveCabalConfig('references/miso/sample-app');
+  assert.equal(config.entry.module, 'Main');
+  assert.deepEqual(config.dependencies, ['miso']);
+  assert.ok(config.sourceRoots.includes('../src'));
+  assert.ok(config.sourceRoots.includes('../ffi/js'));
+});
 
 test('checks record selector types from their declared field signature', () => {
   const parsed = parseModule('module Main where\ndata Model = Model { counter :: Int }\nbad :: String\nbad = counter (Model 1)\n', 'RecordType.hs');
