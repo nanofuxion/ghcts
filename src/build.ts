@@ -308,14 +308,22 @@ export async function build(options: {
   project: string;
   config: GhctsConfig;
   emit?: boolean;
+  /** Logs each pipeline stage's duration and output size to stderr as it
+   * finishes. For diagnosing where a build's time or a bundle's bytes went -
+   * a normal run stays silent. */
+  verbose?: boolean;
 }): Promise<BuildResult> {
   const { project, config } = options;
   const stgConfig = {
     ...defaultStgToJSConfig,
     optimization: config.optimization ?? defaultStgToJSConfig.optimization,
   };
+  const started = Date.now();
+  const log = (message: string) =>
+    options.verbose && console.error(`[ghcts +${((Date.now() - started) / 1000).toFixed(2)}s] ${message}`);
 
   const loaded = await loadProgram(project, config);
+  log(`parsed ${loaded.modules.size} module${loaded.modules.size === 1 ? "" : "s"}`);
   const diagnostics = [...loaded.diagnostics];
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
@@ -330,13 +338,17 @@ export async function build(options: {
   // flat pile of ordinary declarations.
   const elaborated = elaborateProgram(loaded.modules, root, `${root}.hs`);
   diagnostics.push(...(elaborated.diagnostics ?? []));
+  log(`elaborated from \`${root}\``);
 
   const desugared = desugarModule(elaborated.module, `${root}.hs`);
   diagnostics.push(...desugared.diagnostics);
+  log(`desugared to ${desugared.program.binds.length} Core binding${desugared.program.binds.length === 1 ? "" : "s"}`);
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
   const stg = coreToStg(desugared.program);
+  log(`lowered to ${stg.bindings.length} STG binding${stg.bindings.length === 1 ? "" : "s"}`);
   const linked = link(stgConfig, ghcModules(stgConfig, root, stg.bindings));
+  log(`linked (rts ${linked.rts.length}B, lib ${linked.lib.length}B, out ${linked.out.length}B)`);
 
   // `link` only knows the boot packages' JavaScript, so the project's own
   // dependencies join it at the end of lib.js - where GHC puts a leaf package's
@@ -345,6 +357,7 @@ export async function build(options: {
   const packages = await packageJs(project, config);
   const lib = linked.lib + packages;
   const jsexe = { ...linked, lib, all: linked.rts + lib + linked.out + linked.runmain };
+  log(`packaged ${config.dependencies?.length ?? 0} dependenc${config.dependencies?.length === 1 ? "y" : "ies"}, all.js is ${jsexe.all.length}B`);
 
   if (options.emit) {
     const out = join(project, config.outDir, "jsexe");
@@ -358,6 +371,7 @@ export async function build(options: {
     ] as const) {
       await writeFile(join(out, name), text);
     }
+    log(`wrote jsexe to ${out}`);
   }
 
   return { diagnostics, jsexe };

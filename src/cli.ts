@@ -8,8 +8,9 @@ const projectFlag = args.indexOf('--project');
 const project = projectFlag >= 0 ? args[projectFlag + 1] : process.cwd();
 const portFlag = args.indexOf('--port');
 const port = portFlag >= 0 ? Number(args[portFlag + 1]) : undefined;
+const verbose = args.includes('--verbose');
 if (!['build', 'check', 'serve'].includes(command ?? '') || !project || (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535))) {
-  console.error('Usage: ghcts <build|check|serve> --project <directory> [--port <1-65535>]');
+  console.error('Usage: ghcts <build|check|serve> --project <directory> [--port <1-65535>] [--verbose]');
   process.exitCode = 2;
 } else if (command === 'serve') {
   try {
@@ -23,7 +24,7 @@ if (!['build', 'check', 'serve'].includes(command ?? '') || !project || (port !=
 } else {
   const dir = resolve(project);
   const config = await loadConfig(dir);
-  const result = await build({ project: dir, config, emit: command === 'build' });
+  const result = await build({ project: dir, config, emit: command === 'build', verbose });
   for (const diagnostic of result.diagnostics) console.error(formatDiagnostic(diagnostic));
   if (!result.diagnostics.some(d => d.severity === 'error') && command === 'build')
     console.log(resolve(dir, config.outDir, 'jsexe', 'all.js'));
