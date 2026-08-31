@@ -235,12 +235,29 @@ async function ghctsStg(caseDir) {
   const { desugarModule } = await import(join(ROOT, "dist/desugar.js"));
   const { coreToStg } = await import(join(ROOT, "dist/core-to-stg.js"));
   const { inlineKnownCalls } = await import(join(ROOT, "dist/core-opt/inline.js"));
-  const { forceStrictArgs } = await import(join(ROOT, "dist/core-opt/strictness.js"));
+  const { forceStrictArgs, argStrictness } = await import(join(ROOT, "dist/core-opt/strictness.js"));
   const config = JSON.parse(readFileSync(join(caseDir, "ghcts.json"), "utf8"));
   const loaded = await loadProgram(caseDir, config);
   const el = elaborateProgram(loaded.modules, "Main", "Main.hs");
   const core = desugarModule(el.module, "Main.hs").program;
-  return coreToStg(forceStrictArgs(inlineKnownCalls(core))).bindings;
+  const opt = inlineKnownCalls(core);
+  return { bindings: coreToStg(forceStrictArgs(opt)).bindings, strictness: argStrictness(opt) };
+}
+
+/** GHC prints one `<...>` per argument in `Str=`. An argument is strict when
+ * its demand starts with a use count or `S`; `A` means absent and `L` lazy.
+ * Nested parens carry unboxing detail this does not model yet. */
+function ghcStrictArgs(str) {
+  if (!str) return undefined;
+  const out = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of str) {
+    if (ch === "<" && depth++ === 0) { cur = ""; continue; }
+    if (ch === ">" && --depth === 0) { out.push(/^[0-9S]/.test(cur)); continue; }
+    if (depth > 0) cur += ch;
+  }
+  return out;
 }
 
 function runCase(c) {
@@ -282,12 +299,15 @@ mkdirSync(WORK, { recursive: true });
 
 let compared = 0;
 let mismatched = 0;
+let strictCompared = 0;
+let strictMismatched = 0;
 const missingAnalyses = new Set();
 
 for (const c of CORPUS) {
   if (only && c.name !== only) continue;
   const { dir, ghc } = runCase(c);
-  const ours = ghctsFacts(await ghctsStg(dir));
+  const { bindings, strictness } = await ghctsStg(dir);
+  const ours = ghctsFacts(bindings);
 
   if (show === c.name) {
     console.log(`--- GHC ---`);
@@ -297,7 +317,8 @@ for (const c of CORPUS) {
   }
 
   console.log(`\n=== ${c.name} ===`);
-  for (const want of c.want) {
+  for (const want_ of c.want) {
+    const want = want_;
     const g = ghc.get(want);
     const o = ours.get(want);
     if (!g && !o) continue;
@@ -332,11 +353,23 @@ for (const c of CORPUS) {
       mismatched++;
       console.log(`  ${want}: ${diffs.join("; ")}`);
     }
-    if (g.str) console.log(`      GHC Str=${g.str}${g.cpr ? ` Cpr=${g.cpr}` : ""}   ghcts: none`);
+    if (g.str) {
+      const want = ghcStrictArgs(g.str);
+      const got = strictness.get(want_);
+      const fmt = (a) => (a ? a.map((x) => (x ? "S" : "L")).join("") : "?");
+      const agree = want && got && want.length === got.length && want.every((x, i) => x === got[i]);
+      strictCompared++;
+      if (!agree) strictMismatched++;
+      console.log(
+        `      demand: GHC ${fmt(want)} vs ghcts ${fmt(got)}${agree ? " (agree)" : " <-- DIFFERS"}` +
+          `   [GHC Str=${g.str}${g.cpr ? ` Cpr=${g.cpr}` : ""}]`,
+      );
+    }
   }
 }
 
 console.log(`\ncompared ${compared}, mismatched ${mismatched}`);
+console.log(`demand signatures compared ${strictCompared}, disagreeing ${strictMismatched}`);
 if (missingAnalyses.size)
   console.log(`analyses GHC has and ghcts does not: ${[...missingAnalyses].join(", ")}`);
 process.exitCode = mismatched > 0 ? 1 : 0;

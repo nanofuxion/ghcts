@@ -150,6 +150,23 @@ function analyse(program: CoreProgram): Strictness {
   return known;
 }
 
+/** The analysis on its own, by binder name, so it can be checked against
+ * GHC's own demand signatures (`scripts/stg-diff.mjs`). GHC prints one
+ * `<...>` per argument in the `Str=` field of every STG binding, which is the
+ * same fact this computes: `true` where the argument is always forced. */
+export function argStrictness(program: CoreProgram): Map<string, boolean[]> {
+  const known = analyse(program);
+  const out = new Map<string, boolean[]>();
+  for (const b of program.binds) {
+    const pairs = b.tag === "NonRec" ? [[b.binder, b.rhs] as const] : b.pairs.map((x) => [x[0], x[1]] as const);
+    for (const [binder] of pairs) {
+      const sig = known.get(binder.unique);
+      if (sig) out.set(binder.name, sig);
+    }
+  }
+  return out;
+}
+
 /** Rewrite `f e1 .. en` so that every argument `f` is strict in is evaluated
  * by a `case` before the call. */
 export function forceStrictArgs(program: CoreProgram): CoreProgram {
