@@ -87,6 +87,25 @@ const CORPUS = [
     ],
     want: ["mk", "fstP"],
   },
+  {
+    name: "staticptr",
+    // The construct behind every main-thread event handler in miso. On device
+    // a `static` handler registers on the first render and never again, so
+    // this compares how each compiler lowers the form and its key.
+    pragmas: ["{-# LANGUAGE StaticPointers #-}"],
+    imports: ["import GHC.StaticPtr (StaticPtr, staticKey, deRefStaticPtr)"],
+    source: [
+      "handler :: Int -> Int",
+      "handler n = n + 1",
+      "ptr :: StaticPtr (Int -> Int)",
+      "ptr = static handler",
+      "useKey :: Int",
+      "useKey = length (show (staticKey ptr))",
+      "useVal :: Int -> Int",
+      "useVal = deRefStaticPtr ptr",
+    ],
+    want: ["handler", "ptr", "useKey", "useVal"],
+  },
 ];
 
 const args = process.argv.slice(2);
@@ -228,7 +247,15 @@ function runCase(c) {
   const dir = join(WORK, c.name);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  const src = ["module Main where", ...c.source, "main :: IO ()", "main = pure ()", ""].join("\n");
+  const src = [
+    ...(c.pragmas ?? []),
+    "module Main where",
+    ...(c.imports ?? []),
+    ...c.source,
+    "main :: IO ()",
+    "main = pure ()",
+    "",
+  ].join("\n");
   writeFileSync(join(dir, "Main.hs"), src);
   writeFileSync(
     join(dir, "ghcts.json"),
