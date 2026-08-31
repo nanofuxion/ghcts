@@ -20,6 +20,8 @@ import { RTS_SEATS } from "./prelude.js";
 import { BINDING_OVERRIDES } from "./binding-overrides.js";
 import { desugarModule } from "./desugar.js";
 import { coreToStg } from "./core-to-stg.js";
+import { inlineKnownCalls } from "./core-opt/inline.js";
+import { forceStrictArgs } from "./core-opt/strictness.js";
 import { genUnits, stgToJS } from "./stg-js/codegen.js";
 import { link, type ModuleCode } from "./linker/linker.js";
 import { runG, type IdCache } from "./stg-js/monad.js";
@@ -345,7 +347,20 @@ export async function build(options: {
   log(`desugared to ${desugared.program.binds.length} Core binding${desugared.program.binds.length === 1 ? "" : "s"}`);
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
-  const stg = coreToStg(desugared.program);
+  // GHC runs a Core-to-Core pipeline here; ghcts runs the one corner of it
+  // that needs no analysis to be sound. `optimization: "none"` skips it, so
+  // the un-optimised Core remains reachable for oracle comparison.
+  // Inlining first, so the strictness analysis sees the primops a class
+  // method is made of rather than an opaque call - the same reason GHC runs
+  // Specialise before DmdAnal.
+  const optimised =
+    stgConfig.optimization === "none"
+      ? desugared.program
+      : forceStrictArgs(inlineKnownCalls(desugared.program));
+  if (stgConfig.optimization !== "none")
+    log(`optimised Core, ${optimised.binds.length} binding${optimised.binds.length === 1 ? "" : "s"}`);
+
+  const stg = coreToStg(optimised);
   log(`lowered to ${stg.bindings.length} STG binding${stg.bindings.length === 1 ? "" : "s"}`);
   const linked = link(stgConfig, ghcModules(stgConfig, root, stg.bindings));
   log(`linked (rts ${linked.rts.length}B, lib ${linked.lib.length}B, out ${linked.out.length}B)`);

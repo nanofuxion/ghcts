@@ -8,6 +8,10 @@ import { parseModule } from '../dist/parser.js';
 import { collectInterface } from '../dist/interface.js';
 import { parseCabalLibrary } from '../dist/cabal.js';
 import { deriveCabalConfig } from '../dist/build.js';
+import { inlineKnownCalls } from '../dist/core-opt/inline.js';
+import { forceStrictArgs } from '../dist/core-opt/strictness.js';
+import { elaborateProgram } from '../dist/elaborate.js';
+import { desugarModule } from '../dist/desugar.js';
 
 test('derives a ghcts.json from an executable-only .cabal, resolving a local dependency', async () => {
   // sample-app has no ghcts.json - only app.cabal (an `executable` stanza) -
@@ -18,6 +22,72 @@ test('derives a ghcts.json from an executable-only .cabal, resolving a local dep
   assert.deepEqual(config.dependencies, ['miso']);
   assert.ok(config.sourceRoots.includes('../src'));
   assert.ok(config.sourceRoots.includes('../ffi/js'));
+});
+
+/** Desugar one module the way `build` does, so a Core pass can be tested on
+ * the Core the compiler actually produces rather than a hand-built tree. */
+function coreOf(source) {
+  const parsed = parseModule(source, 'Opt.hs');
+  assert.deepEqual(parsed.diagnostics.filter((d) => d.severity === 'error'), []);
+  const modules = new Map([[parsed.module.ast.name, parsed.module.ast]]);
+  const elaborated = elaborateProgram(modules, 'Main', 'Main.hs');
+  return desugarModule(elaborated.module, 'Main.hs').program;
+}
+
+const bindNamed = (program, name) => {
+  for (const b of program.binds) {
+    const pairs = b.tag === 'NonRec' ? [[b.binder, b.rhs]] : b.pairs;
+    for (const [binder, rhs] of pairs) if (binder.name === name) return rhs;
+  }
+  return undefined;
+};
+
+const contains = (e, pred) => {
+  if (!e || typeof e !== 'object') return false;
+  if (pred(e)) return true;
+  return Object.values(e).some((v) =>
+    Array.isArray(v) ? v.some((x) => contains(x, pred)) : contains(v, pred));
+};
+
+test('inlining replaces a known class method with the primop it is made of', () => {
+  const source = 'module Main where\nadd :: Int -> Int -> Int\nadd a b = a + b\n';
+  const before = bindNamed(coreOf(source), 'add');
+  assert.ok(contains(before, (e) => e.tag === 'Var' && e.binder.name === '$cNumInt$+'));
+  const after = bindNamed(inlineKnownCalls(coreOf(source)), 'add');
+  // The dictionary method is gone and its IntAddOp is now in `add` itself.
+  assert.ok(!contains(after, (e) => e.tag === 'Var' && e.binder.name === '$cNumInt$+'));
+  assert.ok(contains(after, (e) => e.tag === 'Op' && e.op.op === 'IntAddOp'));
+});
+
+test('strict arguments are forced at the call site, lazy ones are left alone', () => {
+  // `strict` forces both arguments; `konst` forces only the first. A `Case`
+  // around the argument at the call site is the thunk that is not built.
+  const source = [
+    'module Main where',
+    'strictF :: Int -> Int -> Int',
+    'strictF a b = a + b',
+    'konst :: Int -> Int -> Int',
+    'konst a _ = a',
+    'callStrict :: Int -> Int',
+    'callStrict n = strictF (n + 1) (n + 2)',
+    'callLazy :: Int -> Int',
+    'callLazy n = konst (n + 1) (n + 2)',
+    '',
+  ].join('\n');
+  const opt = forceStrictArgs(inlineKnownCalls(coreOf(source)));
+  const isSat = (e) => e.tag === 'Case' && e.binder.name === 'sat';
+  assert.ok(contains(bindNamed(opt, 'callStrict'), isSat), 'strict call should force its arguments');
+  // konst's second argument may never be evaluated, so forcing it would turn
+  // a defined result into a bottom.
+  const lazy = bindNamed(opt, 'callLazy');
+  const forced = [];
+  const walk = (e) => {
+    if (!e || typeof e !== 'object') return;
+    if (isSat(e)) forced.push(e);
+    Object.values(e).forEach((v) => (Array.isArray(v) ? v.forEach(walk) : walk(v)));
+  };
+  walk(lazy);
+  assert.equal(forced.length, 1, 'only konst\'s first argument is strict');
 });
 
 test('checks record selector types from their declared field signature', () => {
