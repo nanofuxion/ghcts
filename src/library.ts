@@ -2925,6 +2925,11 @@ foreign import javascript unsafe "((x) => x | 0)" valToInt :: JSValPrim -> IntPr
 foreign import javascript unsafe "((x) => +x)" valToNumber :: JSValPrim -> DoublePrim
 foreign import javascript unsafe "((x) => !!x)" valToTruthy :: JSValPrim -> Bool
 foreign import javascript unsafe "((x) => x)" valToString :: JSValPrim -> JSStringPrim
+-- String coercion for the unchecked read, spelled the way JavaScript spells
+-- it. A null or undefined becomes its String() form rather than throwing,
+-- which is what GHCJS's unchecked read does and what miso's native
+-- getAttribute relies on when an element has no such attribute.
+foreign import javascript unsafe "((x) => String(x))" valToStringCoerce :: JSValPrim -> JSStringPrim
 foreign import javascript unsafe "((x) => x.codePointAt(0))" valToChar :: JSValPrim -> CharPrim
 foreign import javascript unsafe "((x) => x.length)" arrayLengthVal :: JSValPrim -> IntPrim
 foreign import javascript unsafe "((x,i) => x[i])" arrayIndexVal :: JSValPrim -> IntPrim -> JSValPrim
@@ -3047,6 +3052,7 @@ fromFloatStep x = case valToDouble x of
 
 instance FromJSValue JSString where
   fromJSValue (JSVal x) = if isStringVal x then fromStringStep x else pure Nothing
+  fromJSValueUnchecked (JSVal x) = pure (JSString (valToStringCoerce x))
 
 fromStringStep :: JSValPrim -> IO (Maybe JSString)
 fromStringStep x = case valToString x of

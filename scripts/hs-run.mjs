@@ -1242,6 +1242,30 @@ const programs = [
     expect: 17,
   },
   {
+    // The string half of the same contract. miso's native getAttribute is
+    // `fromJSValUnchecked =<< jsg2 "__GetAttributeByName" node key` at
+    // `MisoString`, so an element with no such attribute must read back as a
+    // coerced string, not throw: the throw was swallowed by the main-thread
+    // event dispatcher and took every swipe gesture with it.
+    name: "GHCJS.Marshal: an unchecked string read coerces undefined",
+    source: [
+      "module Main where",
+      "import qualified GHCJS.Marshal as Marshal",
+      "import GHC.JS.Prim",
+      "import Data.JSString (JSString, unpack)",
+      "foreign import javascript unsafe \"(() => ({ there: 'ok' }).there)\" getThere :: IntPrim -> JSValPrim",
+      "foreign import javascript unsafe \"(() => ({ there: 'ok' }).absent)\" getAbsent :: IntPrim -> JSValPrim",
+      "main :: IO Int",
+      "main = do",
+      "  a <- Marshal.fromJSValUnchecked (JSVal (getThere 0)) :: IO JSString",
+      "  b <- Marshal.fromJSValUnchecked (JSVal (getAbsent 0)) :: IO JSString",
+      "  pure (length (unpack a) * 100 + length (unpack b))",
+      "",
+    ].join("\n"),
+    // "ok" is 2, "undefined" is 9.
+    expect: 209,
+  },
+  {
     // `fromJSValUnchecked` coerces, it does not check. miso decodes a JSON
     // boolean by reading it as an `Int` and matching 0 or 1
     // (`Miso.JSON.fromJSVal_Value`), so routing the unchecked read through the
