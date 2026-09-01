@@ -8,6 +8,7 @@
  *   node scripts/lynx-run.mjs --tree              # print the element tree at exit
  *   node scripts/lynx-run.mjs --trace             # log every cross-thread message
  *   node scripts/lynx-run.mjs --tap 3 --tap 3     # tap element #3 twice (uids from --tree)
+ *   node scripts/lynx-run.mjs --tap-key bench --bench 20  # tap by data-key, no --tree lookup needed
  *   node scripts/lynx-run.mjs --tap 3 --bench 20   # time 20 taps, one at a time
  *   node scripts/lynx-run.mjs --settle 100         # ms to let each tap finish
  *   node scripts/lynx-run.mjs --count h$someEntry  # how often that entry ran
@@ -55,10 +56,12 @@ import { createContext, runInContext } from "node:vm";
 
 const options = { ms: 3000, tree: false, trace: false, thread: "both", bundle: "references/miso-lynx/examples/dist/jsexe/all.js" };
 const taps = [];
+const tapKeys = [];
 for (const argv = process.argv.slice(2); argv.length; ) {
   const arg = argv.shift();
   if (arg === "--tree") options.tree = true;
   else if (arg === "--tap") taps.push(Number(argv.shift()));
+  else if (arg === "--tap-key") tapKeys.push(argv.shift());
   else if (arg === "--ms") options.ms = Number(argv.shift());
   else if (arg === "--thread") options.thread = argv.shift();
   else if (arg === "--trace") options.trace = true;
@@ -406,6 +409,17 @@ function tapTarget(all, uid) {
   return { target, mount };
 }
 
+/** Same resolution, but by `data-key` instead of a uid read off `--tree`
+ * first. A benchmark app's own element is the one thing that does not move
+ * between a ghcts build and a GHC one, so naming it this way is what lets a
+ * driver script run the same `--tap-key` against both without a human in the
+ * loop reading a tree dump to find the uid each time. */
+function tapTargetByKey(all, key) {
+  const target = all.find((n) => n.attrs["data-key"] === key);
+  if (!target) throw new Error(`--tap-key ${key}: no element with that data-key (run with --tree to check)`);
+  return tapTarget(all, target.uid);
+}
+
 const fireTap = ({ target, mount }) =>
   timed(() =>
     mts.runWorklet(mount.events.get("catchEvent:tap").value, {
@@ -424,8 +438,8 @@ setTimeout(async () => {
   const all = root ? walk(root, []) : [];
 
   if (options.bench) {
-    if (taps.length !== 1) throw new Error("--bench needs exactly one --tap <uid>");
-    const where = tapTarget(all, taps[0]);
+    if (taps.length + tapKeys.length !== 1) throw new Error("--bench needs exactly one --tap <uid> or --tap-key <name>");
+    const where = tapKeys.length ? tapTargetByKey(all, tapKeys[0]) : tapTarget(all, taps[0]);
     await settle();
     const from = guestNs;
     for (let i = 0; i < options.bench; i++) {
@@ -450,6 +464,11 @@ setTimeout(async () => {
     console.log(`\n-- tap <${where.target.tag}#${where.target.uid}> delivered at <${where.mount.tag}#${where.mount.uid}>`);
     fireTap(where);
   }
+  for (const key of tapKeys) {
+    const where = tapTargetByKey(all, key);
+    console.log(`\n-- tap-key ${key} <${where.target.tag}#${where.target.uid}> delivered at <${where.mount.tag}#${where.mount.uid}>`);
+    fireTap(where);
+  }
 
   setTimeout(() => {
     const bound = all.filter((n) => n.events.size > 0);
@@ -462,5 +481,5 @@ setTimeout(async () => {
     if (lynxReads.size) console.log(`lynx.* read but absent: ${[...lynxReads].join(" ")}`);
     if (options.tree && root) console.log(`\n${render(root)}`);
     process.exit(0);
-  }, taps.length ? 500 : 0);
+  }, taps.length || tapKeys.length ? 500 : 0);
 }, options.ms);
