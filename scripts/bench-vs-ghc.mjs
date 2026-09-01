@@ -63,13 +63,17 @@ const { stgToJS, renderModule } = await import("../dist/stg-js/codegen.js");
 const { renderRts } = await import("../dist/stg-js/rts.js");
 const { renderStaticRts } = await import("../dist/stg-js/rts-static.js");
 const { defaultStgToJSConfig: config } = await import("../dist/stg-js/types.js");
+const { optimiseCore } = await import("../dist/build.js");
 
 const parsed = parseModule(source, basename(file));
 const elaborated = elaborateModule(parsed.module.ast, basename(file));
 const desugared = desugarModule(elaborated.module, basename(file));
 const bad = [...(elaborated.diagnostics ?? []), ...desugared.diagnostics].filter((d) => d.severity === "error");
 if (bad.length) { for (const d of bad) console.error(`  ${d.code} ${d.message}`); process.exit(1); }
-const stg = coreToStg(desugared.program);
+// The pipeline `build.ts` ships, so this times what a real build produces
+// rather than un-optimised Core.
+const optimised = optimiseCore(desugared.program);
+const stg = coreToStg(optimised);
 const units = stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings);
 const out = renderModule(config, units);
 const binder = stg.bindings.flatMap((b) => (b.tag === "StgNonRec" ? [b.binder] : b.pairs.map(([x]) => x))).find((b) => b.name === want);

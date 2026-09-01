@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 /**
- * Per-stage differential: ghcts's STG against GHC's own, for the same program.
+ * Per-stage differential: ghcts against GHC's own dumps, for the same program.
  *
- *   node scripts/stg-diff.mjs                 # the whole corpus
+ *   node scripts/stg-diff.mjs                 # every stage, whole corpus
  *   node scripts/stg-diff.mjs --only add      # one case
+ *   node scripts/stg-diff.mjs --stage core    # one stage: core | stg
  *   node scripts/stg-diff.mjs --show add      # both sides, printed
+ *
+ * TWO STAGES
+ *
+ * `core` reads `-ddump-simpl` and asks what GHC's Core-to-Core pipeline
+ * produced that ours did not: which worker/wrapper splits it made, and how
+ * many boxes each binding still allocates. Those are the two things
+ * `src/core-opt/` is responsible for, so a gap here names the pass to fix.
+ *
+ * `stg` reads `-ddump-stg-final` and asks what the backend will see.
  *
  * WHY FACTS AND NOT TEXT
  *
@@ -28,13 +38,16 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const GHC =
   "/nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc";
 
 const ROOT = "/Volumes/Storage/Projects/ghcts";
-const WORK = "/private/tmp/claude-501/-Volumes-Storage-Projects-ghcts/03a5683c-f40f-40b1-896a-7ff7ed635f14/scratchpad/stgdiff";
+// One scratch directory per corpus case, kept between runs so a dump can be
+// read by hand after a mismatch.
+const WORK = join(tmpdir(), "ghcts-stg-diff");
 
 /** Each case is one module. `main` is supplied so GHC links, and is ignored by
  * the comparison - only the named bindings are compared. */
@@ -106,11 +119,58 @@ const CORPUS = [
     ],
     want: ["handler", "ptr", "useKey", "useVal"],
   },
+  {
+    name: "maybeint",
+    // Every decoded event field is an optional value scrutinised once. This is
+    // the shape `fromJSVal` leaves behind at a known type.
+    source: [
+      "orZero :: Maybe Int -> Int",
+      "orZero Nothing  = 0",
+      "orZero (Just n) = n + 1",
+    ],
+    want: ["orZero", "$worZero"],
+  },
+  {
+    name: "record",
+    // A model update: read a field, write it back. The whole BTS dirty-draw
+    // path is made of these.
+    source: [
+      "data M = M { count :: Int, flag :: Bool }",
+      "bump :: M -> M",
+      "bump m = m { count = count m + 1 }",
+    ],
+    want: ["bump", "$wbump"],
+  },
+  {
+    name: "listmap",
+    // Building a list of results, which is what building a VTree is.
+    source: ["bumpAll :: [Int] -> [Int]", "bumpAll xs = map (+ 1) xs"],
+    want: ["bumpAll"],
+  },
+  {
+    name: "classctx",
+    // A constrained instance at a closed type - the case `Specialise` has to
+    // close for `FromJSVal (Maybe a)` to stop going through a dictionary.
+    source: [
+      "class Dec a where",
+      "  dec :: Int -> a",
+      "instance Dec Int where",
+      "  dec n = n + 1",
+      "instance Dec a => Dec (Maybe a) where",
+      "  dec n = Just (dec n)",
+      "decMaybe :: Int -> Maybe Int",
+      "decMaybe n = dec n",
+    ],
+    want: ["decMaybe"],
+  },
 ];
 
 const args = process.argv.slice(2);
 const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : undefined;
 const show = args.includes("--show") ? args[args.indexOf("--show") + 1] : undefined;
+const stage = args.includes("--stage") ? args[args.indexOf("--stage") + 1] : "all";
+const wantCore = stage === "all" || stage === "core";
+const wantStg = stage === "all" || stage === "stg";
 
 /** Parse `-ddump-stg-final`. Bindings are separated by a blank line; the head
  * line is `Name :: Type`, then a bracketed info line, then the right-hand
@@ -234,14 +294,14 @@ async function ghctsStg(caseDir) {
   const { elaborateProgram } = await import(join(ROOT, "dist/elaborate.js"));
   const { desugarModule } = await import(join(ROOT, "dist/desugar.js"));
   const { coreToStg } = await import(join(ROOT, "dist/core-to-stg.js"));
-  const { inlineKnownCalls } = await import(join(ROOT, "dist/core-opt/inline.js"));
-  const { forceStrictArgs, argStrictness } = await import(join(ROOT, "dist/core-opt/strictness.js"));
+  const { optimiseCore } = await import(join(ROOT, "dist/build.js"));
+  const { argStrictness } = await import(join(ROOT, "dist/core-opt/strictness.js"));
   const config = JSON.parse(readFileSync(join(caseDir, "ghcts.json"), "utf8"));
   const loaded = await loadProgram(caseDir, config);
   const el = elaborateProgram(loaded.modules, "Main", "Main.hs");
   const core = desugarModule(el.module, "Main.hs").program;
-  const opt = inlineKnownCalls(core);
-  return { bindings: coreToStg(forceStrictArgs(opt)).bindings, strictness: argStrictness(opt) };
+  const opt = optimiseCore(core);
+  return { core: opt, bindings: coreToStg(opt).bindings, strictness: argStrictness(opt) };
 }
 
 /** GHC prints one `<...>` per argument in `Str=`. An argument is strict when
@@ -257,6 +317,72 @@ function ghcStrictArgs(str) {
     if (ch === ">" && --depth === 0) { out.push(/^[0-9S]/.test(cur)); continue; }
     if (depth > 0) cur += ch;
   }
+  return out;
+}
+
+/** Parse `-ddump-simpl`. Same block shape as the STG dump: `Name :: Type`,
+ * an optional bracketed info line, then `Name = rhs`. Only the binder names
+ * and the shape of each right-hand side are read - this is a differential,
+ * not a Core reader. */
+function parseGhcCore(text) {
+  const out = new Map();
+  // Blank lines separate nothing useful here: a binding's own info block has
+  // them, and a `Rec { ... }` group has none between its members. Every
+  // binding is introduced by a `-- RHS size:` comment, so that is the cut.
+  for (const chunk of text.split(/^-- RHS size:.*$/m).slice(1)) {
+    const first = chunk.split("\n").find((l) => l.trim().length > 0);
+    const m = first && /^([A-Za-z0-9_.$'#]+)/.exec(first.trim());
+    if (!m) continue;
+    const full = m[1];
+    // The right-hand side is introduced by a second line starting with the
+    // name, after the `::` type and the bracketed info block. GHC breaks
+    // before the `=` when the name is long, so find the name line first and
+    // the `=` after it - and start looking past `::` so the info block's own
+    // `Unf=`/`Tmpl=` are not mistaken for it.
+    const at = chunk.indexOf(`\n${full}`, chunk.indexOf("::"));
+    const eq = at >= 0 ? chunk.indexOf("=", at) : -1;
+    const rhs = eq >= 0 ? chunk.slice(eq + 1) : "";
+    out.set(full.replace(/^Main\./, ""), { name: full, rhs, boxes: countBoxes(rhs) });
+  }
+  return out;
+}
+
+/** How many boxes the right-hand side builds. GHC writes a saturated
+ * constructor application as `GHC.Types.I# x`, so counting the constructors
+ * that wrap an unboxed payload counts the allocations worker/wrapper and
+ * case-of-known-constructor are meant to remove. */
+// No trailing `\b`: `#` is not a word character, so a boundary after it never
+// holds and the whole pattern would silently match nothing.
+const BOXES = /(?:GHC\.Types\.)?\b(?:I#|D#|F#|W#|C#)([^\n]*)/g;
+/** Allocations only. The same constructor appears in a `case` alternative,
+ * where it takes a box apart rather than building one, and counting those
+ * would say GHC allocates most where it in fact unboxes most. An alternative
+ * is the occurrence followed by a binder and an arrow. */
+const countBoxes = (rhs) => {
+  let n = 0;
+  for (const m of rhs.matchAll(BOXES)) if (!/^\s+[A-Za-z0-9_']+\s*->/.test(m[1])) n++;
+  return n;
+};
+
+/** The same count off ghcts's Core. ghcts spells the Int box `I` where GHC
+ * spells it `I#`, so the type it belongs to is the fact, not the name. */
+const BOXED_TYPES = new Set([
+  "Int", "Int8", "Int16", "Int32", "Word", "Word8", "Word16", "Word32",
+  "Char", "Float", "Double",
+]);
+function ghctsCoreFacts(program) {
+  const out = new Map();
+  const count = (e) => {
+    if (!e || typeof e !== "object") return 0;
+    let n = e.tag === "Con" && BOXED_TYPES.has(e.con.typeName) && e.args.length === 1 ? 1 : 0;
+    for (const v of Object.values(e))
+      n += Array.isArray(v) ? v.reduce((m, x) => m + count(x), 0) : count(v);
+    return n;
+  };
+  const put = (binder, rhs) => out.set(binder.name, { name: binder.name, boxes: count(rhs) });
+  for (const b of program.binds)
+    if (b.tag === "NonRec") put(b.binder, b.rhs);
+    else for (const [binder, rhs] of b.pairs) put(binder, rhs);
   return out;
 }
 
@@ -284,11 +410,17 @@ function runCase(c) {
       outDir: "dist",
     }),
   );
-  execFileSync(GHC, ["-O2", "-ddump-stg-final", "-ddump-to-file", "Main.hs", "-o", "m"], {
-    cwd: dir,
-    stdio: "ignore",
-  });
-  return { dir, ghc: parseGhcStg(readFileSync(join(dir, "Main.dump-stg-final"), "utf8")) };
+  execFileSync(
+    GHC,
+    ["-O2", "-ddump-stg-final", "-ddump-simpl", "-ddump-to-file", "Main.hs", "-o", "m"],
+    { cwd: dir, stdio: "ignore" },
+  );
+  const simpl = join(dir, "Main.dump-simpl");
+  return {
+    dir,
+    ghc: parseGhcStg(readFileSync(join(dir, "Main.dump-stg-final"), "utf8")),
+    ghcCore: existsSync(simpl) ? parseGhcCore(readFileSync(simpl, "utf8")) : new Map(),
+  };
 }
 
 if (!existsSync(GHC)) {
@@ -301,13 +433,17 @@ let compared = 0;
 let mismatched = 0;
 let strictCompared = 0;
 let strictMismatched = 0;
+let coreCompared = 0;
+let coreMismatched = 0;
+const missingWorkers = [];
 const missingAnalyses = new Set();
 
 for (const c of CORPUS) {
   if (only && c.name !== only) continue;
-  const { dir, ghc } = runCase(c);
-  const { bindings, strictness } = await ghctsStg(dir);
+  const { dir, ghc, ghcCore } = runCase(c);
+  const { core, bindings, strictness } = await ghctsStg(dir);
   const ours = ghctsFacts(bindings);
+  const oursCore = ghctsCoreFacts(core);
 
   if (show === c.name) {
     console.log(`--- GHC ---`);
@@ -317,6 +453,34 @@ for (const c of CORPUS) {
   }
 
   console.log(`\n=== ${c.name} ===`);
+
+  if (wantCore) {
+    // Which worker/wrapper splits GHC made. A split GHC made and we did not is
+    // a boxed argument still crossing a call on the hot path.
+    const ghcWorkers = [...ghcCore.keys()].filter((n) => n.startsWith("$w")).sort();
+    const ourWorkers = [...oursCore.keys()].filter((n) => n.startsWith("$w")).sort();
+    const absent = ghcWorkers.filter((n) => !oursCore.has(n));
+    console.log(
+      `  [core] workers: GHC ${ghcWorkers.length ? ghcWorkers.join(",") : "none"}` +
+        ` vs ghcts ${ourWorkers.length ? ourWorkers.join(",") : "none"}` +
+        (absent.length ? `   <-- MISSING ${absent.join(",")}` : ""),
+    );
+    for (const n of absent) missingWorkers.push(`${c.name}:${n}`);
+    for (const want of c.want) {
+      const g = ghcCore.get(want);
+      const o = oursCore.get(want);
+      if (!g || !o) continue;
+      coreCompared++;
+      const worse = o.boxes > g.boxes;
+      if (worse) coreMismatched++;
+      console.log(
+        `  [core] ${want}: boxes GHC ${g.boxes} vs ghcts ${o.boxes}` +
+          (worse ? "   <-- ghcts allocates more" : ""),
+      );
+    }
+  }
+
+  if (!wantStg) continue;
   for (const want_ of c.want) {
     const want = want_;
     const g = ghc.get(want);
@@ -368,8 +532,11 @@ for (const c of CORPUS) {
   }
 }
 
-console.log(`\ncompared ${compared}, mismatched ${mismatched}`);
+console.log(`\nstg: compared ${compared}, mismatched ${mismatched}`);
+console.log(`core: compared ${coreCompared}, allocating more than GHC ${coreMismatched}`);
+if (missingWorkers.length)
+  console.log(`core: worker/wrapper splits GHC made and ghcts did not: ${missingWorkers.join(" ")}`);
 console.log(`demand signatures compared ${strictCompared}, disagreeing ${strictMismatched}`);
 if (missingAnalyses.size)
   console.log(`analyses GHC has and ghcts does not: ${[...missingAnalyses].join(", ")}`);
-process.exitCode = mismatched > 0 ? 1 : 0;
+process.exitCode = mismatched + coreMismatched + missingWorkers.length > 0 ? 1 : 0;

@@ -8,6 +8,9 @@
  *   node scripts/lynx-run.mjs --tree              # print the element tree at exit
  *   node scripts/lynx-run.mjs --trace             # log every cross-thread message
  *   node scripts/lynx-run.mjs --tap 3 --tap 3     # tap element #3 twice (uids from --tree)
+ *   node scripts/lynx-run.mjs --tap 3 --bench 20   # time 20 taps, one at a time
+ *   node scripts/lynx-run.mjs --settle 100         # ms to let each tap finish
+ *   node scripts/lynx-run.mjs --count h$someEntry  # how often that entry ran
  *   node scripts/lynx-run.mjs --ms 4000 path/to/all.js
  *
  * `scripts/hs-run.mjs` evaluates one compiled module against the bare RTS. This
@@ -59,6 +62,9 @@ for (const argv = process.argv.slice(2); argv.length; ) {
   else if (arg === "--ms") options.ms = Number(argv.shift());
   else if (arg === "--thread") options.thread = argv.shift();
   else if (arg === "--trace") options.trace = true;
+  else if (arg === "--bench") options.bench = Number(argv.shift());
+  else if (arg === "--settle") options.settle = Number(argv.shift());
+  else if (arg === "--count") (options.count ??= []).push(argv.shift());
   else options.bundle = arg;
 }
 if (!["mts", "bts", "both"].includes(options.thread)) throw new Error(`--thread: expected mts, bts or both`);
@@ -279,8 +285,26 @@ const dispatch = (from, message) => {
   }
   // A cross-engine message goes through the other engine's task queue, so it
   // can never arrive re-entrantly. Deliver a turn later.
-  for (const w of bound) setImmediate(() => w.callback({ type: message.type, data }));
+  for (const w of bound)
+    setImmediate(() => timed(() => w.callback({ type: message.type, data })));
 };
+
+/** Wall clock is dominated by the harness's own task turns, so what is timed
+ * is the time spent *inside* the guest bundle: the worklet the engine runs on
+ * a tap, and every cross-thread callback that tap sets off. That number is the
+ * app's own cost, and it is what `--bench` compares between two compilers'
+ * output for the same program. */
+let guestNs = 0n;
+const timed = (fn) => {
+  const t0 = process.hrtime.bigint();
+  try {
+    return fn();
+  } finally {
+    guestNs += process.hrtime.bigint() - t0;
+  }
+};
+
+const counters = Object.create(null);
 
 const lynxReads = new Set();
 
@@ -333,6 +357,20 @@ const contexts = new Map(realms.map((name) => [name, makeRealm(name)]));
 const mts = contexts.get("mts");
 for (const [name, context] of contexts) {
   runInContext(source, context, { filename: `${name}:${options.bundle}` });
+  // `--count h$someEntry` wraps a compiled entry point so a run reports how
+  // many times it was entered. Reading a hot symbol's call count is how a
+  // profile's self-time is turned into "which Haskell function, how often".
+  for (const nm of options.count ?? []) {
+    const f = context[nm];
+    if (typeof f !== "function") continue;
+    counters[nm] ??= 0;
+    context[nm] = function () {
+      counters[nm]++;
+      return f.apply(this, arguments);
+    };
+    context[nm].a = f.a;
+    for (const k of Object.keys(f)) context[nm][k] = f[k];
+  }
   // Lynx calls renderPage when the main-thread template loads, before the app
   // gets a turn of its own; `h$main` only schedules, so this still lands first.
   if (name === "mts") {
@@ -356,25 +394,60 @@ const render = (node, depth = 0) => {
   return ["  ".repeat(depth) + `<${bits.join(" ")}>`, ...node.children.map((c) => render(c, depth + 1))].join("\n");
 };
 
-setTimeout(() => {
+/** Resolve a uid to the element and the ancestor the engine would deliver its
+ * tap to. */
+function tapTarget(all, uid) {
+  const target = all.find((n) => n.uid === uid);
+  if (!target) throw new Error(`--tap ${uid}: no such element (run with --tree for the uids)`);
+  let mount = target;
+  while (mount && !mount.events.has("catchEvent:tap")) mount = mount.parent;
+  if (!mount) throw new Error(`--tap ${uid}: no catchEvent:tap listener between it and the root`);
+  return { target, mount };
+}
+
+const fireTap = ({ target, mount }) =>
+  timed(() =>
+    mts.runWorklet(mount.events.get("catchEvent:tap").value, {
+      type: "tap",
+      target: { elementRefptr: target },
+      detail: {},
+    }),
+  );
+
+/** Let every queued cross-thread message and timer run before the next tap, so
+ * each one is measured on its own rather than batched with its neighbours. */
+const settle = () => new Promise((r) => setTimeout(r, options.settle ?? 25));
+
+setTimeout(async () => {
   const root = mts?.page;
   const all = root ? walk(root, []) : [];
+
+  if (options.bench) {
+    if (taps.length !== 1) throw new Error("--bench needs exactly one --tap <uid>");
+    const where = tapTarget(all, taps[0]);
+    await settle();
+    const from = guestNs;
+    for (let i = 0; i < options.bench; i++) {
+      fireTap(where);
+      await settle();
+    }
+    const ms = Number(guestNs - from) / 1e6;
+    console.log(
+      `bench taps=${options.bench} guest=${ms.toFixed(1)}ms per-tap=${(ms / options.bench).toFixed(2)}ms` +
+        `  elements ${all.length}  flushes ${flushes}`,
+    );
+    for (const [k, v] of Object.entries(counters)) console.log(`count ${k} ${v}`);
+    if (options.tree && root) console.log(`\n${render(root)}`);
+    process.exit(0);
+  }
 
   // The engine delivers a tap to the nearest ancestor holding a `catchEvent:tap`
   // listener, with the tapped element as `target.elementRefptr`, and runs the
   // stored worklet through the app's own `runWorklet`. Nothing else is faked.
   for (const uid of taps) {
-    const target = all.find((n) => n.uid === uid);
-    if (!target) throw new Error(`--tap ${uid}: no such element (run with --tree for the uids)`);
-    let mount = target;
-    while (mount && !mount.events.has("catchEvent:tap")) mount = mount.parent;
-    if (!mount) throw new Error(`--tap ${uid}: no catchEvent:tap listener between it and the root`);
-    console.log(`\n-- tap <${target.tag}#${target.uid}> delivered at <${mount.tag}#${mount.uid}>`);
-    mts.runWorklet(mount.events.get("catchEvent:tap").value, {
-      type: "tap",
-      target: { elementRefptr: target },
-      detail: {},
-    });
+    const where = tapTarget(all, uid);
+    console.log(`\n-- tap <${where.target.tag}#${where.target.uid}> delivered at <${where.mount.tag}#${where.mount.uid}>`);
+    fireTap(where);
   }
 
   setTimeout(() => {
