@@ -390,6 +390,7 @@ const walk = (node, into) => {
 const render = (node, depth = 0) => {
   const bits = [`${node.tag}#${node.uid}`];
   for (const [k, v] of Object.entries(node.attrs)) bits.push(`${k}=${JSON.stringify(v)}`);
+  if (node.classes?.length) bits.push(`class=${JSON.stringify(node.classes.join(" "))}`);
   if (node.events.size) bits.push(`on:${[...node.events.keys()].join(",")}`);
   return ["  ".repeat(depth) + `<${bits.join(" ")}>`, ...node.children.map((c) => render(c, depth + 1))].join("\n");
 };

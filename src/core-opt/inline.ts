@@ -127,48 +127,60 @@ const isWorkerName = (name: string): boolean => name.startsWith("$w");
  * unique to the expression replacing it; `fresh` maps a unique to the binder
  * replacing it. */
 export function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
-  // `mkBinder` spreads its `extra` last, so the fresh unique has to be read
-  // back off the result rather than passed in with the other fields.
-  const rename = (b: Binder): Binder => {
-    const out: Binder = { ...b, unique: mkBinder(b.name).unique };
-    fresh.set(b.unique, out);
-    return out;
+  /** A renaming that reaches only where the new binders are in scope.
+   *
+   * `fresh` used to be one map mutated for the whole walk, which is only sound
+   * while every binder in the copied body has a unique nobody else shares.
+   * They do not: a desugared module already binds the same unique at more than
+   * one site, and specialising copies bodies that share more. One flat map then
+   * hands a reference in one branch the binder minted for another, and the name
+   * it points at exists nowhere - `h$$mainZCMainzizuzupatternzu90_u_a812 is not
+   * defined`, thrown out of `dispatchMainThreadEvent` on the first swipe.
+   * Extending a copy per scope is what makes the renaming capture-avoiding. */
+  const extend = (bs: Binder[], from: Map<number, Binder>) => {
+    const out = new Map(from);
+    const binders = bs.map((b) => {
+      const nb: Binder = { ...b, unique: mkBinder(b.name).unique };
+      out.set(b.unique, nb);
+      return nb;
+    });
+    return { fresh: out, binders };
   };
   switch (e.tag) {
     case "Var": {
-      const s = sub.get(e.binder.unique);
-      if (s) return s;
+      // An inner binding shadows a parameter, so the renaming is asked first.
       const f = fresh.get(e.binder.unique);
-      return f ? { tag: "Var", binder: f } : e;
+      if (f) return { tag: "Var", binder: f };
+      return sub.get(e.binder.unique) ?? e;
     }
     case "Lit":
       return e;
     case "App":
       return { tag: "App", fn: copy(e.fn, sub, fresh), arg: copy(e.arg, sub, fresh) };
     case "Lam": {
-      const b = rename(e.binder);
-      return { tag: "Lam", binder: b, body: copy(e.body, sub, fresh) };
+      const { fresh: inner, binders } = extend([e.binder], fresh);
+      return { tag: "Lam", binder: binders[0]!, body: copy(e.body, sub, inner) };
     }
     case "Let": {
       if (e.bind.tag === "NonRec") {
         const rhs = copy(e.bind.rhs, sub, fresh);
-        const b = rename(e.bind.binder);
-        return { tag: "Let", bind: { tag: "NonRec", binder: b, rhs }, body: copy(e.body, sub, fresh) };
+        const { fresh: inner, binders } = extend([e.bind.binder], fresh);
+        return { tag: "Let", bind: { tag: "NonRec", binder: binders[0]!, rhs }, body: copy(e.body, sub, inner) };
       }
       // Recursive group: the binders scope over their own right-hand sides,
       // so they have to be renamed before any of them is copied.
-      const bs = e.bind.pairs.map(([b]) => rename(b));
-      const pairs = e.bind.pairs.map(([, r], i) => [bs[i]!, copy(r, sub, fresh)] as [Binder, CoreExpr]);
-      return { tag: "Let", bind: { tag: "Rec", pairs }, body: copy(e.body, sub, fresh) };
+      const { fresh: inner, binders } = extend(e.bind.pairs.map(([b]) => b), fresh);
+      const pairs = e.bind.pairs.map(([, r], i) => [binders[i]!, copy(r, sub, inner)] as [Binder, CoreExpr]);
+      return { tag: "Let", bind: { tag: "Rec", pairs }, body: copy(e.body, sub, inner) };
     }
     case "Case": {
       const scrutinee = copy(e.scrutinee, sub, fresh);
-      const binder = rename(e.binder);
+      const { fresh: scoped, binders: bound } = extend([e.binder], fresh);
       const alts: CoreAlt[] = e.alts.map((a) => {
-        const binders = a.binders.map(rename);
-        return { con: a.con, binders, body: copy(a.body, sub, fresh) };
+        const { fresh: inner, binders } = extend(a.binders, scoped);
+        return { con: a.con, binders, body: copy(a.body, sub, inner) };
       });
-      return { tag: "Case", scrutinee, binder, alts };
+      return { tag: "Case", scrutinee, binder: bound[0]!, alts };
     }
     case "Con":
       return { tag: "Con", con: e.con, args: e.args.map((a) => copy(a, sub, fresh)) };

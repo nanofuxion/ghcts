@@ -8,7 +8,7 @@ import { parseModule } from '../dist/parser.js';
 import { collectInterface } from '../dist/interface.js';
 import { parseCabalLibrary } from '../dist/cabal.js';
 import { deriveCabalConfig } from '../dist/build.js';
-import { inlineKnownCalls } from '../dist/core-opt/inline.js';
+import { copy, inlineKnownCalls } from '../dist/core-opt/inline.js';
 import { specialiseKnownDicts } from '../dist/core-opt/specialise.js';
 import { forceStrictArgs } from '../dist/core-opt/strictness.js';
 import { workWrap } from '../dist/core-opt/workwrap.js';
@@ -344,6 +344,36 @@ test('a call on anything but constants is left where it is', () => {
       args(b.rhs).every(constant),
       'a call with a variable argument must stay where it is',
     );
+});
+
+test('copying renames a binder only where that binder is in scope', () => {
+  // A desugared module already binds one unique at more than one site, and
+  // specialising copies bodies that share more. A single renaming map for the
+  // whole walk then hands a free reference the binder minted for some other
+  // branch, and the name it points at exists nowhere - the swipe handler died
+  // on `h$$mainZCMainzizuzupatternzu90_u_a812 is not defined`.
+  const con = { name: 'Just', unique: 900, tag: 1, arity: 1, typeName: 'Maybe' };
+  const y = { name: 'y', unique: 901 };
+  const bound = {
+    tag: 'Case',
+    scrutinee: { tag: 'Var', binder: { name: 'x', unique: 902 } },
+    binder: { name: 'wild', unique: 903 },
+    alts: [{ con: { tag: 'DataAlt', con }, binders: [y], body: { tag: 'Var', binder: y } }],
+  };
+  // The second `y` is free: it is some other binding that happens to share the
+  // unique, and copying must leave it alone.
+  const copied = copy({ tag: 'App', fn: bound, arg: { tag: 'Var', binder: y } }, new Map(), new Map());
+  assert.equal(copied.arg.binder.unique, y.unique, 'a free occurrence keeps its own binder');
+  assert.notEqual(
+    copied.fn.alts[0].binders[0].unique,
+    y.unique,
+    'the bound occurrence should have been renamed',
+  );
+  assert.equal(
+    copied.fn.alts[0].body.binder.unique,
+    copied.fn.alts[0].binders[0].unique,
+    'a branch must name the binder its own alternative binds',
+  );
 });
 
 test('checks record selector types from their declared field signature', () => {
