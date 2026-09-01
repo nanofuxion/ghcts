@@ -102,11 +102,14 @@ export const ctxLneFrameSize = (ctx: ExprCtx): number => ctx.ctxLneFrameSize;
 /** Predicate: do we know for sure that the given Id is evaluated?
  *
  * GHC answers this from the tag signature InferTags attached to the Id
- * (`idTagSig_maybe`, plus a JoinId veto on `idDetails`). ghcts's STG carries
- * neither, so this is conservatively False - always sound, only ever costing
- * a redundant entry. */
-export function ctxIsEvaluated(_i: Binder): boolean {
-  return false;
+ * (`idTagSig_maybe`, plus a JoinId veto on `idDetails`). ghcts records the
+ * same fact on `Binder.evaluated` after a `case` whose binder is a *fresh*
+ * name for the WHNF. `Binder.strict` is `isStrictId` (function closures are
+ * not thunks) and must not be read here: that would make `isInlineApp`
+ * skip entering a data thunk. */
+export function ctxIsEvaluated(i: Binder): boolean {
+  if (i.join) return false;
+  return i.evaluated === true;
 }
 
 /** Return the LNE stack size associated to the given Id. Undefined when the

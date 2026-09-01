@@ -10,8 +10,10 @@
  * from GHC.StgToJS.Linker.Linker, transcribed here because there is nowhere
  * else for them to live yet.
  *
- * Not modelled, and dropped rather than faked: `SptEntry`/StaticPointers,
- * ForeignStubs, cost centres, dependency data, and the `-ddump-js` hook.
+ * Not modelled, and dropped rather than faked: ForeignStubs, cost centres,
+ * dependency data, and the `-ddump-js` hook. Static pointer table entries are
+ * collected from binders that carry `sptFingerprint` and initialised the way
+ * GHC's `initStaticPtrs` does.
  */
 import type { JStat } from "../js/syntax.js";
 import type { Ident } from "../js/ident.js";
@@ -38,6 +40,7 @@ import type { ClosureInfo, StgToJSConfig } from "./types.js";
 import { JSRep } from "./types.js";
 import type { LiveVars } from "./utils.js";
 import { collectIds, collectTopIds, fixedLayout, hasExport, stgRhsLive } from "./utils.js";
+import { initStaticPtrs, type SptEntry } from "./static-ptr.js";
 
 // ---------------------------------------------------------------------------
 // GHC.StgToJS.Types: the two records genUnits produces
@@ -103,22 +106,34 @@ export function stgToJS(config: StgToJSConfig, thisMod: Module, stgBinds: StgBin
 
 /** Generate the ingredients for the linkable units for this module */
 export function genUnits(gs: GenState, m: Module, ss: StgBinding[]): LinkableUnit[] {
-  const gbl = generateGlobalBlock(gs, m);
+  const gbl = generateGlobalBlock(gs, m, sptEntriesOf(ss));
   const exports = generateExportsBlock(m);
   const others: LinkableUnit[] = [];
+  const globalSym = moduleGlobalSymbol(m);
   for (const x of ss) {
-    const mlu = generateBlock(gs, x);
+    const mlu = generateBlock(gs, x, globalSym);
     if (mlu !== undefined) others.push(mlu);
   }
   return [gbl, exports, ...others];
 }
 
+function sptEntriesOf(binds: StgBinding[]): SptEntry[] {
+  const out: SptEntry[] = [];
+  for (const b of binds) {
+    const pairs: Array<[Binder, StgRhs]> = b.tag === "StgNonRec" ? [[b.binder, b.rhs]] : b.pairs;
+    for (const [binder] of pairs) {
+      if (binder.sptFingerprint) out.push({ id: binder, fingerprint: binder.sptFingerprint });
+    }
+  }
+  return out;
+}
+
 /** Generate the global unit that all other blocks in the module depend on;
  * used for cost centres and static initializers. The global unit has no
  * dependencies and exports the moduleGlobalSymbol. */
-function generateGlobalBlock(gs: GenState, m: Module): LinkableUnit {
-  // `initStaticPtrs spt_entries` is dropped with StaticPtr.hs
-  const stat = mconcatJStgStat([...gs.gsGlobal].reverse());
+function generateGlobalBlock(gs: GenState, m: Module, sptEntries: SptEntry[]): LinkableUnit {
+  const staticInit = initStaticPtrs(gs, sptEntries);
+  const stat = mconcatJStgStat([...[...gs.gsGlobal].reverse(), staticInit]);
   const syms = [moduleGlobalSymbol(m)];
   return {
     luObjBlock: { oiSymbols: syms, oiClInfo: [], oiStatic: [], oiStat: stat },
@@ -126,7 +141,7 @@ function generateGlobalBlock(gs: GenState, m: Module): LinkableUnit {
     luOtherExports: syms,
     luIdDeps: [],
     luDepSymbols: [],
-    luRequired: false,
+    luRequired: sptEntries.length > 0,
   };
 }
 
@@ -148,7 +163,7 @@ function generateExportsBlock(m: Module): LinkableUnit {
  * GHC's `CgStgTopBinding` also has a `StgTopStringLit` constructor; stg.ts has
  * no top-level string literal, so only the lifted case exists here.
  */
-function generateBlock(gs: GenState, topBind: StgBinding): LinkableUnit | undefined {
+function generateBlock(gs: GenState, topBind: StgBinding, globalSym: string): LinkableUnit | undefined {
   const tl = genToplevel(gs, topBind);
   const extraTl = gs.gsGroup.ggsToplevelStats;
   const ci = gs.gsGroup.ggsClosureInfo;
@@ -166,7 +181,7 @@ function generateBlock(gs: GenState, topBind: StgBinding): LinkableUnit | undefi
     luIdExports: topDeps,
     luOtherExports: [],
     luIdDeps: allDeps,
-    luDepSymbols: allDeps.map((i) => identForId(gs, i)),
+    luDepSymbols: [...allDeps.map((i) => identForId(gs, i)), globalSym],
     luRequired: required,
   };
 }

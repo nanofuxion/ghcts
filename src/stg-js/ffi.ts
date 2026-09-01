@@ -132,7 +132,9 @@ const targetExprs = (ctx: ExprCtx): JStgExpr[] => ctxTarget(ctx).flatMap((t) => 
  * be one is rejected. */
 function rejectHoles(pat: string): void {
   if (/^\s*\(/.test(pat)) return;
-  if (/\$(r|\d)/.test(pat)) {
+  // GHCJS holes are `$1`/`$2`/`$r1`/`$r2`. `$r` inside an identifier
+  // (`h$release`) is not one of them.
+  if (/\$(?:r\d+|\d+)/.test(pat)) {
     throw new Error(
       `genForeignCall: GHCJS-style FFI pattern ${JSON.stringify(pat)} is not supported. ` +
         "GHC 9.12 requires the import string to be a JavaScript expression denoting a " +

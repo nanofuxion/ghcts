@@ -1,8 +1,79 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GhcJs } from '../dist/index.js';
+import { parseModule } from '../dist/parser.js';
+import { elaborateModule } from '../dist/elaborate.js';
+import { desugarModule } from '../dist/desugar.js';
+import { coreToStg } from '../dist/core-to-stg.js';
+import { stgToJS, renderModule } from '../dist/stg-js/codegen.js';
+import { defaultStgToJSConfig } from '../dist/stg-js/types.js';
 
 const { Ident, JStgSyntax, Syntax, JStgMonad, Make, Transform, Ppr, Optimizer, OptExpr, OptSimple } = GhcJs;
+
+function compileHs(source, file = 'Main.hs') {
+  const parsed = parseModule(source, file);
+  const elaborated = elaborateModule(parsed.module.ast, file);
+  const desugared = desugarModule(elaborated.module, file);
+  assert.deepEqual([...parsed.diagnostics, ...(elaborated.diagnostics ?? []), ...desugared.diagnostics], []);
+  const stg = coreToStg(desugared.program);
+  return stgToJS(defaultStgToJSConfig, { unitId: 'main', moduleName: 'Main' }, stg.bindings);
+}
+
+test('GHC mode direct-jumps saturated known-arity calls without changing the ABI', () => {
+  const units = compileHs(
+    'module Main where\nadd :: Int -> Int -> Int\nadd a b = a + b\nuse :: Int -> Int\nuse x = add x x\n',
+    'DirectJump.hs',
+  );
+  const js = renderModule(defaultStgToJSConfig, units);
+  assert.match(js, /return h\$[A-Za-z0-9_$]*add_e;/);
+  const none = { ...defaultStgToJSConfig, optimization: 'none' };
+  const stg = coreToStg(desugarModule(elaborateModule(parseModule(
+    'module Main where\nadd :: Int -> Int -> Int\nadd a b = a + b\nuse :: Int -> Int\nuse x = add x x\n',
+    'DirectJump.hs',
+  ).module.ast, 'DirectJump.hs').module, 'DirectJump.hs').program);
+  const legacy = renderModule(none, stgToJS(none, { unitId: 'main', moduleName: 'Main' }, stg.bindings));
+  assert.match(legacy, /return h\$ap_2_2_fast\(\);/);
+});
+
+test('GHC mode pushes a continuation then jumps on oversaturated known-arity calls', () => {
+  const js = renderModule(
+    defaultStgToJSConfig,
+    compileHs(
+      [
+        'module Main where',
+        'k :: Int -> Int -> (Int -> Int)',
+        'k a b = add a',
+        'add :: Int -> Int -> Int',
+        'add a b = a + b',
+        'use :: Int -> Int',
+        'use x = k x x x',
+        '',
+      ].join('\n'),
+      'OverSat.hs',
+    ),
+  );
+  assert.match(js, /h\$ap_[0-9]+_[0-9]+/);
+  assert.match(js, /return h\$[A-Za-z0-9_$]*k_e;/);
+});
+
+test('static e registers through h$initStatic so h$runInitStatic fills the SPT before main', () => {
+  const units = compileHs('module Main where\np = static True\n', 'StaticPtr.hs');
+  const js = renderModule(defaultStgToJSConfig, units);
+  assert.match(js, /h\$initStatic\.push/);
+  assert.match(js, /h\$hs_spt_insert/);
+  assert.equal(units.some((u) => u.luRequired && u.luObjBlock.oiStat.tag !== undefined), true);
+});
+
+test('JSVal constructor is emitted under GHC 9.12.2\'s z-encoded name so MK_JSVAL matches', () => {
+  const js = renderModule(
+    defaultStgToJSConfig,
+    compileHs(
+      'module Main where\nimport GHC.JS.Prim (JSVal(..))\nidJSVal (JSVal x) = JSVal x\n',
+      'JSVal.hs',
+    ),
+  );
+  assert.match(js, /h\$ghczminternalZCGHCziInternalziJSziPrimziJSVal_con_e/);
+});
 
 test('GHC.JS.Ident.name is the identity smart constructor', () => {
   assert.equal(Ident.name('h$foo'), 'h$foo');

@@ -22,10 +22,9 @@
  *
  *   - Only saturated calls. An under-applied call would change arity, and
  *     with it the closure a partial application allocates.
- *   - Only trivial arguments (`Var`/`Lit`). Substituting a variable for a
- *     variable can neither duplicate work nor move evaluation across a
- *     `case`, so laziness, exception timing and bottom timing are untouched
- *     however many times the parameter occurs in the body.
+ *   - Only trivial arguments (`Var`/`Lit`) or cheap constructors (`I 1`,
+ *     nullary cons). Substituting those can duplicate an allocation but not
+ *     work, so laziness, exception timing and bottom timing are untouched.
  *   - Only non-recursive callees, checked through the whole call graph, so
  *     the rewrite always terminates.
  *   - Only small bodies, so the emitted code cannot blow up.
@@ -39,8 +38,11 @@ import type { CoreAlt, CoreBind, CoreExpr, CoreProgram } from "../core.js";
 import { mkBinder, type Binder } from "../stg.js";
 
 /** Bodies above this many nodes are left alone. A class method at a known
- * type - two `case`s around one primop - is about eight. */
-const MAX_BODY = 24;
+ * type - two `case`s around one primop - is about eight. Instance methods on
+ * the view/JSON path are larger than that and still worth inlining once
+ * Specialise has closed their types. */
+const MAX_BODY = 48;
+const MAX_METHOD = 120;
 
 /** A callee we are willing to inline: `params.length` leading lambdas with
  * `body` underneath. */
@@ -106,45 +108,25 @@ const isTrivial = (e: CoreExpr): boolean => e.tag === "Var" || e.tag === "Lit";
 /** Already in weak head normal form, so substituting it can duplicate an
  * allocation but never any work: a saturated constructor whose fields are
  * themselves trivial. `I 1`, the second argument of every `n - 1`, is the
- * case that matters. */
-const isCheapValue = (e: CoreExpr): boolean => e.tag === "Con" && e.args.every(isTrivial);
+ * case that matters. Nullary and unboxable constructors are free to
+ * duplicate on this backend - an `I` is the number itself. */
+const isCheapValue = (e: CoreExpr): boolean => {
+  if (e.tag !== "Con" || !e.args.every(isTrivial)) return false;
+  return e.args.length === 0 || e.args.length === 1;
+};
 
-/** How many times the binder occurs. GHC's `preInlineUnconditionally` allows
- * a non-trivial argument through only at one occurrence, because a second
- * one would duplicate the allocation; the count stops at two since that is
- * all the decision needs. */
-function occurrences(e: CoreExpr, unique: number, seen = { n: 0 }): number {
-  if (seen.n > 1) return seen.n;
-  switch (e.tag) {
-    case "Var":
-      if (e.binder.unique === unique) seen.n++;
-      return seen.n;
-    case "Lit":
-      return seen.n;
-    case "App":
-      occurrences(e.fn, unique, seen);
-      return occurrences(e.arg, unique, seen);
-    case "Lam":
-      return occurrences(e.body, unique, seen);
-    case "Let":
-      if (e.bind.tag === "NonRec") occurrences(e.bind.rhs, unique, seen);
-      else for (const [, r] of e.bind.pairs) occurrences(r, unique, seen);
-      return occurrences(e.body, unique, seen);
-    case "Case":
-      occurrences(e.scrutinee, unique, seen);
-      for (const a of e.alts) occurrences(a.body, unique, seen);
-      return seen.n;
-    case "Con":
-    case "Op":
-      for (const a of e.args) occurrences(a, unique, seen);
-      return seen.n;
-  }
-}
+const isMethodName = (name: string): boolean =>
+  name.startsWith("$c") || name.startsWith("$s") || name.startsWith("$dm");
+
+/** Workers are what worker/wrapper just created: the big, boxed-argument-free
+ * half. GHC gives the *wrapper* the INLINE unfolding and leaves the worker
+ * alone; inlining the worker back into its wrapper would undo the pass. */
+const isWorkerName = (name: string): boolean => name.startsWith("$w");
 
 /** Substitute, renaming every binder the copy introduces. `sub` maps a
  * unique to the expression replacing it; `fresh` maps a unique to the binder
  * replacing it. */
-function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
+export function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
   // `mkBinder` spreads its `extra` last, so the fresh unique has to be read
   // back off the result rather than passed in with the other fields.
   const rename = (b: Binder): Binder => {
@@ -209,12 +191,12 @@ function spine(e: CoreExpr): { head: CoreExpr; args: CoreExpr[] } {
 export function inlineKnownCalls(program: CoreProgram): CoreProgram {
   // Only top-level non-recursive bindings are candidates, and only those
   // whose own right-hand side does not reach back to any of them.
-  const tops = new Map<number, CoreExpr>();
+  const tops = new Map<number, { rhs: CoreExpr; name: string }>();
   for (const b of program.binds)
-    if (b.tag === "NonRec") tops.set(b.binder.unique, b.rhs);
+    if (b.tag === "NonRec") tops.set(b.binder.unique, { rhs: b.rhs, name: b.binder.name });
 
   const reaches = new Map<number, Set<number>>();
-  for (const [u, rhs] of tops) {
+  for (const [u, { rhs }] of tops) {
     const s = new Set<number>();
     refs(rhs, s);
     reaches.set(u, s);
@@ -236,8 +218,9 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
   }
 
   const candidates = new Map<number, Candidate>();
-  for (const [u, rhs] of tops) {
+  for (const [u, { rhs, name }] of tops) {
     if (reaches.get(u)?.has(u)) continue;
+    if (isWorkerName(name)) continue;
     const params: Binder[] = [];
     let body = rhs;
     while (body.tag === "Lam") {
@@ -245,7 +228,7 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
       body = body.body;
     }
     if (params.length === 0) continue;
-    if (size(body) > MAX_BODY) continue;
+    if (size(body) > (isMethodName(name) ? MAX_METHOD : MAX_BODY)) continue;
     candidates.set(u, { params, body });
   }
 
@@ -259,12 +242,15 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
         const done = args.map(go);
         if (head.tag === "Var") {
           const c = candidates.get(head.binder.unique);
+          // Only trivial arguments, or ones that are already values. Binding a
+          // non-trivial argument with a `let` and inlining anyway is what GHC
+          // does, and it is worth roughly a millisecond a tap here - but it
+          // also stopped every tap on the device from reaching its handler,
+          // and a faster app that ignores the user is not faster.
           const substitutable =
             c !== undefined &&
             c.params.length === done.length &&
-            done.every(
-              (a, i) => isTrivial(a) || (isCheapValue(a) && occurrences(c.body, c.params[i]!.unique) <= 1),
-            );
+            done.every((a) => isTrivial(a) || isCheapValue(a));
           if (c && substitutable) {
             const sub = new Map<number, CoreExpr>();
             c.params.forEach((p, i) => sub.set(p.unique, done[i]!));

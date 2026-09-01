@@ -22,6 +22,12 @@ sources; there is no generated counter implementation or `Miso.*` compiler
 replacement. Browser builds package the selected Miso JavaScript asset and a
 Node-native `serve` command is provided for local testing.
 
+Runtime code generation defaults to the ABI-preserving `ghc` mode. Set
+`optimization` to `none` in `ghcts.json` to reproduce the conservative apply
+path, or to `native` to opt into experimental native-region work as it becomes
+available. The current native mode includes the same safe direct-entry paths;
+unsupported cases always fall back to the GHC-shaped RTS convention.
+
 The current release targets the reachable default-browser Miso graph and Haskell 2010/GHC-compatible syntax used by that graph. Hackage solving, Template Haskell execution, arbitrary C FFI, and the remaining GHC extension surface are intentionally diagnosed as unsupported until implemented.
 
 ## Credits

@@ -65,7 +65,7 @@ import type {
 import { instanceHead, instanceMethodValues } from "./dictionary.js";
 import { classMethodNames, renameDeclarations, renameValue, resolveProgram, type Scopes } from "./modules.js";
 import { error } from "./diagnostics.js";
-import { constructorTable, derivedEqMethod, derivedGenericSource, derivedOrdMethod, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
+import { constructorTable, derivedEqMethod, derivedGenericSource, derivedJsonSource, derivedOrdMethod, derivedStockSource, expandSugar, fieldSelectors } from "./sugar.js";
 import { PRELUDE_SOURCE, RTS_SEATS } from "./prelude.js";
 import { libraryModuleNames, withLibraryModules } from "./library.js";
 import { parseModule } from "./parser.js";
@@ -1494,15 +1494,10 @@ class Elaborator {
    * The rewrite fires only when the evidence is unambiguous:
    *
    *   - the head is a class method, and the first dictionary argument is a
-   *     *bare* reference to an instance's dictionary value, not an application
-   *     of one. An application means a constrained instance (`instance Eq a =>
-   *     Eq [a]`), whose dictionary is a function of dictionaries only known at
-   *     run time;
-   *   - that instance takes no context of its own, so `methodImpl`'s binding
-   *     expects exactly the method's own context dictionaries - which is what
-   *     the remaining arguments already are, in order (see the two
-   *     `addBinding` loops that build instance methods and class defaults);
-   *   - and the instance defines the method itself. A method left to the class
+   *     reference to an instance's dictionary CAF, or that CAF applied to
+   *     dictionaries this pass already solved (`$fEqList $fEqInt` for
+   *     `instance Eq a => Eq [a]`);
+   *   - that instance defines the method itself. A method left to the class
    *     default is bound as `$dm<Class>$<method>` taking the dictionary back as
    *     its first argument, so there is nothing to shortcut - the dictionary
    *     really is needed.
@@ -1518,13 +1513,26 @@ class Elaborator {
     const cls = this.methodOwner.get(name);
     if (cls === undefined) return undefined;
     const dict = args[0];
-    if (dict === undefined || dict.tag !== "var") return undefined;
+    if (dict === undefined) return undefined;
+    // `$fEqList $fEqInt` is still a compile-time dictionary: the instance is
+    // constrained, so its CAF is a function, but every argument here is
+    // evidence this pass already solved. Peeling the spine lets the same
+    // rewrite GHC does for `Eq a => Eq [a]` fire - jump to the method
+    // implementation with those inner dictionaries, skip selector/project.
+    const dictArgs: Expr[] = [];
+    let head: Expr = dict;
+    while (head.tag === "app") {
+      dictArgs.unshift(head.arg);
+      head = head.fn;
+    }
+    if (head.tag !== "var") return undefined;
     const prefix = `$f${cls}`;
-    if (!dict.name.startsWith(prefix)) return undefined;
-    const emitCon = dict.name.slice(prefix.length);
+    if (!head.name.startsWith(prefix)) return undefined;
+    const emitCon = head.name.slice(prefix.length);
     const instance = this.instances.get(`${cls} ${emitCon}`);
-    if (!instance || instance.context.length > 0 || !instance.methods.has(name)) return undefined;
-    return applyAll(variable(methodImpl(cls, emitCon, name), dict.span), args.slice(1));
+    if (!instance || !instance.methods.has(name)) return undefined;
+    if (dictArgs.length !== instance.context.length) return undefined;
+    return applyAll(variable(methodImpl(cls, emitCon, name), head.span), [...dictArgs, ...args.slice(1)]);
   }
 
   // ------------------------------------------------------------- solving --
@@ -2133,6 +2141,29 @@ export function elaborateProgram(
       }
     } else elaborator.diagnostics.push(...parsed.diagnostics);
   }
+  // `deriving anyclass (ToJSON, FromJSON)` is an empty instance unless we
+  // write the methods. Miso.JSON's default walks Generic on every hydrate, so
+  // these instances are generated the same way as Generic itself: Haskell
+  // source, parsed, then scoped as the module that binds `object` / `.=`.
+  const jsonSource = derivedJsonSource(derivedDatas);
+  if (jsonSource) {
+    let jsonScopes: Scopes | undefined;
+    for (const [mod, values] of resolved.scopes) {
+      if (values.has("object") && values.has(".=") && values.has("withObject") && values.has(".:") && values.has(".:?") && values.has("withText")) {
+        jsonScopes = { values, types: resolved.typeScopes.get(mod) ?? new Map() };
+        break;
+      }
+    }
+    if (jsonScopes) {
+      const parsed = parseModule(jsonSource, "GHCTS/DerivedJSON.hs");
+      if (parsed.module && !parsed.diagnostics.some((d) => d.severity === "error")) {
+        for (const decl of parsed.module.ast.declarations) {
+          scopeOf.set(decl, jsonScopes);
+          declarations.push(decl);
+        }
+      } else elaborator.diagnostics.push(...parsed.diagnostics);
+    }
+  }
   const env: Env = new Map();
 
   // --- type synonyms ----------------------------------------------------
@@ -2489,8 +2520,9 @@ export function elaborateProgram(
       }));
 
     // `deriving anyclass C` is the *empty* instance: every method comes from
-    // the class's own default, which is how `deriving anyclass (ToJSON)` picks
-    // up a `default toJSON` written over `Generic`.
+    // the class's own default. `ToJSON`/`FromJSON` are the exception - their
+    // methods were generated above, so `deriveInstance` finds them already
+    // registered and leaves the empty anyclass unwritten.
     for (const cls of decl.derivingAnyclass ?? []) {
       const info = elaborator.classes.get(cls);
       if (!info || info.variables.length !== 1) {
@@ -2790,14 +2822,12 @@ export function elaborateProgram(
       continue;
     }
     out.push({ ...decl, name: USER_MAIN });
-    // GHC registers the static pointer table from module initialisers, which
-    // run before `main`. The JS backend's initialisers are emitted by the
-    // *code generator*, which this frontend does not reach, so the same
-    // "before anything else" is bought by sequencing the registrations in
-    // front of `main` itself - the earliest point a Haskell program has.
+    // Codegen also pushes `h$hs_spt_insert` onto `h$initStatic` so
+    // `h$runInitStatic` fills the table on every JS engine before `main`.
+    // This wrapper is a second insert at `main` for the same keys: cheap,
+    // idempotent, and the path a lookup that races RTS init still has.
     // `sptRegisterThen`, not `>>`: this declaration is built *after*
-    // elaboration, so it may not name a class method - there is no dictionary
-    // left to pass one.
+    // elaboration, so it may not name a class method.
     const body = staticEntries.reduceRight<Expr>(
       (rest, name) =>
         apply(apply(variable("sptRegisterThen", decl.span), variable(name, decl.span)), rest),

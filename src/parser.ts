@@ -1702,6 +1702,7 @@ class Parser {
     this.staticForms.push({
       tag: "value",
       name,
+      sptFingerprint: [k1, k2, k3, k4],
       equations: [{ patterns: [], guards: [{ body: ptr }], whereBindings: [] }],
       span,
     });

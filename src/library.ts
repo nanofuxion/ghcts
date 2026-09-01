@@ -1754,34 +1754,37 @@ import GHCJS.Types (jsval)
 data OnBlocked = ThrowWouldBlock | ContinueAsync
 data Callback a = Callback CallbackPrim
 
--- A callback is a JavaScript function that starts a Haskell thread, which is
--- what \`h$makeCallbackApply\` does in GHC. It is not reproduced verbatim
--- because its \`MK_JSVAL\` boxes into ghc-internal's \`JSVal\` constructor, which
--- a ghcts program does not link; the Haskell side here therefore takes the raw
--- value and boxes it itself.
+-- A callback is a JavaScript function that starts a Haskell thread.
+-- GHC 9.12.2's own imports from GHC.Internal.JS.Foreign.Callback: h$makeCallback
+-- / h$makeCallbackApply box arguments with MK_JSVAL (the ghc-internal JSVal
+-- constructor, which makeIdentForId emits under that z-encoded name).
 --
--- What is kept is the part that matters: h$forkThread + h$startMainLoop
--- (which together are h$run) start a real thread, and the
--- callback is added to \`h$extraRoots\` so the GC cannot collect the closure it
--- holds. \`h$c2(h$ap1_e, g, x)\` is \`MK_AP1\` - the application \`g x\` as a thunk.
-foreign import javascript unsafe "((g) => { const c = () => (h$forkThread(g, false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback0 :: (RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((g) => { const c = (x) => (h$forkThread(h$c2(h$ap1_e, g, x), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback1 :: (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((g) => { const c = (x,y) => (h$forkThread(h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback2 :: (JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((g) => { const c = (x,y,z) => (h$forkThread(h$c2(h$ap1_e, h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), z), false), h$startMainLoop()); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsCallback3 :: (JSValPrim -> JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((c) => { h$extraRoots.remove(c); c.root = null; })" jsReleaseCallback :: CallbackPrim -> IntPrim
+-- The Haskell wrappers still unwrap \`IO\` (a real constructor here, a newtype
+-- in GHC) so h$run / h$runSync see a void-arity world-token function.
+-- \`h$runSync\` is named, not looked up on \`globalThis\`, because a bundled
+-- all.js may wrap \`var h$...\` in a function scope.
+foreign import javascript unsafe "(($1) => { return h$makeCallback(h$run, [], $1); })" js_asyncCallback :: (RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2) => { return h$makeCallbackApply($1, h$run, [], $2); })" js_asyncCallbackApply1 :: IntPrim -> (JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2) => { return h$makeCallbackApply($1, h$run, [], $2); })" js_asyncCallbackApply2 :: IntPrim -> (JSVal -> JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2) => { return h$makeCallbackApply($1, h$run, [], $2); })" js_asyncCallbackApply3 :: IntPrim -> (JSVal -> JSVal -> JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2) => { return h$makeCallback(h$runSync, [$1], $2); })" js_syncCallback :: Bool -> (RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2, $3) => { return h$makeCallbackApply($2, h$runSync, [$1], $3); })" js_syncCallbackApply1 :: Bool -> IntPrim -> (JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2, $3) => { return h$makeCallbackApply($2, h$runSync, [$1], $3); })" js_syncCallbackApply2 :: Bool -> IntPrim -> (JSVal -> JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "(($1, $2, $3) => { return h$makeCallbackApply($2, h$runSync, [$1], $3); })" js_syncCallbackApply3 :: Bool -> IntPrim -> (JSVal -> JSVal -> JSVal -> RealWorld -> IOResult ()) -> CallbackPrim
+foreign import javascript unsafe "h$release" jsReleaseCallback :: CallbackPrim -> IntPrim
 foreign import javascript unsafe "((c) => c)" jsCallbackVal :: CallbackPrim -> JSValPrim
 
 asyncCallback :: IO () -> IO (Callback (IO ()))
-asyncCallback action = IO (\\s -> callbackStep s (jsCallback0 (\\t -> unIO action t)))
+asyncCallback action = IO (\\s -> callbackStep s (js_asyncCallback (\\t -> unIO action t)))
 
 asyncCallback1 :: (JSVal -> IO ()) -> IO (Callback (JSVal -> IO ()))
-asyncCallback1 f = IO (\\s -> callbackStep s (jsCallback1 (\\x t -> unIO (f (JSVal x)) t)))
+asyncCallback1 f = IO (\\s -> callbackStep s (js_asyncCallbackApply1 1 (\\x t -> unIO (f x) t)))
 
 asyncCallback2 :: (JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> IO ()))
-asyncCallback2 f = IO (\\s -> callbackStep s (jsCallback2 (\\x y t -> unIO (f (JSVal x) (JSVal y)) t)))
+asyncCallback2 f = IO (\\s -> callbackStep s (js_asyncCallbackApply2 2 (\\x y t -> unIO (f x y) t)))
 
 asyncCallback3 :: (JSVal -> JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> JSVal -> IO ()))
-asyncCallback3 f = IO (\\s -> callbackStep s (jsCallback3 (\\x y z t -> unIO (f (JSVal x) (JSVal y) (JSVal z)) t)))
+asyncCallback3 f = IO (\\s -> callbackStep s (js_asyncCallbackApply3 3 (\\x y z t -> unIO (f x y z) t)))
 
 -- The callback IS the JavaScript function, so handing it out as a \`JSVal\` is
 -- JavaScript's identity and no Haskell work - the same representational
@@ -1803,21 +1806,7 @@ instance IsJSVal (Callback a) where
 -- The \`'\` variants hand the action's \`JSVal\` back to JavaScript. GHC uses
 -- \`h$runSyncReturn\`, which reads the value through a ghc-internal symbol a
 -- ghcts program does not link, so the value travels the same way the
--- arguments do: the action stores it and the wrapper reads it out. The slot is
--- saved and restored around the call, so a callback that runs another callback
--- cannot lose its own result.
---
--- \`h$runSync\` is named, not looked up on \`globalThis\`. A linked all.js is a
--- script, so its \`var h$...\` are globals only until something bundles it -
--- rspeedy, webpack and \`bun build\` each wrap a module around it, and every RTS
--- symbol becomes function-scoped. A name still resolves there; \`globalThis['h$'
--- + 'runSync']\` reads back \`undefined\`, and the callback dies with
--- "TypeError: not a function" once per delivered message and no other clue.
-foreign import javascript unsafe "((b, g) => { const run = h$runSync; const c = () => run(g, b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback0 :: Bool -> (RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((b, g) => { const run = h$runSync; const c = (x) => run(h$c2(h$ap1_e, g, x), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback1 :: Bool -> (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((b, g) => { const run = h$runSync; const c = (x,y) => run(h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback2 :: Bool -> (JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-foreign import javascript unsafe "((b, g) => { const run = h$runSync; const c = (x,y,z) => run(h$c2(h$ap1_e, h$c2(h$ap1_e, h$c2(h$ap1_e, g, x), y), z), b); c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallback3 :: Bool -> (JSValPrim -> JSValPrim -> JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
-
+-- arguments do: the action stores it and the wrapper reads it out.
 foreign import javascript unsafe "((v) => { globalThis.h$ghctsSyncResult = v; return 0; })" jsPutSyncResult :: JSValPrim -> IntPrim
 foreign import javascript unsafe "((g) => { const run = h$runSync; const c = () => { const p = globalThis.h$ghctsSyncResult; run(g, false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn0 :: (RealWorld -> IOResult ()) -> CallbackPrim
 foreign import javascript unsafe "((g) => { const run = h$runSync; const c = (x) => { const p = globalThis.h$ghctsSyncResult; run(h$c2(h$ap1_e, g, x), false); const r = globalThis.h$ghctsSyncResult; globalThis.h$ghctsSyncResult = p; return r; }; c._key = ++h$extraRootsN; c.root = g; h$extraRoots.add(c); return c; })" jsSyncCallbackReturn1 :: (JSValPrim -> RealWorld -> IOResult ()) -> CallbackPrim
@@ -1849,16 +1838,16 @@ blocksAsync b = case b of
   ThrowWouldBlock -> False
 
 syncCallback :: OnBlocked -> IO () -> IO (Callback (IO ()))
-syncCallback b action = IO (\\s -> syncCallbackStep s (jsSyncCallback0 (blocksAsync b) (\\t -> unIO action t)))
+syncCallback b action = IO (\\s -> syncCallbackStep s (js_syncCallback (blocksAsync b) (\\t -> unIO action t)))
 
 syncCallback1 :: OnBlocked -> (JSVal -> IO ()) -> IO (Callback (JSVal -> IO ()))
-syncCallback1 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback1 (blocksAsync b) (\\x t -> unIO (f (JSVal x)) t)))
+syncCallback1 b f = IO (\\s -> syncCallbackStep s (js_syncCallbackApply1 (blocksAsync b) 1 (\\x t -> unIO (f x) t)))
 
 syncCallback2 :: OnBlocked -> (JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> IO ()))
-syncCallback2 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback2 (blocksAsync b) (\\x y t -> unIO (f (JSVal x) (JSVal y)) t)))
+syncCallback2 b f = IO (\\s -> syncCallbackStep s (js_syncCallbackApply2 (blocksAsync b) 2 (\\x y t -> unIO (f x y) t)))
 
 syncCallback3 :: OnBlocked -> (JSVal -> JSVal -> JSVal -> IO ()) -> IO (Callback (JSVal -> JSVal -> JSVal -> IO ()))
-syncCallback3 b f = IO (\\s -> syncCallbackStep s (jsSyncCallback3 (blocksAsync b) (\\x y z t -> unIO (f (JSVal x) (JSVal y) (JSVal z)) t)))
+syncCallback3 b f = IO (\\s -> syncCallbackStep s (js_syncCallbackApply3 (blocksAsync b) 3 (\\x y z t -> unIO (f x y z) t)))
 
 putSyncResult :: IO JSVal -> IO ()
 putSyncResult m = m >>= putSyncResultStep

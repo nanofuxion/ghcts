@@ -312,10 +312,14 @@ export function argRefs(u: UnfloatedMap, a: StgArg): IdSet {
 }
 
 /** True when the binding is a `StaticPtr` constructor application, which the
- * linker must export. GHC compares against `staticPtrDataConKey`. */
+ * linker must export. GHC compares against `staticPtrDataConKey`. A `static e`
+ * thunk that still carries its fingerprint is the same root. */
 export function hasExport(bnd: StgBinding): boolean {
-  const isExportedBind = (rhs: StgRhs): boolean => rhs.tag === "StgRhsCon" && rhs.con.name === "StaticPtr";
-  return bnd.tag === "StgNonRec" ? isExportedBind(bnd.rhs) : bnd.pairs.some(([, r]) => isExportedBind(r));
+  const isExportedBind = (binder: Binder, rhs: StgRhs): boolean =>
+    binder.sptFingerprint !== undefined || (rhs.tag === "StgRhsCon" && rhs.con.name === "StaticPtr");
+  return bnd.tag === "StgNonRec"
+    ? isExportedBind(bnd.binder, bnd.rhs)
+    : bnd.pairs.some(([b, r]) => isExportedBind(b, r));
 }
 
 export function collectTopIds(bnd: StgBinding): Binder[] {

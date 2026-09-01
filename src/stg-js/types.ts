@@ -198,8 +198,10 @@ export function closureInfo(
 
 /** StgToJSConfig - the codegen flags. Only the fields the JS-emitting layers
  * read are modelled; GHC's SDocContext/LinkerConfig settings have no TS
- * counterpart. Defaults match GHC's own (-O0, no profiling, no RTS asserts). */
+ * counterpart. The default selects only ABI-preserving direct-call paths;
+ * the experimental native-region lowering is separately gated by `native`. */
 export interface StgToJSConfig {
+  optimization: "none" | "ghc" | "native";
   inlinePush: boolean;
   inlineBlackhole: boolean;
   inlineLoadRegs: boolean;
@@ -216,6 +218,7 @@ export interface StgToJSConfig {
 }
 
 export const defaultStgToJSConfig: StgToJSConfig = {
+  optimization: "ghc",
   inlinePush: false,
   inlineBlackhole: false,
   inlineLoadRegs: false,

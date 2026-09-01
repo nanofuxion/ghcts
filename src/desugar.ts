@@ -1139,7 +1139,17 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
 
   const values = module.declarations.filter(isValue);
   const foreigns = module.declarations.filter(isForeign);
-  for (const decl of [...values, ...foreigns]) d.top.set(decl.name, mkBinder(decl.name, { exported: true }));
+  for (const decl of [...values, ...foreigns]) {
+    const extra: Parameters<typeof mkBinder>[1] = { exported: true };
+    if (decl.tag === "value" && decl.sptFingerprint) {
+      const [k1, k2, k3, k4] = decl.sptFingerprint;
+      extra.sptFingerprint = [
+        (BigInt(k1 >>> 0) << 32n) | BigInt(k2 >>> 0),
+        (BigInt(k3 >>> 0) << 32n) | BigInt(k4 >>> 0),
+      ];
+    }
+    d.top.set(decl.name, mkBinder(decl.name, extra));
+  }
 
   const binds: CoreBind[] = [];
 

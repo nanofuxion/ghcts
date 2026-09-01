@@ -14,6 +14,8 @@ export interface GhctsConfig {
    * `default:`.  Distinct from `cpp`: a flag selects which stanza cabal reads,
    * a CPP symbol selects which lines the preprocessor keeps. */
   flags?: string[];
+  /** Runtime code-generation mode. Defaults to the GHC-compatible fast path. */
+  optimization?: "none" | "ghc" | "native";
 }
 
 export interface Diagnostic {

@@ -30,6 +30,7 @@ import {
   decl,
   declAssign_,
   assign_,
+  if_,
   jInt,
   jString,
   jhFromList,
@@ -48,6 +49,7 @@ import { allocData, dataFieldName, jsClosureCount } from "./closure.js";
 import type { ExprCtx } from "./expr-ctx.js";
 import {
   ctxClearLneFrame,
+  ctxIsEvaluated,
   ctxIsLneBinding,
   ctxIsLneLiveVar,
   ctxLneBindingStackSize,
@@ -60,7 +62,7 @@ import {
   ctxUpdateLneFrame,
 } from "./expr-ctx.js";
 import { genForeignCall, genPrimCall } from "./ffi.js";
-import { closureField1, closureField2, closureInfo, closureInfo_, closureField1_, closureField2_, closureMeta_ } from "./heap.js";
+import { closureField1, closureField2, closureInfo, closureInfo_, closureField1_, closureField2_, closureMeta_, isObject } from "./heap.js";
 import {
   declVarsForId,
   freshIdent,
@@ -107,6 +109,7 @@ import {
   fixedLayout,
   idSlotCount,
   isBoolDataCon,
+  isUnboxable,
   isUnboxableCon,
   liveStatic,
   liveVars,
@@ -188,12 +191,9 @@ export function isInlineExpr(e: StgExpr): boolean {
     case "StgConApp":
       return true;
     case "StgOpApp":
-      // CONSERVATIVE: `isInlineForeignCall` needs the CCallSpec's safety and
-      // `primOpIsReallyInline` needs GHC's PrimOp table; neither survives into
-      // stg.ts. Answering False only pushes a return frame that the inline
-      // result immediately returns into - correct, one frame slower. The
-      // PrimCallOp case is True in GHC unconditionally.
-      return e.op.tag === "StgPrimCallOp";
+      if (e.op.tag === "StgPrimCallOp") return true;
+      if (e.op.tag === "StgFCallOp") return e.op.target.safety !== "interruptible";
+      return false;
     case "StgCase":
       return isInlineExpr(e.scrutinee) && e.alts.every((a) => isInlineExpr(a.body));
     case "StgLet":
@@ -202,13 +202,10 @@ export function isInlineExpr(e: StgExpr): boolean {
   }
 }
 
-/** `GHC.StgToJS.Utils.isInlineApp`.
- *
- * CONSERVATIVE: every clause of GHC's version tests a Core property
- * (`isJoinId`, `isUnboxedTupleType`/`isStrictType` on the Id's type,
- * `idDetails` for the newtype-wrapper case) or `ctxIsEvaluated`, which
- * expr-ctx.ts already answers False. So nothing is inline. */
-function isInlineApp(_i: Binder, _args: StgArg[]): boolean {
+/** `GHC.StgToJS.Utils.isInlineApp`. */
+function isInlineApp(i: Binder, args: StgArg[]): boolean {
+  if (i.join) return false;
+  if (args.length === 0) return isUnboxedTupleId(i) || isStrictTypeId(i) || ctxIsEvaluated(i);
   return false;
 }
 
@@ -300,38 +297,42 @@ export function genExpr(gs: GenState, ctx: ExprCtx, stg: StgExpr): [JStgStat, Ex
   throw new Error("genExpr: unreachable");
 }
 
+/** GHC's `isStrictId`: join points are never treated as evaluated; otherwise
+ * a function closure, a post-case binder, or an explicit strict bit. */
+function isStrictId(i: Binder): boolean {
+  if (i.join) return false;
+  return i.strict === true || i.evaluated === true || (i.funRepArity ?? 0) > 0;
+}
+
+/** Unlifted / void / prim-suffixed names stand in for `isStrictType`. */
+function isStrictTypeId(i: Binder): boolean {
+  return i.arity === 0 || i.name.endsWith("#");
+}
+
+function isUnboxedTupleId(i: Binder): boolean {
+  return i.name.startsWith("(#");
+}
+
+function isLocalId(i: Binder): boolean {
+  return i.exported !== true || i.internal === true;
+}
+
+/** GHC.StgToJS.Apply.jumpToII - avoid one indirection for global ids. */
+function jumpToII(gs: GenState, i: Binder, vars: JStgExpr[], loadAppInR1: JStgStat): JStgStat {
+  const loadArgs = assignAllReverseOrder([...regsFromR1.slice(1).map(register)], vars);
+  if (isLocalId(i)) {
+    return mconcatJStgStat([loadArgs, loadAppInR1, returnS(closureInfo(varForId(gs, i)))]);
+  }
+  return mconcatJStgStat([loadArgs, loadAppInR1, returnS(varForEntryId(gs, i))]);
+}
+
 /** GHC.StgToJS.Apply.genApp - generate an application of some args to an Id.
  *
- * The case where args is null is common as it's used to generate the
- * evaluation code for an Id.
- *
- * CONSERVATIVE: of GHC's nine clauses only the let-no-escape one, `proxy#`,
- * "no args and Id can't be a function" and the final generic-apply
- * fall-through survive. Each of the five that do not is keyed on something
- * ghcts's Binder cannot carry, and the reason differs:
- *
- *   - the saturated and oversaturated direct jumps read `idFunRepArity`, which
- *     the frontend does know - but both are additionally guarded by
- *     `isStrictId i`, and that is `isStrictType (idType i) || isStrUsedDmd
- *     (idDemandInfo i)`. A function's type is lifted, and demand analysis does
- *     not run at -O0, so for an ordinary top-level function BOTH disjuncts are
- *     False and neither clause fires in the output this port is measured
- *     against. Carrying arity alone would therefore not move a single byte,
- *     and ghcts has no demand analysis to make the guard true. That is why
- *     `Binder` still has no arity field.
- *   - unboxed-tuple / strict-type field return: needs `isStrictType`.
- *   - the unboxable-heap-object check and the "known evaluated" return: both
- *     additionally require `ctxIsEvaluated`, which is `isTaggedSig . idTagSig`
- *     - the result of GHC.Stg.InferTags, an unported pass. Nothing short of
- *     porting it makes this answerable; see expr-ctx.ts.
- *   - the newtype `DataConWrapId` wrapper: needs `idDetails`.
- *
- * Dropping them is sound because `h$ap_N_M` (and `h$ap_gen_fast`) decide arity
- * at run time from the closure's own info table, and `h$ap_0_0` is exactly the
- * "enter it" case. The cost is one extra indirection per call.
- */
+ * Case order follows Apply.hs. Binder facts (`funRepArity`, `strict`,
+ * `evaluated`, `mightBeFun`) stand in for the Core `Id` queries GHC makes. */
 export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [JStgStat, ExprResult] {
   const st = stackState(gs);
+  const ghc = getSettings(gs).optimization !== "none";
 
   // let-no-escape
   const n = ctxLneBindingStackSize(ctx, i);
@@ -340,7 +341,6 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
     const ei = varForEntryId(gs, i);
     const ra = mconcatJStgStat(as_.map((a, k) => assign_(register(regsFromR1[k]), a)).reverse());
     const p = pushLneFrame(gs, n, ctx);
-    // for the header (which will only be written when the thread is suspended)
     const a = adjSp(st, 1);
     return [mconcatJStgStat([ra, p, a, returnS(ei)]), "ExprCont"];
   }
@@ -351,27 +351,52 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
     if (tops.length === 1) return [assign_(tops[0], null_), "ExprInline"];
   }
 
+  const targets = ctxTarget(ctx);
+
+  // unboxed tuple or strict type: return fields individually
+  if (args.length === 0 && targets.length > 0 && (isUnboxedTupleId(i) || isStrictTypeId(i))) {
+    return [storeIdFields(gs, i, targets), "ExprInline"];
+  }
+
+  // unboxable heap object already evaluated: Int/Double payload, or the box
+  const vt = idJSRep(i);
+  if (args.length === 0 && vt.length === 1 && isUnboxable(vt[0]!) && ctxIsEvaluated(i)) {
+    const fields = targets.flatMap((t) => t.expr);
+    const is = varsForId(gs, i);
+    if (fields.length === 1 && is.length === 1) {
+      return [assign_(fields[0]!, if_(isObject(is[0]!), closureField1(is[0]!), is[0]!)), "ExprInline"];
+    }
+  }
+
+  // known evaluated (or strict type): return fields without entering
+  if (args.length === 0 && targets.length > 0 && (ctxIsEvaluated(i) || isStrictTypeId(i))) {
+    return [storeIdFields(gs, i, targets), "ExprInline"];
+  }
+
   // no args and Id can't be a function: just enter it
-  //
-  // GHC's guard is `idFunRepArity i == 0 && not (mightBeFunTy (idType i))`.
-  // `mightBeFun` (src/stg.ts) is the desugarer's answer to the second half,
-  // and it is only ever set False for a lifted data type - which has no
-  // function rep arity - so the first half comes along with it.
-  //
-  // GHC panics on a multi-var argument, having ruled one out by type. This
-  // falls through to the generic apply instead: an under-answered `mightBeFun`
-  // is always allowed, and h$ap_0_0_fast enters exactly as h$e does.
   if (args.length === 0 && i.mightBeFun === false) {
     const enterId = genIdArg(gs, i);
     if (enterId.length === 1) return [returnS(app(hdEntryStr, [enterId[0]!])), "ExprCont"];
   }
 
-  // generic apply:
-  //  - try to find a pre-generated apply function that matches
-  //  - use it if any
-  //  - otherwise use generic apply function h$ap_gen_fast
-  const is = assignAll([...regsFromR1.map(register)], varsForId(gs, i));
-  return [jumpToFast(gs, args, is), "ExprCont"];
+  const arity = i.funRepArity;
+  const loadFun = assignAll([...regsFromR1.map(register)], varsForId(gs, i));
+
+  // fully saturated global function
+  if (ghc && args.length !== 0 && arity === args.length && !isLocalId(i) && isStrictId(i)) {
+    const vars = args.flatMap((a) => genArg(gs, a));
+    return [jumpToII(gs, i, vars, loadFun), "ExprCont"];
+  }
+
+  // oversaturated function: push extra args as a continuation, then jump
+  if (ghc && arity !== undefined && arity < args.length && isStrictId(i) && arity > 0) {
+    const reg = args.slice(0, arity);
+    const over = args.slice(arity);
+    const vars = reg.flatMap((a) => genArg(gs, a));
+    return [mconcatJStgStat([pushCont(gs, over), jumpToII(gs, i, vars, loadFun)]), "ExprCont"];
+  }
+
+  return [jumpToFast(gs, args, loadFun), "ExprCont"];
 }
 
 /** GHC.StgToJS.Apply.jumpToFast - try to use a specialized pre-generated
@@ -393,8 +418,7 @@ function jumpToFast(gs: GenState, args: StgArg[], loadAppInR1: JStgStat): JStgSt
   ]);
 }
 
-/** GHC.StgToJS.Apply.pushCont. Unused while genApp never takes the
- * oversaturated branch, but it is what that branch calls. */
+/** GHC.StgToJS.Apply.pushCont. */
 export function pushCont(gs: GenState, args: StgArg[]): JStgStat {
   const vars = args.flatMap((a) => genArg(gs, a));
   const spec = mkApplySpec(ApplyConv.StackConv, args, vars);

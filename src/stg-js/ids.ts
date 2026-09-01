@@ -153,6 +153,11 @@ export function makeIdentForId(
   currentModule: Module,
 ): Ident {
   const exported = i.exported === true;
+  if (i.name === "JSVal") {
+    const suffixType = idType === IdType.IdPlain ? "" : idType === IdType.IdEntry ? "_e" : "_con_e";
+    const suffixNum = num === undefined ? "" : `_${intBS(num)}`;
+    return name(`h$ghczminternalZCGHCziInternalziJSziPrimziJSVal${suffixNum}${suffixType}`);
+  }
   // GHC uses the Id's own defining module when it is exported; ghcts Binders
   // carry no Name, hence no defining module, so the current one is always used.
   const mod = currentModule;

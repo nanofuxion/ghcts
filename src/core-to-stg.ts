@@ -27,6 +27,7 @@ import type {
   StgModule,
   StgRhs,
 } from "./stg.js";
+import { occInfo } from "./core-opt/simplify.js";
 import { UpdateFlag, isUnboxedTupleCon, litArg, mkBinder, varArg } from "./stg.js";
 import { isAlwaysSinkableCon } from "./stg-js/sinker.js";
 
@@ -90,7 +91,7 @@ class Converter {
 
   /** Peel the leading lambdas, so a right-hand side becomes a function
    * closure rather than a thunk that returns one. */
-  rhs(expr: CoreExpr): StgRhs {
+  rhs(expr: CoreExpr, owner?: Binder): StgRhs {
     const args: Binder[] = [];
     let body = expr;
     while (body.tag === "Lam") {
@@ -109,9 +110,48 @@ class Converter {
       // levity rules forbid. Failing loudly beats allocating a closure the
       // backend will never be able to enter.
       if (isUnboxedTupleCon(stgBody.con)) throw new Error("coreToStg: unboxed tuple in a lazy position");
+      // A constructor binding is a value, not a thunk, so every use of it is
+      // already in WHNF. This is the easy half of GHC's InferTags, and
+      // without it `genApp` sends each use through `h$ap_0_0_fast` to enter a
+      // closure that was never going to do any work.
+      if (owner) owner.evaluated = true;
       return { tag: "StgRhsCon", con: stgBody.con, args: stgBody.args };
     }
-    return this.mkClosure(args, stgBody);
+    if (owner && args.length > 0) {
+      owner.funRepArity = args.length;
+      // A function closure is not a thunk: GHC's `isStrictId` is true of
+      // top-level Funs because they are already evaluated as functions.
+      // Without this bit, genApp never takes the saturated/oversaturated
+      // jump and every call pays `h$ap_N_M_fast`.
+      owner.strict = true;
+      // A deliberately narrow seed set for native-region lowering: closed,
+      // monomorphic primitive workers.  Later passes may reject this; no
+      // caller may treat the bit as permission to skip the ABI wrapper.
+      owner.nativeEligible =
+        stgBody.tag === "StgOpApp" &&
+        stgBody.op.tag === "StgPrimOp" &&
+        args.every((a) => (a.arity ?? 1) === 1) &&
+        freeVarsOf(stgBody).size === 0;
+      if (owner.nativeEligible && stgBody.tag === "StgOpApp") {
+        const op = stgBody.op.tag === "StgPrimOp" ? stgBody.op.op : "";
+        owner.nativeResultRep =
+          op.startsWith("Int") || op.startsWith("Word") || op.startsWith("Char") ? "i32" :
+          op.startsWith("Double") || op.startsWith("Float") ? "f64" :
+          op.includes("Eq") || op.includes("Gt") || op.includes("Ge") || op.includes("Lt") || op.includes("Le") ? "bool" :
+          undefined;
+        owner.nativeEligible = owner.nativeResultRep !== undefined;
+        if (owner.nativeEligible) {
+          owner.strict = true;
+          // Primitive workers consume their arguments strictly. Preserve this
+          // demand fact for the native-region pass instead of rediscovering it
+          // from the lowered expression later.
+          for (const arg of stgBody.args) {
+            if (arg.tag === "StgVarArg") arg.id.strict = true;
+          }
+        }
+      }
+    }
+    return this.mkClosure(args, stgBody, owner);
   }
 
   /** The update-flag decision, in one place.
@@ -124,14 +164,19 @@ class Converter {
    *     worse, an update frame is missing where the RTS expects one.
    *     Updatable. This covers source-level `let`s and top-level CAFs.
    *
-   * SingleEntry is deliberately never emitted. It would be the right flag for
-   * a thunk this pass invented to make one argument atomic - substituted for
-   * exactly one occurrence, so the update is provably wasted - but `atom`
-   * floats arguments with `case` instead, so no such thunk is ever built.
-   * Guessing SingleEntry anywhere else risks losing an update frame the RTS
-   * expects, which fails silently rather than loudly. */
-  mkClosure(args: Binder[], body: StgExpr): StgRhs {
-    const update = args.length > 0 ? UpdateFlag.ReEntrant : UpdateFlag.Updatable;
+   * SingleEntry is emitted only where the binding's own body proves it: the
+   * thunk is read exactly once, outside any lambda and outside any recursive
+   * group, so no second entry can exist to find the update missing. That is
+   * the occurrence analysis behind GHC's update flags, and each thunk it
+   * applies to saves an update frame push and a black-hole write. Guessing it
+   * anywhere else fails silently rather than loudly. */
+  mkClosure(args: Binder[], body: StgExpr, owner?: Binder): StgRhs {
+    const update =
+      args.length > 0
+        ? UpdateFlag.ReEntrant
+        : owner?.singleEntry === true
+          ? UpdateFlag.SingleEntry
+          : UpdateFlag.Updatable;
     const bound = new Set(args);
     const freeVars = [...freeVarsOf(body)].filter((v) => !bound.has(v) && !this.topLevel.has(v));
     return { tag: "StgRhsClosure", freeVars, update, args, body };
@@ -165,15 +210,24 @@ class Converter {
         const binder = mkBinder("lam");
         return {
           tag: "StgLet",
-          binding: { tag: "StgNonRec", binder, rhs: this.rhs(e) },
+          binding: { tag: "StgNonRec", binder, rhs: this.rhs(e, binder) },
           body: { tag: "StgApp", fn: binder, args: [] },
         };
       }
-      case "Let":
+      case "Let": {
         // A source `let` is lazy, so it stays a `let`: the right-hand side
         // becomes a thunk the body enters, which is what CorePrep leaves and
         // what the backend allocates with h$c1.
+        //
+        // Whether that thunk needs an update frame is a fact about the body,
+        // not the right-hand side, so it is decided here and left on the
+        // binder for `mkClosure` to read.
+        if (e.bind.tag === "NonRec") {
+          const occ = occInfo(e.body, e.bind.binder.unique);
+          if (occ.count === 1 && !occ.inLam) e.bind.binder.singleEntry = true;
+        }
         return { tag: "StgLet", binding: this.bind(e.bind), body: this.expr(e.body) };
+      }
       case "Case": {
         // The scrutinee's floats belong outside the whole `case`, not inside
         // its scrutinee: CorePrep produces `let sat = ... in case f x sat of`,
@@ -213,6 +267,13 @@ class Converter {
         // both of its arguments through exactly such a `case`, twice per
         // arithmetic operation.
         const altType = altTypeOf(e.alts, e.scrutinee);
+        // The case binder names WHNF only when it is not the scrutinee
+        // itself. Desugar reuses a `Var` scrutinee as the binder (`case p of
+        // p { DEFAULT -> ... }`) so the Case still enters; marking that
+        // binder evaluated makes `isInlineApp` skip the enter and unpack a
+        // thunk.
+        if (scrutVar === undefined || scrutVar.unique !== e.binder.unique)
+          e.binder.evaluated = true;
         if (
           scrutVar !== undefined &&
           scrutVar.mightBeFun === undefined &&
@@ -252,8 +313,8 @@ class Converter {
   bind(bind: CoreBind, toTop = false): StgBinding {
     return this.under(toTop, () =>
       bind.tag === "NonRec"
-        ? { tag: "StgNonRec", binder: bind.binder, rhs: this.rhs(bind.rhs) }
-        : { tag: "StgRec", pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs)] as [Binder, StgRhs]) },
+        ? { tag: "StgNonRec", binder: bind.binder, rhs: this.rhs(bind.rhs, bind.binder) }
+        : { tag: "StgRec", pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs, b)] as [Binder, StgRhs]) },
     );
   }
 

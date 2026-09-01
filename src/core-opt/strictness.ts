@@ -86,8 +86,15 @@ function demanded(e: CoreExpr, known: Strictness): Set<number> {
     case "Lam":
       // Entering a lambda demands nothing; the body only runs once applied.
       return new Set();
-    case "Let":
-      return demanded(e.body, known);
+    case "Let": {
+      const out = demanded(e.body, known);
+      // If the body is certain to force the binding, the right-hand side runs,
+      // and everything it forces is forced too. Stopping at the body loses
+      // every argument a `where` helper demands.
+      if (e.bind.tag === "NonRec" && out.has(e.bind.binder.unique))
+        for (const u of demanded(e.bind.rhs, known)) out.add(u);
+      return out;
+    }
     case "Con":
       return new Set();
     case "Op": {
@@ -108,6 +115,10 @@ function demanded(e: CoreExpr, known: Strictness): Set<number> {
       const { head, args } = spine(e);
       const out = new Set<number>();
       if (head.tag !== "Var") return out;
+      // Applying a function forces the function: whatever closure the head
+      // names has to be in weak head normal form before an argument can be
+      // handed to it. GHC's `Note [Demand on the worker]` counts the same.
+      out.add(head.binder.unique);
       const sig = known.get(head.binder.unique);
       if (!sig) return out;
       args.forEach((a, i) => {
@@ -121,6 +132,48 @@ function demanded(e: CoreExpr, known: Strictness): Set<number> {
 /** Argument strictness for every top-level function, by least fixpoint. */
 function analyse(program: CoreProgram): Strictness {
   const fns = new Map<number, { params: Binder[]; body: CoreExpr }>();
+  /** Local functions count too. A `where` helper is a `let`-bound lambda, and
+   * without a signature for it every call to one teaches the analysis nothing
+   * - which in library code is most calls. Binder uniques are program-wide, so
+   * one map holds both. */
+  const collect = (e: CoreExpr): void => {
+    switch (e.tag) {
+      case "Var":
+      case "Lit":
+        return;
+      case "App":
+        collect(e.fn);
+        collect(e.arg);
+        return;
+      case "Lam":
+        collect(e.body);
+        return;
+      case "Let": {
+        const pairs =
+          e.bind.tag === "NonRec"
+            ? [[e.bind.binder, e.bind.rhs] as const]
+            : e.bind.pairs.map((p) => [p[0], p[1]] as const);
+        for (const [binder, rhs] of pairs) {
+          const l = lambdas(rhs);
+          if (l.params.length > 0) fns.set(binder.unique, l);
+          collect(rhs);
+        }
+        collect(e.body);
+        return;
+      }
+      case "Case":
+        collect(e.scrutinee);
+        for (const a of e.alts) collect(a.body);
+        return;
+      case "Con":
+      case "Op":
+        for (const a of e.args) collect(a);
+        return;
+    }
+  };
+  for (const b of program.binds)
+    if (b.tag === "NonRec") collect(b.rhs);
+    else for (const [, r] of b.pairs) collect(r);
   for (const b of program.binds) {
     const pairs = b.tag === "NonRec" ? [[b.binder, b.rhs] as const] : b.pairs.map((p) => [p[0], p[1]] as const);
     for (const [binder, rhs] of pairs) {
@@ -167,8 +220,23 @@ export function argStrictness(program: CoreProgram): Map<string, boolean[]> {
   return out;
 }
 
+/** The same analysis, keyed by the binder's unique.
+ *
+ * `argStrictness` is by name because that is how GHC's dumps are read back.
+ * A pass that rewrites bindings cannot use a name: one linked program holds
+ * every module's top-level binders, and names like `go` or `lvl` repeat
+ * across them, so a by-name lookup hands one binding's signature to an
+ * unrelated one - and `workWrap` then unboxes an argument nobody forces. */
+export const argStrictnessByUnique = (program: CoreProgram): Map<number, boolean[]> => analyse(program);
+
 /** Rewrite `f e1 .. en` so that every argument `f` is strict in is evaluated
  * by a `case` before the call. */
+/** A right-hand side worth turning into a `case`: not already a value, and
+ * not a lambda - a function closure is in weak head normal form, so forcing
+ * it would allocate a `case` for nothing. */
+const worthForcing = (e: CoreExpr): boolean =>
+  e.tag === "App" || e.tag === "Case" || e.tag === "Let" || e.tag === "Op";
+
 export function forceStrictArgs(program: CoreProgram): CoreProgram {
   const known = analyse(program);
 
@@ -184,7 +252,21 @@ export function forceStrictArgs(program: CoreProgram): CoreProgram {
           e.bind.tag === "NonRec"
             ? { tag: "NonRec", binder: e.bind.binder, rhs: go(e.bind.rhs) }
             : { tag: "Rec", pairs: e.bind.pairs.map(([b, r]) => [b, go(r)] as [Binder, CoreExpr]) };
-        return { tag: "Let", bind, body: go(e.body) };
+        const body = go(e.body);
+        // let-to-case. A binding the body is certain to force does not need to
+        // be a thunk: allocating one, entering it, black-holing it and writing
+        // the result back is work whose only purpose is to delay something
+        // that is not being delayed. Evaluating it here instead is what GHC's
+        // `Note [Let to case]` does, and the counter app forces roughly ten
+        // times as many thunks per tap as GHC's build of the same program.
+        if (bind.tag === "NonRec" && worthForcing(bind.rhs) && demanded(body, known).has(bind.binder.unique))
+          return {
+            tag: "Case",
+            scrutinee: bind.rhs,
+            binder: bind.binder,
+            alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
+          };
+        return { tag: "Let", bind, body };
       }
       case "Case":
         return {
@@ -201,14 +283,18 @@ export function forceStrictArgs(program: CoreProgram): CoreProgram {
         const { head, args } = spine(e);
         const done = args.map(go);
         const sig = head.tag === "Var" ? known.get(head.binder.unique) : undefined;
-        if (!sig || sig.length !== done.length) {
-          return done.reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), go(head));
-        }
+        if (!sig) return done.reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), go(head));
+        // A call need not be saturated for the signature to say something. An
+        // under-applied call still passes the arguments it has, in order, and
+        // an over-applied one passes the first `sig.length` to this function
+        // and the rest to whatever it returns. Requiring an exact match threw
+        // away every partial application - which, with dictionaries curried in
+        // front of real arguments, is most calls in library code.
         // Bind each strict, non-trivial argument to a `case` outside the
         // call, innermost first so the order stays left to right.
         const forced: Array<{ binder: Binder; rhs: CoreExpr }> = [];
         const finalArgs = done.map((a, i) => {
-          if (sig[i] !== true || isTrivial(a)) return a;
+          if (i >= sig.length || sig[i] !== true || isTrivial(a)) return a;
           const binder = mkBinder("sat");
           forced.push({ binder, rhs: a });
           return { tag: "Var", binder } as CoreExpr;

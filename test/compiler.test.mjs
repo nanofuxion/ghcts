@@ -9,9 +9,15 @@ import { collectInterface } from '../dist/interface.js';
 import { parseCabalLibrary } from '../dist/cabal.js';
 import { deriveCabalConfig } from '../dist/build.js';
 import { inlineKnownCalls } from '../dist/core-opt/inline.js';
+import { specialiseKnownDicts } from '../dist/core-opt/specialise.js';
 import { forceStrictArgs } from '../dist/core-opt/strictness.js';
+import { workWrap } from '../dist/core-opt/workwrap.js';
+import { simplifyCore } from '../dist/core-opt/simplify.js';
+import { floatConstants } from '../dist/core-opt/float.js';
+import { optimiseCore } from '../dist/build.js';
 import { elaborateProgram } from '../dist/elaborate.js';
 import { desugarModule } from '../dist/desugar.js';
+import { coreFreeVars } from '../dist/core.js';
 
 test('derives a ghcts.json from an executable-only .cabal, resolving a local dependency', async () => {
   // sample-app has no ghcts.json - only app.cabal (an `executable` stanza) -
@@ -62,12 +68,14 @@ test('inlining replaces a known class method with the primop it is made of', () 
 test('strict arguments are forced at the call site, lazy ones are left alone', () => {
   // `strict` forces both arguments; `konst` forces only the first. A `Case`
   // around the argument at the call site is the thunk that is not built.
+  // Both callees are recursive, so the inliner leaves the calls in place and
+  // what the `case`s say is the demand signature, not the inlining.
   const source = [
     'module Main where',
     'strictF :: Int -> Int -> Int',
-    'strictF a b = a + b',
+    'strictF a b = if a + b > 0 then a else strictF (a + 1) (b + 1)',
     'konst :: Int -> Int -> Int',
-    'konst a _ = a',
+    'konst a b = if a > 0 then a else konst (a + 1) b',
     'callStrict :: Int -> Int',
     'callStrict n = strictF (n + 1) (n + 2)',
     'callLazy :: Int -> Int',
@@ -88,6 +96,254 @@ test('strict arguments are forced at the call site, lazy ones are left alone', (
   };
   walk(lazy);
   assert.equal(forced.length, 1, 'only konst\'s first argument is strict');
+});
+
+test('constrained Eq [Int] specialises to the Int method, not a dictionary apply', () => {
+  const source = [
+    'module Main where',
+    'eqInts :: [Int] -> [Int] -> Bool',
+    'eqInts xs ys = xs == ys',
+    '',
+  ].join('\n');
+  const spec = specialiseKnownDicts(coreOf(source));
+  const eqInts = bindNamed(spec, 'eqInts');
+  assert.ok(eqInts, 'eqInts should exist');
+  // The list instance is applied to `$fEqInt` at most as a specialised `$s…`
+  // binding; the call itself must not keep `== ($fEqList $fEqInt)`.
+  assert.ok(
+    !contains(eqInts, (e) => e.tag === 'Var' && e.binder.name === '=='),
+    'the == selector should be gone',
+  );
+  assert.ok(
+    contains(eqInts, (e) => e.tag === 'Var' && /\$cEqInt\$==|\$s\$cEqList/.test(e.binder.name)),
+    'should mention the Int method or a specialised list method',
+  );
+});
+
+test('toJSON xs at [Rec] does not keep a $fToJSONList dictionary apply', () => {
+  const source = [
+    'module Main where',
+    'data Rec = Rec Int',
+    'class ToJSON a where',
+    '  toJSON :: a -> Int',
+    'instance ToJSON Int where',
+    '  toJSON n = n',
+    'instance ToJSON Rec where',
+    '  toJSON (Rec n) = toJSON n',
+    'instance ToJSON a => ToJSON [a] where',
+    '  toJSON xs = case xs of',
+    '    [] -> 0',
+    '    y:ys -> toJSON y',
+    'jsonList :: [Rec] -> Int',
+    'jsonList xs = toJSON xs',
+    '',
+  ].join('\n');
+  const spec = specialiseKnownDicts(coreOf(source));
+  const jsonList = bindNamed(spec, 'jsonList');
+  assert.ok(jsonList, 'jsonList should exist');
+  assert.ok(
+    !contains(jsonList, (e) => e.tag === 'Var' && e.binder.name === '$fToJSONList'),
+    'the list dictionary should not be applied at the call site',
+  );
+  assert.ok(
+    !contains(jsonList, (e) => e.tag === 'Var' && e.binder.name === 'toJSON'),
+    'the toJSON selector should be gone',
+  );
+});
+
+test('work/wrap unpacks Int arguments on a strict adder', () => {
+  const source = [
+    'module Main where',
+    'add :: Int -> Int -> Int',
+    'add a b = a + b',
+    '',
+  ].join('\n');
+  const wrapped = workWrap(inlineKnownCalls(coreOf(source)));
+  const worker = [...wrapped.binds].find(
+    (b) => b.tag === 'NonRec' && b.binder.name.startsWith('$w'),
+  );
+  assert.ok(worker, 'a $w worker should exist');
+  const add = bindNamed(wrapped, 'add');
+  assert.ok(contains(add, (e) => e.tag === 'Case'), 'the wrapper should case on its Int args');
+});
+
+test('work/wrap leaves every worker binder in scope on a self-recursive loop', () => {
+  const source = [
+    'module Main where',
+    'sumTo :: Int -> Int -> Int',
+    'sumTo acc 0 = acc',
+    'sumTo acc n = sumTo (acc + n) (n - 1)',
+    '',
+  ].join('\n');
+  const opt = workWrap(
+    simplifyCore(forceStrictArgs(inlineKnownCalls(coreOf(source)))),
+  );
+  const tops = new Set();
+  for (const b of opt.binds)
+    if (b.tag === 'NonRec') tops.add(b.binder);
+    else for (const [x] of b.pairs) tops.add(x);
+  for (const b of opt.binds) {
+    const pairs = b.tag === 'NonRec' ? [[b.binder, b.rhs]] : b.pairs;
+    for (const [binder, rhs] of pairs) {
+      const free = [...coreFreeVars(rhs)].filter((v) => ![...tops].some((t) => t.unique === v.unique));
+      assert.deepEqual(free.map((v) => v.name), [], `${binder.name} should bind everything it reads`);
+    }
+  }
+  // The worker calls itself, not back through the wrapper it was split from:
+  // GHC inlines the wrapper's INLINE unfolding at every call site, and a
+  // worker that re-entered the wrapper would rebox on every iteration.
+  const worker = bindNamed(opt, '$wsumTo');
+  assert.ok(worker, 'a $wsumTo worker should exist');
+  assert.ok(
+    contains(worker, (e) => e.tag === 'Var' && e.binder.name === '$wsumTo'),
+    'the recursive call should reach the worker',
+  );
+});
+
+test('inlining leaves work/wrap workers alone', () => {
+  const source = [
+    'module Main where',
+    'add :: Int -> Int -> Int',
+    'add a b = a + b',
+    'twice :: Int -> Int',
+    'twice n = add n n',
+    '',
+  ].join('\n');
+  const wrapped = workWrap(inlineKnownCalls(coreOf(source)));
+  const after = inlineKnownCalls(wrapped);
+  assert.ok(
+    [...after.binds].some((b) => b.tag === 'NonRec' && b.binder.name.startsWith('$w')),
+    'the worker should survive a later inlining pass',
+  );
+});
+
+test('the simplifier drops a case on a constructor it just built', () => {
+  const source = [
+    'module Main where',
+    'unbox :: Int',
+    'unbox = case (1 :: Int) of n -> n + 1',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  assert.ok(contains(before, (e) => e.tag === 'Case'), 'there should be a case to remove');
+  const after = bindNamed(simplifyCore(before), 'unbox');
+  assert.ok(
+    !contains(after, (e) => e.tag === 'Case'),
+    'nothing is left to scrutinise once the constructor is known',
+  );
+  assert.ok(contains(after, (e) => e.tag === 'Op'), 'the primop should remain');
+});
+
+test('the simplifier reuses what an enclosing case already proved', () => {
+  const source = [
+    'module Main where',
+    'twice :: Int -> Int',
+    'twice n = n + n',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  const countCases = (e) => {
+    let n = 0;
+    contains(e, (x) => {
+      if (x.tag === 'Case') n += 1;
+      return false;
+    });
+    return n;
+  };
+  const after = bindNamed(simplifyCore(before), 'twice');
+  // `n` is unpacked once; the second `n` reads the payload already in scope.
+  assert.equal(countCases(after), 1);
+});
+
+test('work/wrap unboxes an argument the body only cases further down', () => {
+  // `sumTo` cases `n` at the top and `acc` inside a branch. GHC unboxes both -
+  // Str=<1!P(L)><1!P(1L)> - so the accumulator must not stay boxed just
+  // because no case for it sits on the spine.
+  const source = [
+    'module Main where',
+    'sumTo :: Int -> Int -> Int',
+    'sumTo acc 0 = acc',
+    'sumTo acc n = sumTo (acc + n) (n - 1)',
+    '',
+  ].join('\n');
+  const worker = bindNamed(optimiseCore(coreOf(source)), '$wsumTo');
+  assert.ok(worker, 'a $wsumTo worker should exist');
+  // Two unboxed payload parameters, so neither argument crosses the recursive
+  // call in a box.
+  let params = 0;
+  for (let e = worker; e && e.tag === 'Lam'; e = e.body) params += 1;
+  assert.equal(params, 2);
+  // The recursive call passes primop results, not freshly built boxes.
+  assert.ok(
+    contains(worker, (e) => e.tag === 'Var' && e.binder.name === '$wsumTo'),
+    'the worker should call itself',
+  );
+});
+
+test('constant constructors are shared at the top level, not rebuilt', () => {
+  const source = [
+    'module Main where',
+    'data Colour = Red | Green',
+    'pick :: Int -> Colour',
+    'pick 0 = Red',
+    'pick _ = Red',
+    '',
+  ].join('\n');
+  const floated = floatConstants(inlineKnownCalls(coreOf(source)));
+  const shared = floated.binds.filter(
+    (b) => b.tag === 'NonRec' && b.binder.name === 'lvl' && b.rhs.tag === 'Con' && b.rhs.con.name === 'Red',
+  );
+  assert.equal(shared.length, 1, 'both branches should reach one shared Red');
+  const pick = bindNamed(floated, 'pick');
+  assert.ok(
+    !contains(pick, (e) => e.tag === 'Con' && e.con.name === 'Red'),
+    'no branch should build Red for itself',
+  );
+});
+
+test('an unboxed-representation box is left where it is', () => {
+  // `I# 0` is the number itself on this backend, and GHC.StgToJS.Sinker
+  // unfloats exactly these again, so floating one out only invents a name.
+  const source = ['module Main where', 'zero :: Int', 'zero = 0', ''].join('\n');
+  const floated = floatConstants(inlineKnownCalls(coreOf(source)));
+  const boxes = floated.binds.filter(
+    (b) =>
+      b.tag === 'NonRec' &&
+      b.binder.name === 'lvl' &&
+      b.rhs.tag === 'Con' &&
+      b.rhs.con.typeName === 'Int',
+  );
+  assert.deepEqual(boxes, [], 'an Int box is the number itself here');
+});
+
+test('a call on anything but constants is left where it is', () => {
+  // Two occurrences of one closed call are not one value: miso's `(#)` frees
+  // the JavaScript handle it built, calling it a temporary nobody else can
+  // reach, so a second occurrence handed the first one's handle reads a freed
+  // handle. Only a call on literals is safe to share.
+  const source = [
+    'module Main where',
+    'seed :: Int',
+    'seed = 7',
+    'bump :: Int -> Int',
+    'bump x = x + 1',
+    'go :: Int -> Int',
+    'go n = case n of',
+    '  0 -> bump seed',
+    '  _ -> bump seed',
+    '',
+  ].join('\n');
+  const floated = floatConstants(inlineKnownCalls(coreOf(source)));
+  const constant = (e) => e.tag === 'Lit' || (e.tag === 'Con' && e.args.every(constant));
+  const args = (e) => (e.tag === 'App' ? [...args(e.fn), e.arg] : []);
+  const lifted = floated.binds.filter(
+    (b) => b.tag === 'NonRec' && b.binder.name === 'lvl' && b.rhs.tag === 'App',
+  );
+  for (const b of lifted)
+    assert.ok(
+      args(b.rhs).every(constant),
+      'a call with a variable argument must stay where it is',
+    );
 });
 
 test('checks record selector types from their declared field signature', () => {
@@ -663,4 +919,70 @@ test('the generated RTS behaves the same as real GHC rts.js', async () => {
   agree('h$l3 fills registers in descending order', (g) => { g.l3('a', 'b', 'c'); return g.regs(); });
   agree('h$p2 pushes two stack slots', (g) => { g.reset(); g.p2('u', 'v'); return g.snap(); });
   agree('h$pp5 pushes the slots its bitmap names', (g) => { g.reset(); g.pp5('u', 'v'); return g.snap(); });
+});
+
+test('derived ToJSON/FromJSON methods match aeson defaults and parse', async () => {
+  const { derivedJsonSource } = await import('../dist/sugar.js');
+  const span = { start: 0, end: 0, line: 1, column: 1 };
+  const rec = {
+    tag: 'data',
+    name: 'User',
+    surfaceName: 'User',
+    parameters: [],
+    constructors: [{
+      name: 'User',
+      arity: 2,
+      fields: ['userId', 'bio'],
+      fieldTypes: ['Int', 'Maybe JSString'],
+      surface: { name: 'User', fields: ['userId', 'bio'] },
+    }],
+    deriving: ['Generic'],
+    derivingAnyclass: ['ToJSON', 'FromJSON'],
+    span,
+  };
+  const sum = {
+    tag: 'data',
+    name: 'Tab',
+    surfaceName: 'Tab',
+    parameters: [],
+    constructors: ['Home', 'Search'].map((name) => ({
+      name,
+      arity: 0,
+      surface: { name },
+    })),
+    deriving: ['Generic'],
+    derivingAnyclass: ['ToJSON', 'FromJSON'],
+    span,
+  };
+  const tagged = {
+    tag: 'data',
+    name: 'Screen',
+    surfaceName: 'Screen',
+    parameters: [],
+    constructors: [
+      { name: 'ScreenTab', arity: 0, surface: { name: 'ScreenTab' } },
+      { name: 'ScreenProfile', arity: 1, fieldTypes: ['Int'], surface: { name: 'ScreenProfile' } },
+      { name: 'ScreenViewer', arity: 2, fieldTypes: ['Int', 'Int'], surface: { name: 'ScreenViewer' } },
+    ],
+    deriving: ['Generic'],
+    derivingAnyclass: ['ToJSON', 'FromJSON'],
+    span,
+  };
+  const source = derivedJsonSource([rec, sum, tagged]);
+  assert.match(source, /toJSON \(User x0 x1\) = object/);
+  assert.match(source, /fromString "userId"/);
+  assert.match(source, /o \.:\? \(fromString "bio"\)/);
+  assert.match(source, /toJSON Home = fromString "Home"/);
+  assert.match(source, /withText \(fromString "Tab"\)/);
+  assert.match(source, /fromString "tag"\) \.= \(fromString "ScreenProfile"\)/);
+  assert.match(source, /fromString "contents"\) \.= \(\(x0, x1\)\)/);
+  assert.doesNotMatch(source, /genericToJSON|genericParseJSON/);
+  const parsed = parseModule(source, 'GHCTS/DerivedJSON.hs');
+  assert.deepEqual(parsed.diagnostics.filter((d) => d.severity === 'error'), []);
+  const instances = parsed.module.ast.declarations.filter((d) => d.tag === 'instance');
+  assert.equal(instances.length, 6);
+  for (const inst of instances) {
+    const methods = instanceMethodValues(inst, 'GHCTS/DerivedJSON.hs');
+    assert.ok(methods.length > 0, `instance ${inst.head} dropped its methods on re-parse`);
+  }
 });

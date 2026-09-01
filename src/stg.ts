@@ -52,6 +52,28 @@ export interface Binder {
    * every consumer must read it the way `mightBeFunTy` is documented to be
    * read: False only when we are *sure* it is a data type. */
   mightBeFun?: boolean;
+  /** Number of source-level value arguments in the closure's entry point. */
+  funRepArity?: number;
+  /** The thunk this binder names is entered at most once, so no update frame
+   * is needed - GHC's `SingleEntry`. Set only when the binding's body reads it
+   * exactly once, outside any lambda or recursive group. */
+  singleEntry?: boolean;
+  /** The binder is known to be strict/evaluated at its use site. */
+  strict?: boolean;
+  evaluated?: boolean;
+  /** The binding is entered at most once (GHC's one-shot information). */
+  oneShot?: boolean;
+  /** Join-point marker; join points must not use direct native calls. */
+  join?: boolean;
+  /** Proven-safe candidate for raw primitive lowering.  This is only a
+   * compiler fact; code generation must still retain the ABI entry wrapper. */
+  nativeEligible?: boolean;
+  /** Result representation proven by the narrow native-candidate analysis. */
+  nativeResultRep?: "i32" | "f64" | "bool" | "string";
+  /** 128-bit static-pointer fingerprint as two Word64 halves. Set on the
+   * binder of each `static e` form so StgToJS can push `h$hs_spt_insert`
+   * onto `h$initStatic` the way GHC's `initStaticPtrs` does. */
+  sptFingerprint?: [bigint, bigint];
 }
 
 /** GHC's Literal, narrowed to what the JS backend can represent.

@@ -20,8 +20,13 @@ import { RTS_SEATS } from "./prelude.js";
 import { BINDING_OVERRIDES } from "./binding-overrides.js";
 import { desugarModule } from "./desugar.js";
 import { coreToStg } from "./core-to-stg.js";
+import type { CoreProgram } from "./core.js";
+import { floatConstants } from "./core-opt/float.js";
 import { inlineKnownCalls } from "./core-opt/inline.js";
+import { simplifyCore } from "./core-opt/simplify.js";
+import { specialiseKnownDicts } from "./core-opt/specialise.js";
 import { forceStrictArgs } from "./core-opt/strictness.js";
+import { workWrap } from "./core-opt/workwrap.js";
 import { genUnits, stgToJS } from "./stg-js/codegen.js";
 import { link, type ModuleCode } from "./linker/linker.js";
 import { runG, type IdCache } from "./stg-js/monad.js";
@@ -306,6 +311,42 @@ async function packageJs(project: string, config: GhctsConfig): Promise<string> 
   return sources.map((source) => `${source}\n`).join("");
 }
 
+/** The Core-to-Core pipeline, in GHC's order: Specialise, Simplifier,
+ * DmdAnal, WorkWrap, Simplifier. Inlining stands in for the parts of the
+ * Simplifier that unfold a binding, and runs first so the strictness analysis
+ * sees the primops a class method is made of rather than an opaque call.
+ *
+ * `scripts/bench-vs-ghc.mjs` and `scripts/stg-diff.mjs` call this too, so what
+ * they measure and compare is what a build actually emits.
+ */
+export function optimiseCore(program: CoreProgram): CoreProgram {
+  if (process.env.GHCTS_NO_OPT) return program;
+  const skip = new Set((process.env.GHCTS_SKIP ?? "").split(",").filter(Boolean));
+  const on = <T,>(name: string, f: (x: T) => T) => (x: T) => (skip.has(name) ? x : f(x));
+  const float = on("float", floatConstants);
+  const inline = on("inline", inlineKnownCalls);
+  const spec = on("spec", specialiseKnownDicts);
+  const strict = on("strict", forceStrictArgs);
+  const simpl = on("simplify", simplifyCore);
+  // WorkWrap hands its worker a rebuilt box and leaves it to the Simplifier to
+  // delete again. That is not only a size trade: building misogram with
+  // `GHCTS_SKIP=simplify` and WorkWrap still on dies at startup with
+  // `fromJSValUnchecked: failure`, first at `$cIntegralInt$toInteger`. So the
+  // two run together or not at all, and this debug switch cannot ask for the
+  // half that does not work.
+  const ww = on("workwrap", skip.has("simplify") ? (x: CoreProgram) => x : workWrap);
+  if (process.env.GHCTS_SKIP)
+    return float(inline(simpl(ww(simpl(strict(inline(spec(inline(float(program))))))))));
+  // Sharing constants comes first, while a `pack "type"` is still one call to
+  // one literal. Inlining rewrites it into the loop it is made of, and a loop
+  // is no longer a shape this can recognise, so every use site would keep its
+  // own copy and rebuild the same JS string on every draw.
+  const shared0 = floatConstants(program);
+  const specialised = inlineKnownCalls(specialiseKnownDicts(inlineKnownCalls(shared0)));
+  const demanded = simplifyCore(forceStrictArgs(specialised));
+  return floatConstants(inlineKnownCalls(simplifyCore(workWrap(demanded))));
+}
+
 export async function build(options: {
   project: string;
   config: GhctsConfig;
@@ -347,16 +388,10 @@ export async function build(options: {
   log(`desugared to ${desugared.program.binds.length} Core binding${desugared.program.binds.length === 1 ? "" : "s"}`);
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
 
-  // GHC runs a Core-to-Core pipeline here; ghcts runs the one corner of it
-  // that needs no analysis to be sound. `optimization: "none"` skips it, so
-  // the un-optimised Core remains reachable for oracle comparison.
-  // Inlining first, so the strictness analysis sees the primops a class
-  // method is made of rather than an opaque call - the same reason GHC runs
-  // Specialise before DmdAnal.
+  // `optimization: "none"` skips the Core-to-Core pipeline, so the
+  // un-optimised Core remains reachable for oracle comparison.
   const optimised =
-    stgConfig.optimization === "none"
-      ? desugared.program
-      : forceStrictArgs(inlineKnownCalls(desugared.program));
+    stgConfig.optimization === "none" ? desugared.program : optimiseCore(desugared.program);
   if (stgConfig.optimization !== "none")
     log(`optimised Core, ${optimised.binds.length} binding${optimised.binds.length === 1 ? "" : "s"}`);
 

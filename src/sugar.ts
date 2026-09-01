@@ -648,6 +648,149 @@ export function derivedStockSource(datas: readonly DataDeclaration[]): string {
  * is load-bearing - `from` and `to` are generated from the same tree - but
  * matching GHC costs nothing.
  */
+/** Miso.JSON's Generic default walks `Rep` and dictionaries on every encode
+ * and decode. Hydrating the model and shipping an action across threads does
+ * that work on the Lynx JS thread, which is why a tap that only writes `pages`
+ * can stall for seconds. These instances match `defaultOptions` (identity
+ * field/constructor names, `allNullaryToStringTag`, keep `Nothing` as null)
+ * but name constructors and fields directly, so the body is an `object` /
+ * `withObject` spine instead of `from`/`to`.
+ *
+ * The generated module is scoped as whatever module defines `object` and `.=`
+ * (`Miso.JSON`); constructor names are the already-flattened ones and are
+ * left as written because that module does not bind them. */
+export function derivedJsonSource(datas: readonly DataDeclaration[]): string {
+  const out: string[] = ["module GHCTS.DerivedJSON where"];
+  let derived = 0;
+  for (const decl of datas) {
+    const wantTo = (decl.derivingAnyclass ?? []).includes("ToJSON");
+    const wantFrom = (decl.derivingAnyclass ?? []).includes("FromJSON");
+    if (!wantTo && !wantFrom) continue;
+    if (decl.constructors.length === 0) continue;
+    if (decl.constructors.some((c) => isInfixCon(c.surface?.name ?? c.name) || isInfixCon(c.name)))
+      continue;
+    derived++;
+    if (wantTo) {
+      out.push(`instance ${jsonInstanceHead("ToJSON", decl)} where`);
+      for (const con of decl.constructors) out.push(`  toJSON ${conPat(con)} = ${encodeCon(decl, con)}`);
+    }
+    if (wantFrom) {
+      out.push(`instance ${jsonInstanceHead("FromJSON", decl)} where`);
+      out.push(`  parseJSON = ${decodeType(decl)}`);
+    }
+  }
+  return derived === 0 ? "" : out.join("\n") + "\n";
+}
+
+const isInfixCon = (name: string): boolean => /^[!#$%&*+./<=>?@\\^|~:-]+$/.test(name);
+
+const jsonStr = (value: string): string => `fromString ${JSON.stringify(value)}`;
+
+const jsonInstanceHead = (cls: string, decl: DataDeclaration): string => {
+  const applied = decl.parameters.length ? `(${[decl.name, ...decl.parameters].join(" ")})` : decl.name;
+  if (decl.parameters.length === 0) return `${cls} ${applied}`;
+  const ctx = decl.parameters.map((p) => `${cls} ${p}`).join(", ");
+  return decl.parameters.length === 1 ? `${ctx} => ${cls} ${applied}` : `(${ctx}) => ${cls} ${applied}`;
+};
+
+const conPat = (con: DataDeclaration["constructors"][0]): string =>
+  con.arity === 0 ? con.name : `(${con.name} ${Array.from({ length: con.arity }, (_, i) => `x${i}`).join(" ")})`;
+
+const tagOf = (con: DataDeclaration["constructors"][0]): string => con.surface?.name ?? con.name;
+
+const isRecordCon = (con: DataDeclaration["constructors"][0]): boolean =>
+  (con.fields?.length ?? 0) === con.arity && con.arity > 0;
+
+const fieldKey = (con: DataDeclaration["constructors"][0], i: number): string =>
+  con.surface?.fields?.[i] ?? con.fields?.[i] ?? `_${i}`;
+
+const isMaybeType = (source: string | undefined): boolean => {
+  if (!source) return false;
+  const t = source.replace(/^\s*!/, "").trim();
+  return /^Maybe(?:\s|\(|$)/.test(t);
+};
+
+const objectExpr = (pairs: readonly string[]): string => `object [${pairs.join(", ")}]`;
+
+const pair = (key: string, value: string): string => `(${jsonStr(key)}) .= (${value})`;
+
+const encodeProduct = (con: DataDeclaration["constructors"][0]): string => {
+  if (isRecordCon(con))
+    return objectExpr(Array.from({ length: con.arity }, (_, i) => pair(fieldKey(con, i), `x${i}`)));
+  if (con.arity === 0) return "emptyArray";
+  if (con.arity === 1) return "toJSON x0";
+  if (con.arity <= 4) return `toJSON (${Array.from({ length: con.arity }, (_, i) => `x${i}`).join(", ")})`;
+  return `toJSON [${Array.from({ length: con.arity }, (_, i) => `toJSON x${i}`).join(", ")}]`;
+};
+
+const encodeTagged = (con: DataDeclaration["constructors"][0]): string => {
+  const tag = pair("tag", jsonStr(tagOf(con)));
+  if (isRecordCon(con))
+    return objectExpr([tag, ...Array.from({ length: con.arity }, (_, i) => pair(fieldKey(con, i), `x${i}`))]);
+  if (con.arity === 0) return objectExpr([tag]);
+  if (con.arity === 1) return objectExpr([tag, pair("contents", "x0")]);
+  if (con.arity <= 4)
+    return objectExpr([tag, pair("contents", `(${Array.from({ length: con.arity }, (_, i) => `x${i}`).join(", ")})`)]);
+  return objectExpr([
+    tag,
+    pair("contents", `[${Array.from({ length: con.arity }, (_, i) => `toJSON x${i}`).join(", ")}]`),
+  ]);
+};
+
+const encodeCon = (decl: DataDeclaration, con: DataDeclaration["constructors"][0]): string => {
+  if (decl.constructors.length === 1) return encodeProduct(con);
+  if (decl.constructors.every((c) => c.arity === 0)) return jsonStr(tagOf(con));
+  return encodeTagged(con);
+};
+
+const applicativeCon = (con: DataDeclaration["constructors"][0], args: readonly string[]): string => {
+  if (args.length === 0) return `pure ${con.name}`;
+  if (args.length === 1) return `${con.name} <$> ${args[0]}`;
+  return `${con.name} <$> ${args[0]} ${args.slice(1).map((a) => `<*> ${a}`).join(" ")}`;
+};
+
+const lookupField = (con: DataDeclaration["constructors"][0], i: number): string => {
+  const op = isMaybeType(con.fieldTypes?.[i]) ? ".:?" : ".:";
+  return `(o ${op} (${jsonStr(fieldKey(con, i))}))`;
+};
+
+const decodeProduct = (con: DataDeclaration["constructors"][0]): string => {
+  if (isRecordCon(con)) {
+    const args = Array.from({ length: con.arity }, (_, i) => lookupField(con, i));
+    return `withObject (${jsonStr(tagOf(con))}) $ \\o -> ${applicativeCon(con, args)}`;
+  }
+  if (con.arity === 0) return `\\_ -> pure ${con.name}`;
+  if (con.arity === 1) return `${con.name} <$> parseJSON`;
+  const vars = Array.from({ length: con.arity }, (_, i) => `j${i}`);
+  return `(\\(${vars.join(", ")}) -> ${con.name} ${vars.join(" ")}) <$> parseJSON`;
+};
+
+const decodeTaggedCon = (con: DataDeclaration["constructors"][0]): string => {
+  if (isRecordCon(con)) {
+    const args = Array.from({ length: con.arity }, (_, i) => lookupField(con, i));
+    return applicativeCon(con, args);
+  }
+  if (con.arity === 0) return `pure ${con.name}`;
+  if (con.arity === 1) return `${con.name} <$> (o .: (${jsonStr("contents")}))`;
+  const vars = Array.from({ length: con.arity }, (_, i) => `j${i}`);
+  return `(\\(${vars.join(", ")}) -> ${con.name} ${vars.join(" ")}) <$> (o .: (${jsonStr("contents")}))`;
+};
+
+const decodeType = (decl: DataDeclaration): string => {
+  const cons = decl.constructors;
+  if (cons.length === 1) return decodeProduct(cons[0]!);
+  if (cons.every((c) => c.arity === 0)) {
+    let expr = `fail "FromJSON: unknown constructor"`;
+    for (const con of [...cons].reverse())
+      expr = `if t == ${jsonStr(tagOf(con))} then pure ${con.name} else ${expr}`;
+    return `withText (${jsonStr(decl.surfaceName ?? decl.name)}) $ \\t -> ${expr}`;
+  }
+  let expr = `fail "FromJSON: unknown constructor"`;
+  for (const con of [...cons].reverse())
+    expr = `if t == ${jsonStr(tagOf(con))} then ${decodeTaggedCon(con)} else ${expr}`;
+  return `withObject (${jsonStr(decl.surfaceName ?? decl.name)}) $ \\o -> (o .: (${jsonStr("tag")})) >>= \\t -> ${expr}`;
+};
+
 export function derivedGenericSource(datas: readonly DataDeclaration[]): string {
   const out: string[] = ["module GHCTS.Derived where"];
   let derived = 0;
