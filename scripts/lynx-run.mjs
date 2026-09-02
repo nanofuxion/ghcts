@@ -54,13 +54,27 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createContext, runInContext } from "node:vm";
 
+const traceStart = Date.now();
 const options = { ms: 3000, tree: false, trace: false, thread: "both", bundle: "references/miso-lynx/examples/dist/jsexe/all.js" };
 const taps = [];
+/** `--swipe <uid>`: a leftward drag across the element, as a finger would. */
+const swipes = [];
+/** `--peek <h$symbol>`: print the closure at exit - its entry, type and first field - in each realm. */
+const peeks = [];
+/** `--trace-fn <h$name>`: log every call of that global function, with its result. */
+const traceFns = [];
+/** `--hs-prof`: sample the Haskell stack once per 1000 closure entries and
+ * print, at exit, which bindings the time after the first gesture sat under. */
+const hsProf = { on: false, armed: false, samples: 0, inclusive: new Map(), self: new Map(), allocs: new Map(), owner: new Map(), papSites: new Map() };
 const tapKeys = [];
 for (const argv = process.argv.slice(2); argv.length; ) {
   const arg = argv.shift();
   if (arg === "--tree") options.tree = true;
   else if (arg === "--tap") taps.push(Number(argv.shift()));
+  else if (arg === "--swipe") swipes.push(Number(argv.shift()));
+  else if (arg === "--peek") peeks.push(argv.shift());
+  else if (arg === "--hs-prof") hsProf.on = true;
+  else if (arg === "--trace-fn") traceFns.push(argv.shift());
   else if (arg === "--tap-key") tapKeys.push(argv.shift());
   else if (arg === "--ms") options.ms = Number(argv.shift());
   else if (arg === "--thread") options.thread = argv.shift();
@@ -71,7 +85,12 @@ for (const argv = process.argv.slice(2); argv.length; ) {
   else options.bundle = arg;
 }
 if (!["mts", "bts", "both"].includes(options.thread)) throw new Error(`--thread: expected mts, bts or both`);
-const source = readFileSync(resolve(options.bundle), "utf8");
+let source = readFileSync(resolve(options.bundle), "utf8");
+if (hsProf.on) {
+  const loop = "while(c !== h$reschedule && ++count < 1000) {";
+  if (!source.includes(loop)) throw new Error("--hs-prof: scheduler loop not found");
+  source = source.replace(loop, `h$$$$hsProf(c); ${loop}`);
+}
 
 // ---------------------------------------------------------------- element model
 
@@ -274,14 +293,27 @@ const wire = (value, seen = new Set()) => {
   return copy;
 };
 
+// Lynx serializes event payload data across realms, but the receiving realm
+// supplies the native event methods. Functions themselves never cross the
+// boundary; restoring only these two known methods models that contract.
+const restoreEventMethods = (value) => {
+  if (!value || typeof value !== "object") return value;
+  if (value.type !== undefined && value.preventDefault === null)
+    value.preventDefault = () => {};
+  if (value.type !== undefined && value.stopPropagation === null)
+    value.stopPropagation = () => {};
+  for (const child of Object.values(value)) restoreEventMethods(child);
+  return value;
+};
+
 const dispatch = (from, message) => {
   // The engine's own check, which the device reported as "ContextProxy's
   // dispatchEvent failed, since arg0 must be object!".
   if (message === null || typeof message !== "object")
     throw new TypeError(`ContextProxy.dispatchEvent: arg0 must be an object, got ${describe(message)}`);
   const bound = wires.filter((w) => w.protocol === message.type && w.realm !== from);
-  const data = wire(message.data);
-  if (options.trace) console.log(`[${from} -> ${message.type} x${bound.length}] ${JSON.stringify(data).slice(0, 300)}`);
+  const data = restoreEventMethods(wire(message.data));
+  if (options.trace) console.log(`[+${(Date.now() - traceStart).toString().padStart(5)}ms ${from} -> ${message.type} x${bound.length}] ${JSON.stringify(data).slice(0, 300)}`);
   if (bound.length === 0) {
     unheard.set(message.type, (unheard.get(message.type) ?? 0) + 1);
     return;
@@ -323,8 +355,16 @@ function makeRealm(name) {
     clearImmediate,
     queueMicrotask,
     process,
+    // Miso's JS FFI calls the browser-global APIs directly, rather than
+    // routing them through `lynx`.
+    requestAnimationFrame: (cb) => setTimeout(() => cb(Date.now()), 16),
+    cancelAnimationFrame: (id) => clearTimeout(id),
     __MAIN_THREAD__: main,
     __BACKGROUND__: !main,
+    // misogram's asset module supplies this registry in rspeedy. The generic
+    // stub has no embedded image pack, so return the requested key as a stable
+    // placeholder instead of turning a host omission into an app crash.
+    __misoGramAssets: new Proxy({}, { get: (_target, key) => typeof key === "string" ? key : undefined }),
   };
   context.globalThis = context;
   if (main) installElementApi(context);
@@ -339,6 +379,15 @@ function makeRealm(name) {
     // two ends of this one channel.
     getJSContext: () => proxy,
     getCoreContext: () => proxy,
+    // `lynx.getJSModule("GlobalEventEmitter")`: misogram subscribes to
+    // keyboard status on it at startup. Without it the call threw inside the
+    // Haskell thread that goes on to handle every event, so no tap ever
+    // reached `update` here and every bench measured nothing.
+    getJSModule: (name) => ({ name, addListener() {}, removeListener() {}, emit() {}, toggle() {}, trigger() {} }),
+    // What LynxExplorer 3.9 on a Pixel 4 XL reports, minus `osVersion`, which
+    // that engine omits. misogram's swiper reads `pixelWidth / pixelRatio` as
+    // its page width, so without this every swipe computes a zero offset.
+    SystemInfo: { pixelWidth: 1440, pixelHeight: 3040, pixelRatio: 3.5, platform: "Android", lynxSdkVersion: "3.9", engineVersion: "3.9", runtimeType: "quickjs" },
     reportError: (e) => console.log(`[${name} lynx.reportError] ${e && e.message ? e.message : e}`),
     requestAnimationFrame: (cb) => setTimeout(() => cb(Date.now()), 16),
     cancelAnimationFrame: (id) => clearTimeout(id),
@@ -359,7 +408,77 @@ const realms = options.thread === "both" ? ["mts", "bts"] : [options.thread];
 const contexts = new Map(realms.map((name) => [name, makeRealm(name)]));
 const mts = contexts.get("mts");
 for (const [name, context] of contexts) {
+  // A linker-local `h$$Mod_NNN` is a continuation frame pushed by some other
+  // closure's code; the first function whose body mentions it is taken as
+  // its owner, followed up the chain until a named top-level binding.
+  const ownerOf = new Map();
+  if (hsProf.on) {
+    const parts = source.split(/^function (h\$\$?[\w$]+)\(/m);
+    for (let i = 1; i < parts.length; i += 2) {
+      const fn = parts[i], body = parts[i + 1] ?? "";
+      for (const m of body.matchAll(/h\$\$[\w$]+/g)) if (m[0] !== fn && !ownerOf.has(m[0])) ownerOf.set(m[0], fn);
+    }
+  }
+  const resolveOwner = (n) => {
+    for (let i = 0; i < 20 && n.startsWith("h$$"); i++) { const o = ownerOf.get(n); if (!o) break; n = o; }
+    return n;
+  };
+  context.h$$hsProf = (c) => {
+    if (!hsProf.armed) return;
+    hsProf.samples++;
+    const self = c?.name || "?";
+    hsProf.self.set(self, (hsProf.self.get(self) ?? 0) + 1);
+    const seen = new Set([self]);
+    const stack = context.h$stack, sp = context.h$sp;
+    // The nearest named top-level binding: a `t_e_u_`/`lam_e_u_` local, an
+    // `h$$…_NNN` linker-local or an RTS frame is charged to whoever called it.
+    const named = (n) => /Z[CD]/.test(n) && !/^h\$(ap|pap|upd|bh|e|rs|p\d|pp\d|catch|return|restore|run|done|sel|unbox|stackFrame|dumpRes|maskFrame|unmaskFrame|reportStackTrace)/.test(n);
+    const resolve = resolveOwner;
+    let owner = named(self) ? resolve(self) : "";
+    for (let k = sp; k >= 0 && k > sp - 400; k--) {
+      const f = stack?.[k];
+      if (typeof f === "function" && f.name) { seen.add(f.name); if (!owner && named(f.name)) owner = resolve(f.name); }
+    }
+    owner ||= "(none)";
+    hsProf.owner.set(owner, (hsProf.owner.get(owner) ?? 0) + 1);
+    for (const n of seen) hsProf.inclusive.set(n, (hsProf.inclusive.get(n) ?? 0) + 1);
+  };
   runInContext(source, context, { filename: `${name}:${options.bundle}` });
+  if (hsProf.on)
+    for (const k of Object.keys(context).filter((k) => /^h\$c(\d+)?$/.test(k))) {
+      const orig = context[k];
+      context[k] = function (f, ...rest) {
+        if (hsProf.armed) {
+          const n = f?.name || "?";
+          hsProf.allocs.set(n, (hsProf.allocs.get(n) ?? 0) + 1);
+          if (n.startsWith("h$pap")) {
+            // A partial application is built by the generic apply on behalf
+            // of whatever pushed the frame on top of the stack: charge it there.
+            let site = "(none)";
+            for (let k = context.h$sp; k >= 0 && k > context.h$sp - 60; k--) { const g = context.h$stack?.[k]; if (typeof g === "function" && g.name && /Z[CD]/.test(g.name)) { site = resolveOwner(g.name); break; } }
+            hsProf.papSites.set(site, (hsProf.papSites.get(site) ?? 0) + 1);
+          }
+        }
+        return orig.call(this, f, ...rest);
+      };
+    }
+  for (const fn of traceFns) {
+    const orig = context[fn];
+    if (typeof orig !== "function") { console.log(`--trace-fn ${fn}: not a function in ${name}`); continue; }
+    context[fn] = function (...args) {
+      const r = orig.apply(this, args);
+      const shape = (x, d = 0) => x && typeof x === "object" ? `<${x.f ? x.f.name + "/t" + x.f.t : "obj"}${d < 3 ? ` d1=${shape(x.d1, d + 1)} d2=${shape(x.d2, d + 1)}` : ""}>` : String(x);
+      const frames = process.env.LYNX_RUN_TRACE_STACK && r === process.env.LYNX_RUN_TRACE_STACK
+        ? "  stack=" + [0, 1, 2, 3, 4, 5, 6].map((k) => { const f = context.h$stack?.[context.h$sp - k]; return typeof f === "function" ? f.name : ""; }).filter(Boolean).join(" < ")
+        : "";
+      console.log(`[${name} ${fn}] -> ${JSON.stringify(typeof r === "string" ? r : String(r)).slice(0, 100)}${r === "" ? `  arg0=${shape(args[0])}` : ""}${frames}`);
+      return r;
+    };
+  }
+  // Each Lynx JS engine evaluates the bundle's RTS static initializers. The
+  // MTS path also reaches this through renderPage, but the BTS has no page
+  // callback, so initialize it explicitly before its scheduled main runs.
+  context.h$runInitStatic?.();
   // `--count h$someEntry` wraps a compiled entry point so a run reports how
   // many times it was entered. Reading a hot symbol's call count is how a
   // profile's self-time is turned into "which Haskell function, how often".
@@ -426,12 +545,69 @@ const fireTap = ({ target, mount }) =>
       type: "tap",
       target: { elementRefptr: target },
       detail: {},
+      preventDefault() {},
+      stopPropagation() {},
     }),
   );
+
+/** A finger dragged left across `target`: touchstart, ten touchmoves, touchend,
+ * each delivered to the nearest ancestor holding that `catchEvent:` listener
+ * with Lynx's `changedTouches` shape. Coordinates are Lynx px on the stub's
+ * `SystemInfo`, so a drag of most of the width crosses a page. */
+const fireSwipe = (all, uid) => {
+  const target = all.find((n) => n.uid === uid);
+  if (!target) throw new Error(`--swipe ${uid}: no such element (run with --tree for the uids)`);
+  hsProf.armed = true;
+  const listener = (kind) => {
+    let mount = target;
+    while (mount && !mount.events.has(`catchEvent:${kind}`)) mount = mount.parent;
+    if (!mount) throw new Error(`--swipe ${uid}: no catchEvent:${kind} listener between it and the root`);
+    return mount.events.get(`catchEvent:${kind}`).value;
+  };
+  const touch = (kind, x, y) => {
+    const t = { identifier: 1, x, y, pageX: x, pageY: y, clientX: x, clientY: y };
+    timed(() => mts.runWorklet(listener(kind), {
+      type: kind,
+      target: { elementRefptr: target },
+      detail: {},
+      changedTouches: [t],
+      touches: kind === "touchend" ? [] : [t],
+      preventDefault() {},
+      stopPropagation() {},
+    }));
+  };
+  const width = 1440 / 3.5;
+  const y = 300;
+  const frame = () => new Promise((r) => setTimeout(r, 16));
+  return (async () => {
+    touch("touchstart", width * 0.85, y);
+    for (let i = 1; i <= 10; i++) { await frame(); touch("touchmove", width * 0.85 - (width * 0.7 * i) / 10, y); }
+    await frame();
+    touch("touchend", width * 0.15, y);
+  })();
+};
 
 /** Let every queued cross-thread message and timer run before the next tap, so
  * each one is measured on its own rather than batched with its neighbours. */
 const settle = () => new Promise((r) => setTimeout(r, options.settle ?? 25));
+
+const hsProfReport = () => {
+  if (hsProf.on) {
+    const top = (m, n) => [...m].sort((a, b) => b[1] - a[1]).slice(0, n);
+    console.log(`\nhs-prof: ${hsProf.samples} samples after the first gesture (one per 1000 closure entries)`);
+    console.log("inclusive (samples with the binding on the stack):");
+    for (const [k, v] of top(hsProf.inclusive, 45)) console.log(`${String((100 * v / hsProf.samples).toFixed(1)).padStart(6)}%  ${k}`);
+    const allocTotal = [...hsProf.allocs.values()].reduce((a, b) => a + b, 0);
+  console.log(`allocations after the first gesture: ${allocTotal} (h$cN calls; top entries):`);
+  for (const [k, v] of top(hsProf.allocs, 40)) console.log(`${String(v).padStart(8)}  ${k}`);
+  console.log("partial applications, by the binding whose frame was on top:");
+  for (const [k, v] of top(hsProf.papSites, 25)) console.log(`${String(v).padStart(8)}  ${k}`);
+  console.log("owner (nearest named binding on the stack):");
+  for (const [k, v] of top(hsProf.owner, 40)) console.log(`${String((100 * v / hsProf.samples).toFixed(1)).padStart(6)}%  ${k}`);
+  console.log("self (closure being entered):");
+    for (const [k, v] of top(hsProf.self, 25)) console.log(`${String((100 * v / hsProf.samples).toFixed(1)).padStart(6)}%  ${k}`);
+  }
+};
 
 setTimeout(async () => {
   const root = mts?.page;
@@ -443,7 +619,8 @@ setTimeout(async () => {
     await settle();
     const from = guestNs;
     for (let i = 0; i < options.bench; i++) {
-      fireTap(where);
+      hsProf.armed = true;
+    fireTap(where);
       await settle();
     }
     const ms = Number(guestNs - from) / 1e6;
@@ -453,6 +630,7 @@ setTimeout(async () => {
     );
     for (const [k, v] of Object.entries(counters)) console.log(`count ${k} ${v}`);
     if (options.tree && root) console.log(`\n${render(root)}`);
+    hsProfReport();
     process.exit(0);
   }
 
@@ -469,8 +647,19 @@ setTimeout(async () => {
     console.log(`\n-- tap-key ${key} <${where.target.tag}#${where.target.uid}> delivered at <${where.mount.tag}#${where.mount.uid}>`);
     fireTap(where);
   }
+  for (const uid of swipes) {
+    console.log(`\n-- swipe left across <#${uid}>`);
+    await fireSwipe(all, uid);
+    await settle();
+  }
 
   setTimeout(() => {
+    for (const sym of peeks)
+      for (const [name, realm] of contexts) {
+        const v = realm?.[sym];
+        const show = (x) => x && typeof x === "object" ? `<${x.f ? x.f.name + "/t" + x.f.t : "obj"} d1=${typeof x.d1 === "object" ? show(x.d1) : String(x.d1)} d2=${typeof x.d2 === "object" ? "obj" : String(x.d2)}>` : String(x);
+        console.log(`peek ${name} ${sym} = ${show(v)}`);
+      }
     const bound = all.filter((n) => n.events.size > 0);
     console.log(
       `\nthreads ${realms.join("+")}  elements ${all.length}  flushes ${flushes}  ` +
@@ -480,6 +669,7 @@ setTimeout(async () => {
       console.log(`dispatches nothing listened for: ${[...unheard].map(([k, v]) => `${k} x${v}`).join(", ")}`);
     if (lynxReads.size) console.log(`lynx.* read but absent: ${[...lynxReads].join(" ")}`);
     if (options.tree && root) console.log(`\n${render(root)}`);
+    hsProfReport();
     process.exit(0);
   }, taps.length || tapKeys.length ? 500 : 0);
 }, options.ms);

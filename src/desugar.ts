@@ -38,6 +38,7 @@ import { coreFreeVars, mkApps, mkLams } from "./core.js";
 import { error } from "./diagnostics.js";
 import type { Binder, DataCon, Literal, StgOp } from "./stg.js";
 import { isUnboxedTupleCon, mkBinder, mkDataCon } from "./stg.js";
+import { eraseNewtypes } from "./erase-newtypes.js";
 import type { Diagnostic } from "./types.js";
 
 export interface DesugarResult {
@@ -202,7 +203,7 @@ class Desugarer {
   /** How many constructors each data type has, so an alternative list that
    * covers all of them can drop its unreachable DEFAULT. Codegen emits no tag
    * test for a single-constructor type, and would then see two defaults. */
-  readonly conCount = new Map<string, number>([["[]", 2]]);
+  readonly conCount = new Map<string, number>([["[]", 2], ["Bool", 2]]);
   readonly top = new Map<string, Binder>();
   /** Names introduced by a `class` declaration, so a use of one can say
    * "dictionary elaboration" instead of "not in scope". */
@@ -232,12 +233,20 @@ class Desugarer {
   lookupCon(name: string, arity: number): DataCon {
     const found = this.cons.get(name);
     if (found) return found;
+    // `Bool` is wired in the same way: codegen keys its raw `true`/`false`
+    // representation off the constructor tag, so a `True` synthesised with
+    // the generic tag 1 would silently compile to `false`.
     const made =
       name === "[]"
-        ? mkDataCon("[]", 1, 0, "[]")
+        ? { ...mkDataCon("[]", 1, 0, "[]"), definingUnitId: "ghc-prim", definingModuleName: "GHC.Types" }
         : name === ":"
-          ? mkDataCon(":", 2, 2, "[]")
-          : mkDataCon(name, 1, arity, name);
+          ? { ...mkDataCon(":", 2, 2, "[]"), definingUnitId: "ghc-prim", definingModuleName: "GHC.Types" }
+          : name === "False"
+            ? mkDataCon("False", 1, 0, "Bool")
+            : name === "True"
+              ? mkDataCon("True", 2, 0, "Bool")
+              : mkDataCon(name, 1, arity, name, name === "I" ? ["other"] : undefined);
+    if (name === "I") made.fieldUnboxed = [true];
     this.cons.set(name, made);
     return made;
   }
@@ -344,13 +353,20 @@ class Desugarer {
   /** Con and Op nodes must come out saturated (see src/core.ts). An
    * under-applied occurrence becomes a lambda that supplies the rest. */
   saturateCon(con: DataCon, args: CoreExpr[]): CoreExpr {
-    if (args.length === con.arity) return { tag: "Con", con, args };
+    // A newtype's constructor is erased, so its field is not a slot to fill:
+    // `Count (a + b)` IS `a + b`, already the box the call returns.
+    const boxed = args.map((arg, i) =>
+      con.newtype !== true && con.fieldReps?.[i] === "boxed-int" && (arg.tag === "Op" || arg.tag === "App")
+        ? { tag: "Con" as const, con: this.lookupCon("I", 1), args: [arg] }
+        : arg,
+    );
+    if (args.length === con.arity) return { tag: "Con", con, args: boxed };
     if (args.length > con.arity) {
       // Over-application of a constructor cannot happen in well-typed code.
       return mkApps({ tag: "Con", con, args: args.slice(0, con.arity) }, args.slice(con.arity));
     }
     const extra = Array.from({ length: con.arity - args.length }, (_, i) => mkBinder(`${con.name}_${i}`));
-    return mkLams(extra, { tag: "Con", con, args: [...args, ...extra.map(varOf)] });
+    return mkLams(extra, { tag: "Con", con, args: [...boxed, ...extra.map(varOf)] });
   }
 
   saturateOp(prim: Prim, args: CoreExpr[]): CoreExpr {
@@ -943,6 +959,14 @@ const call = (op: StgOp, arity: number, args: readonly Binder[]): CoreExpr => ({
  * and `JSVal -> IO ()` are not mistaken for `JSVal`. */
 const headTypeCon = (text: string): string | undefined => /^\s*([A-Z][A-Za-z0-9_'.]*)/.exec(text)?.[1];
 
+const primitiveRepOf = (text: string): "Int" | "Double" | "Float" | "Word" | "Char" | "JSVal" | "JSString" | undefined => {
+  const name = headTypeCon(text)?.split(".").at(-1);
+  if (name === "Int" || name === "Double" || name === "Float" || name === "Word" || name === "Char") return name;
+  if (name === "JSValPrim") return "JSVal";
+  if (name === "JSStringPrim") return "JSString";
+  return undefined;
+};
+
 /** `IO t` -> `t`; anything else -> `undefined`. `\b` keeps `IOResult a` out. */
 const ioPayload = (text: string): string | undefined => /^\s*IO\b(.*)$/.exec(text)?.[1]?.trim();
 
@@ -1039,16 +1063,17 @@ const voidRepOf = (p: Pattern): true | undefined =>
  * instance method written `(+) (I a) (I b) = ...` forces both arguments
  * through such a column.
  *
- * `newtype` is included deliberately: unlike GHC, ghcts never erases a
- * newtype's constructor (see `elaborate.ts`'s deriving-newtype note), so a
- * value matched against one is a real single-field closure here regardless of
- * what it wraps. */
+ * A newtype's constructor is excluded: `src/erase-newtypes.ts` erases it, so
+ * the subject is the wrapped value itself, which may well be a function. */
+const NEWTYPE_CONS = new Set<string>();
 const notFunOf = (p: Pattern): true | undefined =>
   p.tag === "var" || p.tag === "wild"
     ? p.notFun
-    : p.tag === "con" || p.tag === "record" || p.tag === "int" || p.tag === "char" || p.tag === "string"
-      ? true
-      : undefined;
+    : (p.tag === "con" || p.tag === "record") && NEWTYPE_CONS.has(p.name)
+      ? undefined // erased: the subject is whatever the newtype wraps, a function included
+      : p.tag === "con" || p.tag === "record" || p.tag === "int" || p.tag === "char" || p.tag === "string"
+        ? true
+        : undefined;
 
 const patternName = (p: Pattern): string | undefined =>
   p.tag === "var" ? p.name : p.tag === "as" ? p.name : undefined;
@@ -1110,7 +1135,29 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
       const unboxed = UNBOXED_TUPLE_TYPES.has(decl.name);
       decl.constructors.forEach((con, i) => {
         const name = unboxed ? unboxedTupleName(con.arity) : con.name;
-        d.cons.set(con.name, mkDataCon(name, i + 1, con.arity, unboxed ? name : decl.name));
+        const fieldReps = con.fieldTypes?.map((t) => /\bInt\b/.test(t) ? "boxed-int" as const : "other" as const);
+        const made = mkDataCon(name, i + 1, con.arity, unboxed ? name : decl.name, fieldReps);
+        // `Big` stores its sign as the raw Bool representation used by the JS
+        // backend, not as a heap pointer. This metadata is consumed when a
+        // constructor alternative binds the sign field (e.g. `bigIsNeg`).
+        if (decl.name === "Big") made.fieldUnboxed = [true, false];
+        // A newtype is a coercion in GHC, and `src/erase-newtypes.ts` makes
+        // it one here - unless it wraps a primitive, where the constructor is
+        // the box the foreign-call marshalling (`boxTypes`) unwraps.
+        if (decl.newtype === true && decl.constructors.length === 1 && con.arity === 1 && headTypeCon(con.fieldTypes?.[0] ?? "")?.endsWith("Prim") !== true) {
+          made.newtype = true;
+          NEWTYPE_CONS.add(con.name);
+        }
+        // GHC declares the list in ghc-prim:GHC.Types, and its JavaScript
+        // library names the constructors by that symbol: `h$jsstringPack`,
+        // `h$toHsList` and the rest read `h$ghczmprimZCGHCziTypesziZC_con_e`
+        // and `...ZMZN` outright. Emitting them under `main:Main` left those
+        // helpers unusable (every such reference in a bundle was undefined).
+        if (decl.name === "[]") {
+          made.definingUnitId = "ghc-prim";
+          made.definingModuleName = "GHC.Types";
+        }
+        d.cons.set(con.name, made);
       });
       d.conCount.set(unboxed ? unboxedTupleName(decl.constructors[0]?.arity ?? 0) : decl.name, decl.constructors.length);
     } else if (decl.tag === "class") {
@@ -1148,7 +1195,11 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
         (BigInt(k3 >>> 0) << 32n) | BigInt(k4 >>> 0),
       ];
     }
-    d.top.set(decl.name, mkBinder(decl.name, extra));
+    const topBinder = mkBinder(decl.name, extra);
+    if (decl.tag === "value" && decl.parameterReps) topBinder.parameterReps = decl.parameterReps;
+    if (decl.tag === "value" && decl.inline) topBinder.inline = true;
+    if (decl.tag === "value" && decl.resultRep === "Int") topBinder.resultRep = "boxed-int";
+    d.top.set(decl.name, topBinder);
   }
 
   const binds: CoreBind[] = [];
@@ -1158,7 +1209,8 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
     // A foreign import is a saturated foreign call under enough lambdas to
     // consume its declared arguments; `arity` comes from the signature's
     // top-level arrows.
-    const params = Array.from({ length: decl.arity }, (_, i) => mkBinder(`ffi${i}`));
+    const parameterReps = decl.parameterReps ?? decl.signature.slice(0, decl.arity).map(primitiveRepOf);
+    const params = Array.from({ length: decl.arity }, (_, i) => mkBinder(`ffi${i}`, parameterReps?.[i] ? { primitiveRep: parameterReps[i] } : {}));
     const op: StgOp = {
       tag: "StgFCallOp",
       target: { javascript: decl.javascript, safety: "unsafe" },
@@ -1185,20 +1237,41 @@ export function desugarModule(module: Module, file = `${module.name}.hs`): Desug
 
   for (const decl of values) {
     const arity = decl.equations[0]?.patterns.length ?? 0;
-    const params = Array.from({ length: arity }, (_, i) => mkBinder(`a${i}`));
+    const params = Array.from({ length: arity }, (_, i) => mkBinder(`a${i}`, decl.parameterReps?.[i] ? { primitiveRep: decl.parameterReps[i] } : {}));
     const rows: MatchRow[] = decl.equations.map((eq) => ({
       patterns: eq.patterns,
       guards: eq.guards,
       whereBindings: eq.whereBindings,
     }));
-    const body = d.match(params, rows, d.top, raise());
+    let body = d.match(params, rows, d.top, raise());
+    // Keep the ordinary entry point's boxed result distinct from the machine
+    // operation.  GHC's CPR pass records this fact while later worker/native
+    // paths may unbox it; erasing it here makes the backend choose a different
+    // allocation sequence even when the STG control shape agrees.
+    if (decl.resultRep === "Int") {
+      const intCon = d.cons.get("I");
+      if (intCon) {
+        const boxResult = (e: CoreExpr): CoreExpr => {
+          switch (e.tag) {
+            case "Op": return { tag: "Con", con: intCon, args: [e] };
+            // Only result positions are boxed: a `case` scrutinee binds the
+            // primop's raw value (`case primStableNameInt n of i -> I i`), and
+            // boxing it too made the alternative box a box.
+            case "Case": return { ...e, alts: e.alts.map((a) => ({ ...a, body: boxResult(a.body) })) };
+            case "Let": return { ...e, body: boxResult(e.body) };
+            default: return e;
+          }
+        };
+        body = boxResult(body);
+      }
+    }
     binds.push({ tag: "NonRec", binder: d.top.get(decl.name)!, rhs: mkLams(params, body) });
   }
 
   return {
     // An unboxed tuple has no worker: there is no closure to enter, so GHC
     // emits no `_con_e` for one and neither does this.
-    program: { name: module.name, binds, dataCons: [...d.cons.values()].filter((c) => !isUnboxedTupleCon(c)) },
+    program: eraseNewtypes({ name: module.name, binds, dataCons: [...d.cons.values()].filter((c) => !isUnboxedTupleCon(c)) }),
     diagnostics: d.diagnostics,
   };
 }

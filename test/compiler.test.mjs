@@ -9,15 +9,21 @@ import { collectInterface } from '../dist/interface.js';
 import { parseCabalLibrary } from '../dist/cabal.js';
 import { deriveCabalConfig } from '../dist/build.js';
 import { copy, inlineKnownCalls } from '../dist/core-opt/inline.js';
+import { specConstr } from '../dist/core-opt/specconstr.js';
 import { specialiseKnownDicts } from '../dist/core-opt/specialise.js';
 import { forceStrictArgs } from '../dist/core-opt/strictness.js';
 import { workWrap } from '../dist/core-opt/workwrap.js';
 import { simplifyCore } from '../dist/core-opt/simplify.js';
 import { floatConstants } from '../dist/core-opt/float.js';
 import { optimiseCore } from '../dist/build.js';
-import { elaborateProgram } from '../dist/elaborate.js';
+import { elaborateModule, elaborateProgram } from '../dist/elaborate.js';
 import { desugarModule } from '../dist/desugar.js';
+import { coreToStg } from '../dist/core-to-stg.js';
 import { coreFreeVars } from '../dist/core.js';
+import { mkBinder } from '../dist/stg.js';
+import { GenState, slotUnknown } from '../dist/stg-js/monad.js';
+import { optimizeFree } from '../dist/stg-js/expr.js';
+import { defaultStgToJSConfig } from '../dist/stg-js/types.js';
 
 test('derives a ghcts.json from an executable-only .cabal, resolving a local dependency', async () => {
   // sample-app has no ghcts.json - only app.cabal (an `executable` stanza) -
@@ -58,11 +64,383 @@ const contains = (e, pred) => {
 test('inlining replaces a known class method with the primop it is made of', () => {
   const source = 'module Main where\nadd :: Int -> Int -> Int\nadd a b = a + b\n';
   const before = bindNamed(coreOf(source), 'add');
-  assert.ok(contains(before, (e) => e.tag === 'Var' && e.binder.name === '$cNumInt$+'));
+  assert.ok(contains(before, (e) => e.tag === 'Var' && /\$fNumInt_\$c\+|\$cNumInt\$\+/.test(e.binder.name)));
   const after = bindNamed(inlineKnownCalls(coreOf(source)), 'add');
   // The dictionary method is gone and its IntAddOp is now in `add` itself.
-  assert.ok(!contains(after, (e) => e.tag === 'Var' && e.binder.name === '$cNumInt$+'));
+  assert.ok(!contains(after, (e) => e.tag === 'Var' && /\$fNumInt_\$c\+|\$cNumInt\$\+/.test(e.binder.name)));
   assert.ok(contains(after, (e) => e.tag === 'Op' && e.op.op === 'IntAddOp'));
+});
+
+test('desugaring annotates numeric foreign parameters for worker/wrapper', () => {
+  const program = coreOf([
+    'module Main where',
+    'foreign import javascript unsafe "((x) => x)" numericForeignProbe :: Int -> IO Int',
+  ].join('\n'));
+  const rhs = bindNamed(program, 'numericForeignProbe');
+  assert.equal(rhs?.tag, 'Lam');
+  assert.equal(rhs?.binder.primitiveRep, 'Int');
+});
+
+test('desugaring distinguishes JS-native foreign parameters', () => {
+  const program = coreOf([
+    'module Main where',
+    'foreign import javascript unsafe "((x) => x)" jsValForeignProbe :: JSValPrim -> IO JSValPrim',
+    'foreign import javascript unsafe "((x) => x)" jsStringForeignProbe :: JSStringPrim -> IO JSStringPrim',
+  ].join('\n'));
+  assert.equal(bindNamed(program, 'jsValForeignProbe')?.binder.primitiveRep, 'JSVal');
+  assert.equal(bindNamed(program, 'jsStringForeignProbe')?.binder.primitiveRep, 'JSString');
+});
+
+test('preserves INLINE pragmas on Core binders', () => {
+  const source = [
+    'module Main where',
+    'inlineProbe :: Int -> Int',
+    'inlineProbe x = x',
+    '{-# INLINE inlineProbe #-}',
+  ].join('\n');
+  const parsed = parseModule(source, 'Inline.hs');
+  assert.deepEqual(parsed.diagnostics.filter((d) => d.severity === 'error'), []);
+  assert.deepEqual(parsed.module?.ast.inlineNames, ['inlineProbe']);
+  const program = desugarModule(elaborateProgram(new Map([['Main', parsed.module.ast]]), 'Main', 'Main.hs').module, 'Main.hs').program;
+  assert.equal(program.binds.find((b) => b.binder.name === 'inlineProbe')?.binder.inline, true);
+});
+
+test('rooted inlining optimizes reachable bodies without rewriting dead exports', () => {
+  const source = [
+    'module Main where',
+    'used :: Int',
+    'used = 1 + 2',
+    'dead :: Int',
+    'dead = 3 + 4',
+    '',
+  ].join('\n');
+  const after = inlineKnownCalls(coreOf(source), { roots: ['used'], preserveUnreferencedTopLevelBodies: true });
+  assert.ok(contains(bindNamed(after, 'used'), (e) => e.tag === 'Op' && e.op.op === 'IntAddOp'));
+  assert.ok(contains(bindNamed(after, 'dead'), (e) => e.tag === 'Var' && /\$fNumInt_\$c\+|\$cNumInt\$\+/.test(e.binder.name)));
+});
+
+test('inlining distinguishes top-level binders that share a unique', () => {
+  const f = mkBinder('f');
+  const g = mkBinder('g');
+  const x = mkBinder('x');
+  const y = mkBinder('y');
+  g.unique = f.unique;
+  const program = {
+    name: 'Main',
+    binds: [
+      { tag: 'NonRec', binder: f, rhs: { tag: 'Lam', binder: x, body: { tag: 'Lit', value: 1 } } },
+      { tag: 'NonRec', binder: g, rhs: { tag: 'Lam', binder: y, body: { tag: 'Lit', value: 2 } } },
+      { tag: 'NonRec', binder: mkBinder('use'), rhs: { tag: 'App', fn: { tag: 'Var', binder: g }, arg: { tag: 'Lit', value: 0 } } },
+    ],
+  };
+  const use = bindNamed(inlineKnownCalls(program), 'use');
+  assert.equal(use.tag, 'Lit');
+  assert.equal(use.value, 2);
+});
+
+test('inlining resolves cloned call-site binders by unique', () => {
+  const target = mkBinder('target');
+  const x = mkBinder('x');
+  const callRef = { ...target };
+  const use = mkBinder('useCloned');
+  const program = {
+    name: 'Main',
+    dataCons: [],
+    binds: [
+      { tag: 'NonRec', binder: target, rhs: { tag: 'Lam', binder: x, body: { tag: 'Var', binder: x } } },
+      { tag: 'NonRec', binder: use, rhs: { tag: 'App', fn: { tag: 'Var', binder: callRef }, arg: { tag: 'Lit', lit: { tag: 'LitInt', value: 1n } } } },
+    ],
+  };
+  const body = bindNamed(inlineKnownCalls(program), 'useCloned');
+  assert.ok(body && body.tag === 'Lit' && body.lit.value === 1n);
+});
+
+test('erases only a RealWorld lambda parameter, not a function-valued binder', () => {
+  const source = [
+    'module Main where',
+    'stateAction :: RealWorld -> IOResult ()',
+    'stateAction = \\s -> IOResult s ()',
+    'takesAction :: (RealWorld -> IOResult ()) -> Int',
+    'takesAction _ = 1',
+  ].join('\n');
+  const program = coreOf(source);
+  const stateAction = bindNamed(program, 'stateAction');
+  const takesAction = bindNamed(program, 'takesAction');
+  const firstLambda = (e) => {
+    if (!e || typeof e !== 'object') return undefined;
+    if (e.tag === 'Lam') return e;
+    for (const value of Object.values(e)) {
+      const found = Array.isArray(value)
+        ? value.map(firstLambda).find((x) => x !== undefined)
+        : firstLambda(value);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  assert.equal(firstLambda(stateAction)?.binder.arity, 0);
+  assert.equal(firstLambda(takesAction)?.binder.arity, undefined);
+});
+
+test('dictionary specialisation follows zero-argument FromJSVal aliases', () => {
+  const dict = mkBinder('$fFromJSValInt');
+  const selector = mkBinder('fromJSVal');
+  const method = mkBinder('$cFromJSValInt$fromJSVal');
+  const ffi = mkBinder('Miso_DSL_FFI_fromJSVal_Int');
+  const x = mkBinder('x');
+  const program = {
+    name: 'Main',
+    dataCons: [],
+    binds: [
+      { tag: 'NonRec', binder: dict, rhs: { tag: 'Lit', lit: { tag: 'LitInt', value: 0n } } },
+      { tag: 'NonRec', binder: ffi, rhs: { tag: 'Lit', lit: { tag: 'LitInt', value: 0n } } },
+      { tag: 'NonRec', binder: method, rhs: { tag: 'Var', binder: ffi } },
+      { tag: 'NonRec', binder: selector, rhs: { tag: 'Lam', binder: dict, body: { tag: 'Lam', binder: x, body: { tag: 'App', fn: { tag: 'Var', binder: method }, arg: { tag: 'Var', binder: x } } } } },
+      { tag: 'NonRec', binder: mkBinder('use'), rhs: { tag: 'App', fn: { tag: 'App', fn: { tag: 'Var', binder: selector }, arg: { tag: 'Var', binder: dict } }, arg: { tag: 'Lit', lit: { tag: 'LitInt', value: 1n } } } },
+    ],
+  };
+  const use = bindNamed(specialiseKnownDicts(program), 'use');
+  assert.ok(contains(use, (e) => e.tag === 'Var' && e.binder === ffi));
+  assert.ok(!contains(use, (e) => e.tag === 'Var' && e.binder === method));
+});
+
+test('specialisation canonicalises direct top-level aliases used as values', () => {
+  const alias = mkBinder('alias');
+  const target = mkBinder('target');
+  const use = mkBinder('useAlias');
+  const program = {
+    name: 'Main',
+    dataCons: [],
+    binds: [
+      { tag: 'NonRec', binder: target, rhs: { tag: 'Lit', lit: { tag: 'LitInt', value: 0n } } },
+      { tag: 'NonRec', binder: alias, rhs: { tag: 'Var', binder: target } },
+      { tag: 'NonRec', binder: use, rhs: { tag: 'Var', binder: alias } },
+    ],
+  };
+  const body = bindNamed(specialiseKnownDicts(program), 'useAlias');
+  assert.ok(body && body.tag === 'Var' && body.binder === target);
+});
+
+test('specialisation clones a recursive map for a known unary function', () => {
+  const source = [
+    'module Main where',
+    'row :: Int -> Int',
+    'row n = n + 1',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int] -> [Int]',
+    'view xs = map1 row xs',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  const after = specConstr(before);
+  let clone;
+  const findClone = (e) => {
+    if (!e || typeof e !== 'object') return;
+    if (e.tag === 'Let') {
+      const pairs = e.bind.tag === 'NonRec' ? [[e.bind.binder, e.bind.rhs]] : e.bind.pairs;
+      for (const [binder, rhs] of pairs) {
+        if (binder.name.startsWith('$smap1_row')) clone = { binder, rhs };
+        findClone(rhs);
+      }
+      findClone(e.body);
+    } else if (e.tag === 'App') { findClone(e.fn); findClone(e.arg); }
+    else if (e.tag === 'Lam') findClone(e.body);
+    else if (e.tag === 'Case') { findClone(e.scrutinee); e.alts.forEach((a) => findClone(a.body)); }
+    else if (e.tag === 'Con' || e.tag === 'Op') e.args.forEach(findClone);
+  };
+  after.binds.forEach((b) => {
+    const pairs = b.tag === 'NonRec' ? [[b.binder, b.rhs]] : b.pairs;
+    for (const [binder, rhs] of pairs) {
+      if (binder.name.startsWith('$smap1_row')) clone = { binder, rhs };
+      findClone(rhs);
+    }
+  });
+  assert.ok(clone, 'a specialized map clone should be added');
+  let cloneParams = 0;
+  for (let rhs = clone.rhs; rhs.tag === 'Lam'; rhs = rhs.body) cloneParams += 1;
+  assert.equal(cloneParams, 1, 'the specialized clone should drop its function parameter');
+  assert.ok(
+    contains(clone.rhs, (e) => e.tag === 'Op' && e.op.op === 'IntAddOp'),
+    'the known function body should be substituted into the clone',
+  );
+  assert.ok(
+    contains(clone.rhs, (e) => e.tag === 'Var' && e.binder === clone.binder),
+    'recursive calls should target the specialized clone',
+  );
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    contains(view, (e) => e.tag === 'Var' && e.binder === clone.binder),
+    'the known call should be redirected to the specialized clone',
+  );
+});
+
+test('default Integral.div specialization revisits its divMod body', () => {
+  const source = [
+    'module Main where',
+    'half :: Int -> Int',
+    'half n = n `div` 2',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  const after = specialiseKnownDicts(before, { inlineGenerated: true });
+  const half = bindNamed(after, 'half');
+  assert.ok(half, 'half should remain in the specialized program');
+  assert.ok(!contains(half, (e) => e.tag === 'Var' && e.binder.name === '$dmIntegral$div'),
+    'the copied default div body should be recursively specialized');
+});
+
+test('Integral.div specialization propagates through the demanded divMod projection', () => {
+  const source = [
+    'module Main where',
+    'half :: Int -> Int',
+    'half n = n `div` 2',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  const after = specialiseKnownDicts(before, { inlineGenerated: true });
+  const half = bindNamed(after, 'half');
+  assert.ok(
+    contains(half, (e) => e.tag === 'Var' && /\$fIntegralInt_\$cquotRem|\$cIntegralInt\$quotRem/.test(e.binder.name)),
+    'the known Integral dictionary should reach the concrete quotRem implementation',
+  );
+  const genericProjectedDivMod = (e) => {
+    if (!e || typeof e !== 'object') return false;
+    if (e.tag === 'App') {
+      let head = e;
+      const args = [];
+      while (head.tag === 'App') {
+        args.unshift(head.arg);
+        head = head.fn;
+      }
+      if (head.tag === 'Var' && head.binder.name === 'divMod' &&
+          args[0]?.tag === 'Var' && args[0].binder.name === '$fIntegralInt') return true;
+    }
+    return Object.values(e).some((v) =>
+      Array.isArray(v) ? v.some(genericProjectedDivMod) : genericProjectedDivMod(v));
+  };
+  assert.ok(!genericProjectedDivMod(half), 'the projected divMod call should be specialized');
+});
+
+test('specialisation clones a recursive map for an inline section', () => {
+  const source = [
+    'module Main where',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int] -> [Int]',
+    'view xs = map1 (+ 1) xs',
+    '',
+  ].join('\n');
+  const after = specConstr(inlineKnownCalls(coreOf(source)));
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    contains(view, (e) => e.tag === 'Var' && e.binder.name.startsWith('$smap1_$lambda')),
+    'an inline section should be specialized through the recursive map',
+  );
+});
+
+test('inlines a trivial prefix of a known function application', () => {
+  const source = [
+    'module Main where',
+    'add :: Int -> Int -> Int',
+    'add a b = a + b',
+    'plus1 :: Int -> Int',
+    'plus1 = add 1',
+    '',
+  ].join('\n');
+  const after = inlineKnownCalls(coreOf(source), { preserveUnreferencedTopLevelBodies: false });
+  const plus1 = bindNamed(after, 'plus1');
+  assert.ok(plus1?.tag === 'Lam', 'partial application should become a remaining-argument lambda');
+  assert.ok(contains(plus1, (e) => e.tag === 'Con' && e.con.name === 'I'), 'the supplied literal should be substituted');
+});
+
+test('SpecConstr carries a named callback through a fmap-to-map wrapper', () => {
+  const source = [
+    'module Main where',
+    'row :: Int -> Int',
+    'row n = n + 1',
+    'fmap1 :: (Int -> Int) -> [Int] -> [Int]',
+    'fmap1 f xs = map1 f xs',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int] -> [Int]',
+    'view xs = fmap1 row xs',
+    '',
+  ].join('\n');
+  const after = specConstr(inlineKnownCalls(coreOf(source)));
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    contains(view, (e) => e.tag === 'Var' && e.binder.name.startsWith('$smap1_row')),
+    'a named callback should survive the wrapper and specialize the recursive map',
+  );
+});
+
+test('SpecConstr exposes the two-argument list <$>', () => {
+  const source = [
+    'module Main where',
+    'row :: Int -> Int',
+    'row n = n + 1',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int]',
+    'view = row <$> map1 id [1, 2]',
+    '',
+  ].join('\n');
+  const after = specConstr(inlineKnownCalls(coreOf(source)), { requireKnownCollection: true });
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    contains(view, (e) => e.tag === 'Var' && e.binder.name.startsWith('$smap1_')),
+    'the two-argument <$>'
+  );
+});
+
+test('SpecConstr leaves map generic when its collection is unknown', () => {
+  const source = [
+    'module Main where',
+    'row :: Int -> Int',
+    'row n = n + 1',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int] -> [Int]',
+    'view xs = map1 row xs',
+    '',
+  ].join('\n');
+  const after = specConstr(inlineKnownCalls(coreOf(source)), { requireKnownCollection: true });
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    !contains(view, (e) => e.tag === 'Var' && e.binder.name.startsWith('$smap1_row')),
+    'an unknown collection must not trigger a specialized recursive map',
+  );
+});
+
+test('SpecConstr specializes map when its collection is a known list', () => {
+  const source = [
+    'module Main where',
+    'row :: Int -> Int',
+    'row n = n + 1',
+    'map1 :: (Int -> Int) -> [Int] -> [Int]',
+    'map1 f xs = case xs of',
+    '  [] -> []',
+    '  y:ys -> f y : map1 f ys',
+    'view :: [Int]',
+    'view = map1 row [1, 2]',
+    '',
+  ].join('\n');
+  const after = specConstr(inlineKnownCalls(coreOf(source)), { requireKnownCollection: true });
+  const view = bindNamed(after, 'view');
+  assert.ok(
+    contains(view, (e) => e.tag === 'Var' && e.binder.name.startsWith('$smap1_row')),
+    'a known list collection should trigger recursive map specialization',
+  );
 });
 
 test('strict arguments are forced at the call site, lazy ones are left alone', () => {
@@ -115,7 +493,7 @@ test('constrained Eq [Int] specialises to the Int method, not a dictionary apply
     'the == selector should be gone',
   );
   assert.ok(
-    contains(eqInts, (e) => e.tag === 'Var' && /\$cEqInt\$==|\$s\$cEqList/.test(e.binder.name)),
+    contains(eqInts, (e) => e.tag === 'Var' && /\$fEq(?:Int|List)|\$cEqInt\$==|\$s/.test(e.binder.name)),
     'should mention the Int method or a specialised list method',
   );
 });
@@ -165,6 +543,37 @@ test('work/wrap unpacks Int arguments on a strict adder', () => {
   assert.ok(worker, 'a $w worker should exist');
   const add = bindNamed(wrapped, 'add');
   assert.ok(contains(add, (e) => e.tag === 'Case'), 'the wrapper should case on its Int args');
+});
+
+test('work/wrap recognizes boxed Int methods in nested arithmetic', () => {
+  const source = [
+    'module Main where',
+    'mix :: Int -> Int -> Int',
+    'mix a b = a * b + a',
+    '',
+  ].join('\n');
+  const wrapped = workWrap(inlineKnownCalls(coreOf(source)));
+  assert.ok(
+    [...wrapped.binds].some((b) => b.tag === 'NonRec' && b.binder.name.startsWith('$wmix')),
+    'nested strict Int methods should produce an unboxed worker',
+  );
+});
+
+test('core-to-stg marks generated workers as top-level internal binders', () => {
+  const source = [
+    'module Main where',
+    'add :: Int -> Int -> Int',
+    'add a b = a + b',
+    '',
+  ].join('\n');
+  const program = coreToStg(workWrap(inlineKnownCalls(coreOf(source))));
+  const worker = program.bindings.find(
+    (b) => b.tag === 'StgNonRec' && b.binder.name.startsWith('$w'),
+  );
+  assert.ok(worker, 'the STG program should contain the generated worker');
+  assert.equal(worker.binder.topLevel, true);
+  assert.equal(worker.binder.exported, false);
+  assert.equal(worker.binder.internal, true);
 });
 
 test('work/wrap leaves every worker binder in scope on a self-recursive loop', () => {
@@ -255,6 +664,23 @@ test('the simplifier reuses what an enclosing case already proved', () => {
   assert.equal(countCases(after), 1);
 });
 
+test('the simplifier propagates a closed top-level constructor', () => {
+  const source = [
+    'module Main where',
+    'two :: Int',
+    'two = 2',
+    'useTwo :: Int -> Int',
+    'useTwo n = n + two',
+    '',
+  ].join('\n');
+  const before = inlineKnownCalls(coreOf(source));
+  const after = bindNamed(simplifyCore(before), 'useTwo');
+  assert.ok(
+    !contains(after, (e) => e.tag === 'Var' && e.binder.name === 'two'),
+    'a closed constructor binding should be visible at its use sites',
+  );
+});
+
 test('work/wrap unboxes an argument the body only cases further down', () => {
   // `sumTo` cases `n` at the top and `acc` inside a branch. GHC unboxes both -
   // Str=<1!P(L)><1!P(1L)> - so the accumulator must not stay boxed just
@@ -280,7 +706,41 @@ test('work/wrap unboxes an argument the body only cases further down', () => {
   );
 });
 
-test('constant constructors are shared at the top level, not rebuilt', () => {
+test('demand analysis records direct-jump eligibility separately from strictness', () => {
+  const program = optimiseCore(coreOf([
+    'module Main where',
+    'add :: Int -> Int -> Int',
+    'add a b = a + b',
+    '',
+  ].join('\n')));
+  const add = program.binds.find((b) => b.tag === 'NonRec' && b.binder.name === 'add');
+  assert.ok(add, 'add should remain a top-level binding');
+  // A boxed wrapper may be strict without having the native entry ABI needed
+  // for a direct jump. Core-to-STG marks only proven native-region functions.
+  assert.equal(add.binder.directJumpEligible, undefined);
+  assert.equal(add.binder.strict, true);
+});
+
+test('elaboration preserves primitive parameter representation into Core', () => {
+  const desugared = coreOf([
+    'module Main where',
+    'big :: Int -> Bool',
+    'big n = n > 10',
+    '',
+  ].join('\n'));
+  const bind = desugared.binds.find((b) => b.tag === 'NonRec' && b.binder.name === 'big');
+  assert.ok(bind && bind.rhs.tag === 'Lam');
+  assert.equal(bind.rhs.binder.primitiveRep, 'Int');
+});
+
+test('optimizeFree follows GHC drop-after-take offset semantics', () => {
+  const id = mkBinder('live');
+  const gs = new GenState(defaultStgToJSConfig, { unitId: 'main', moduleName: 'Test' }, 1, new Map());
+  gs.gsGroup.ggsStack = [slotUnknown, { tag: 'SlotId', id, size: 1 }];
+  assert.deepEqual(optimizeFree(gs, 1, [id]), [[id, 1, false]]);
+});
+
+test('a nullary constructor is a name already, so FloatOut leaves it in place', () => {
   const source = [
     'module Main where',
     'data Colour = Red | Green',
@@ -293,17 +753,38 @@ test('constant constructors are shared at the top level, not rebuilt', () => {
   const shared = floated.binds.filter(
     (b) => b.tag === 'NonRec' && b.binder.name === 'lvl' && b.rhs.tag === 'Con' && b.rhs.con.name === 'Red',
   );
-  assert.equal(shared.length, 1, 'both branches should reach one shared Red');
+  assert.equal(shared.length, 0, 'GHC never floats a bare constructor worker');
   const pick = bindNamed(floated, 'pick');
   assert.ok(
-    !contains(pick, (e) => e.tag === 'Con' && e.con.name === 'Red'),
-    'no branch should build Red for itself',
+    contains(pick, (e) => e.tag === 'Con' && e.con.name === 'Red'),
+    'each branch returns Red directly, as GHC does with the worker Var',
   );
 });
 
-test('an unboxed-representation box is left where it is', () => {
-  // `I# 0` is the number itself on this backend, and GHC.StgToJS.Sinker
-  // unfloats exactly these again, so floating one out only invents a name.
+test('a nullary constructor argument is the constructor worker, never a let', () => {
+  const source = [
+    'module Main where',
+    'data Big = Big Bool [Int]',
+    'bigZero :: Big',
+    'bigZero = Big False []',
+    '',
+  ].join('\n');
+  const stg = coreToStg(coreOf(source));
+  const bigZero = stg.bindings.find((b) => b.tag === 'StgNonRec' && b.binder.name === 'bigZero');
+  assert.ok(bigZero, 'bigZero should be lowered');
+  assert.equal(bigZero.rhs.tag, 'StgRhsCon', 'static data, not a thunk that allocates its fields');
+  assert.deepEqual(
+    bigZero.rhs.args.map((a) => (a.tag === 'StgVarArg' ? a.id.name : a.tag)),
+    ['False', '[]'],
+  );
+  const falseWorker = stg.bindings.find((b) => b.tag === 'StgNonRec' && b.binder.name === 'False');
+  assert.ok(falseWorker, 'the worker binding exists');
+  assert.equal(bigZero.rhs.args[0].id, falseWorker.binder, 'one Binder object per constructor');
+});
+
+test('FloatOut shares a constant unboxed-representation box', () => {
+  // GHC's Core/STG keeps the shared `I# 0` binding (`orZero1`) even though
+  // JavaScript codegen can represent its payload as a raw number.
   const source = ['module Main where', 'zero :: Int', 'zero = 0', ''].join('\n');
   const floated = floatConstants(inlineKnownCalls(coreOf(source)));
   const boxes = floated.binds.filter(
@@ -313,7 +794,7 @@ test('an unboxed-representation box is left where it is', () => {
       b.rhs.tag === 'Con' &&
       b.rhs.con.typeName === 'Int',
   );
-  assert.deepEqual(boxes, [], 'an Int box is the number itself here');
+  assert.equal(boxes.length, 1, 'the constant Int box should have one shared home');
 });
 
 test('a call on anything but constants is left where it is', () => {
@@ -344,6 +825,27 @@ test('a call on anything but constants is left where it is', () => {
       args(b.rhs).every(constant),
       'a call with a variable argument must stay where it is',
     );
+});
+
+test('FloatOut lifts a closed callback passed to map', () => {
+  const source = [
+    'module Main where',
+    'bumpAll :: [Int] -> [Int]',
+    'bumpAll xs = map (+ 1) xs',
+    '',
+  ].join('\n');
+  const floated = floatConstants(inlineKnownCalls(coreOf(source)));
+  // Every program links GHC.JS.Prim now, so more than one closed lambda is
+  // floated; the one that matters is whichever `bumpAll` hands to `map`.
+  const callbacks = floated.binds.filter(
+    (b) => b.tag === 'NonRec' && b.binder.name === 'lvl' && b.rhs.tag === 'Lam',
+  );
+  assert.ok(callbacks.length > 0, 'the closed section should have a top-level binding');
+  const bumpAll = bindNamed(floated, 'bumpAll');
+  assert.ok(
+    bumpAll && contains(bumpAll, (e) => e.tag === 'Var' && callbacks.some((c) => c.binder === e.binder)),
+    'map should receive the floated callback rather than a local lambda let',
+  );
 });
 
 test('copying renames a binder only where that binder is in scope', () => {
@@ -644,6 +1146,23 @@ test('instance method equations keep string literals instead of turning them int
   assert.equal(body.tag, 'app');
   assert.equal(body.arg.tag, 'string');
   assert.equal(body.arg.value, 'staticKey');
+});
+
+test('preserves INLINE pragmas on extracted instance methods', () => {
+  const parsed = parseModule([
+    'module InlineInstance where',
+    'class ToJSVal a where',
+    '  toJSVal :: a -> Int',
+    'data Rec = Rec',
+    'instance ToJSVal Rec where',
+    '  toJSVal Rec = 1',
+    '  {-# INLINE toJSVal #-}',
+    '',
+  ].join('\n'), 'InlineInstance.hs');
+  assert.deepEqual(parsed.diagnostics, []);
+  const instance = parsed.module.ast.declarations.find(declaration => declaration.tag === 'instance');
+  assert.deepEqual(instance.inlineNames, ['toJSVal']);
+  assert.equal(instanceMethodValues(instance)[0].inline, true);
 });
 
 test('parses do-local let bindings without an expression-level in', () => {

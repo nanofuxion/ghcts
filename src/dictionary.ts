@@ -110,6 +110,7 @@ export function instanceMethodValues(declaration: InstanceDeclaration, file = '<
     if (parsed.diagnostics.length) continue;
     const value = parsed.module?.ast.declarations.find((candidate): candidate is ValueDeclaration => candidate.tag === 'value');
     if (!value) continue;
+    if (declaration.inlineNames?.includes(value.name) || parsed.module?.ast.inlineNames?.includes(value.name)) value.inline = true;
     // Layout puts each equation of a multi-equation member in its own slice, so
     // the equations arrive as separate declarations and have to be rejoined -
     // otherwise `f A = ...` / `f B = ...` would keep only the last equation.

@@ -18,6 +18,9 @@ export interface ExprCtx {
   /** Top-level binding Id */
   readonly ctxTop: Binder;
 
+  /** IDs known evaluated by the enclosing Core/STG let context. */
+  readonly ctxEval: ReadonlySet<number>;
+
   /** Target variables for the evaluated expression */
   readonly ctxTarget: TypedExpr[];
 
@@ -48,6 +51,7 @@ export interface ExprCtx {
 export function initExprCtx(i: Binder): ExprCtx {
   return {
     ctxTop: i,
+    ctxEval: new Set(),
     ctxTarget: [],
     ctxLneFrameBs: new Map(),
     ctxLneFrameVars: [],
@@ -60,6 +64,12 @@ export const ctxSetTarget = (t: TypedExpr[], ctx: ExprCtx): ExprCtx => ({ ...ctx
 
 /** Set top-level binding Id */
 export const ctxSetTop = (i: Binder, ctx: ExprCtx): ExprCtx => ({ ...ctx, ctxTop: i });
+
+export const ctxAddEval = (ids: readonly Binder[], ctx: ExprCtx): ExprCtx => {
+  const evals = new Set(ctx.ctxEval);
+  for (const i of ids) evals.add(i.unique);
+  return { ...ctx, ctxEval: evals };
+};
 
 /** Set source location */
 export const ctxSetSrcSpan = (span: RealSrcSpan, ctx: ExprCtx): ExprCtx => ({ ...ctx, ctxSrcSpan: span });
@@ -107,9 +117,9 @@ export const ctxLneFrameSize = (ctx: ExprCtx): number => ctx.ctxLneFrameSize;
  * name for the WHNF. `Binder.strict` is `isStrictId` (function closures are
  * not thunks) and must not be read here: that would make `isInlineApp`
  * skip entering a data thunk. */
-export function ctxIsEvaluated(i: Binder): boolean {
+export function ctxIsEvaluated(i: Binder, ctx?: ExprCtx): boolean {
   if (i.join) return false;
-  return i.evaluated === true;
+  return i.evaluated === true || ctx?.ctxEval.has(i.unique) === true;
 }
 
 /** Return the LNE stack size associated to the given Id. Undefined when the

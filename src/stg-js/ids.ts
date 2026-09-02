@@ -160,7 +160,10 @@ export function makeIdentForId(
   }
   // GHC uses the Id's own defining module when it is exported; ghcts Binders
   // carry no Name, hence no defining module, so the current one is always used.
-  const mod = currentModule;
+  const mod =
+    i.definingUnitId !== undefined && i.definingModuleName !== undefined
+      ? { unitId: i.definingUnitId, moduleName: i.definingModuleName }
+      : currentModule;
   const suffixNum = num === undefined ? "" : `_${intBS(num)}`;
   const suffixType = idType === IdType.IdPlain ? "" : idType === IdType.IdEntry ? "_e" : "_con_e";
   // A real top-level declaration is exported *and* has a real source name, so
@@ -260,7 +263,13 @@ export const varForDataConEntryId = (s: GenState, i: Binder): JStgExpr => Var(id
  * (src/stg.ts) carries no such Binder, so one is derived from the DataCon
  * itself - same name and unique, and exported, matching GHC where a worker is
  * always as visible as its constructor. */
-const dataConWorkId = (d: DataCon): Binder => ({ name: d.name, unique: d.unique, exported: true });
+const dataConWorkId = (d: DataCon): Binder => ({
+  name: d.name,
+  unique: d.unique,
+  exported: true,
+  definingUnitId: d.definingUnitId,
+  definingModuleName: d.definingModuleName,
+});
 
 /** Retrieve datacon worker entry Ident for the given datacon */
 export const identForDataConWorker = (s: GenState, d: DataCon): Ident =>

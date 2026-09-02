@@ -57,7 +57,7 @@ test('GHC mode pushes a continuation then jumps on oversaturated known-arity cal
 });
 
 test('static e registers through h$initStatic so h$runInitStatic fills the SPT before main', () => {
-  const units = compileHs('module Main where\np = static True\n', 'StaticPtr.hs');
+  const units = compileHs('{-# LANGUAGE StaticPointers #-}\nmodule Main where\np = static True\n', 'StaticPtr.hs');
   const js = renderModule(defaultStgToJSConfig, units);
   assert.match(js, /h\$initStatic\.push/);
   assert.match(js, /h\$hs_spt_insert/);

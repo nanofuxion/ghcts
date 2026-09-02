@@ -89,7 +89,10 @@ data Either a b = Left a | Right b
 -- and \`h\$forkThread\` all assume - and they are why a bind step now assigns a
 -- register where it used to allocate a two-field heap object.
 data IOResult a = IOResult RealWorld a
-data IO a = IO (RealWorld -> IOResult a)
+-- A newtype, as GHC's is: \`src/erase-newtypes.ts\` makes the constructor a
+-- coercion, so an \`IO\` action IS its state function and a bind allocates no
+-- box around it.
+newtype IO a = IO (RealWorld -> IOResult a)
 
 -- --------------------------------------------------------------- classes ---
 

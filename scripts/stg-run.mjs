@@ -30,7 +30,11 @@ import { mkBinder, mkDataCon, UpdateFlag } from "../dist/stg.js";
 const show = process.argv.includes("--print");
 const config = defaultStgToJSConfig;
 const mod = { unitId: "main", moduleName: "Test" };
-const rts = renderRts(config) + "\n" + renderStaticRts(config);
+// The static RTS now carries ghcjs-base's jsstring.js, which builds
+// `h$jsstringEmpty` from the `JSVal` constructor at load time. A real program
+// always links GHC.JS.Prim; these hand-built terms do not, so the constructor
+// entry is stubbed the way the linker would otherwise supply it.
+const rts = "function h$ghczminternalZCGHCziInternalziJSziPrimziJSVal_con_e() { return h$rs(); }\n" + renderRts(config) + "\n" + renderStaticRts(config);
 
 /** Test-only scaffolding: the harness drives one term to completion itself
  * rather than starting a real thread, so it supplies its own stack, its own

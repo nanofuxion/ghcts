@@ -853,7 +853,11 @@ function showType(t: Type): string {
 const dictType = (cls: string): string => `Dict_${cls}`;
 const dictCon = (cls: string): string => `MkDict_${cls}`;
 const dictValue = (cls: string, target: string): string => `$f${cls}${target}`;
-const methodImpl = (cls: string, target: string, method: string): string => `$c${cls}${target}$${method}`;
+// GHC names an instance method by its dictionary first, then the `$c` method
+// suffix. Keep this canonical spelling so ordinary specialized calls match
+// GHC's symbol stream; the specialiser still accepts the older spelling when
+// reading previously elaborated bindings.
+const methodImpl = (cls: string, target: string, method: string): string => `$f${cls}${target}_$c${method}`;
 const defaultImpl = (cls: string, method: string): string => `$dm${cls}$${method}`;
 const superSelector = (cls: string, index: number): string => `$p${index}${cls}`;
 
@@ -986,7 +990,15 @@ class Elaborator {
   /** Is this binder's type the erased state token? See `Pattern.voidRep`. */
   isVoidRep(node: Pattern | Expr): boolean {
     const t = this.binderTypes.get(node);
-    return t !== undefined && headCon(t) === "RealWorld";
+    if (t === undefined) return false;
+    // Lambda nodes are recorded with their complete arrow type. The erased
+    // state token is the domain of `RealWorld -> a`, not the head constructor
+    // of the arrow itself.
+    const p = prune(t);
+    if (node.tag === "lambda" && p.tag === "app" && p.fn.tag === "app" && headCon(p.fn.fn) === "->") {
+      return headCon(p.fn.arg) === "RealWorld";
+    }
+    return headCon(p) === "RealWorld";
   }
 
   /** Is this binder's type *surely* a data type? See `Pattern.notFun`.
@@ -2082,11 +2094,27 @@ export function elaborateProgram(
   file = `${root}.hs`,
 ): ElaborateResult {
   nextTVar = 0;
-  const user = modules.get(root) ?? { name: root, imports: [], exports: [], reexports: [], declarations: [] };
+  const user0 = modules.get(root) ?? { name: root, imports: [], exports: [], reexports: [], declarations: [] };
+  // GHC.JS.Prim always links, as ghc-internal always does in GHC: the static
+  // runtime's ghcjs-base half builds `h$jsstringEmpty` from the `JSVal`
+  // constructor at load time, before any program code runs. Qualified under a
+  // name nothing spells, so no user name is shadowed.
+  const user: Module = user0.imports.some((i) => i.module === "GHC.JS.Prim")
+    ? user0
+    : { ...user0, imports: [...user0.imports, { module: "GHC.JS.Prim", qualified: true, alias: "GHCTS.JSPrim", span: { start: 0, end: 0, line: 1, column: 1 } }] };
+  modules = new Map(modules).set(root, user);
   // The compiler's own library modules join the program before resolution, so
   // they are ordered, renamed and scoped exactly like any other module - and a
   // project module of the same name shadows them.
-  const resolved = resolveProgram(withLibraryModules(modules), root, libraryModuleNames);
+  const suppliedModules = new Set(modules.keys());
+  const globalLibraryModules = new Set(libraryModuleNames);
+  // A project dependency may intentionally provide a module also present in
+  // the compiler's fallback library table (Miso is the important case). The
+  // supplied source wins in `withLibraryModules`, and it must also win the
+  // namespace policy: GHC emits it under the package unit, not as a global
+  // embedded library module.
+  for (const name of suppliedModules) globalLibraryModules.delete(name);
+  const resolved = resolveProgram(withLibraryModules(modules), root, globalLibraryModules);
   const elaborator = new Elaborator(file);
   const prelude = parseModule(PRELUDE_SOURCE, "GHCTS/Prelude.hs");
   if (!prelude.module || prelude.diagnostics.some((d) => d.severity === "error")) {
@@ -2105,7 +2133,7 @@ export function elaborateProgram(
       values: resolved.scopes.get(module.name)!,
       types: resolved.typeScopes.get(module.name)!,
     };
-    for (const decl of renameDeclarations(module, scopes, module.name === root, !libraryModuleNames.has(module.name), resolved.fields)) {
+    for (const decl of renameDeclarations(module, scopes, module.name === root, !globalLibraryModules.has(module.name), resolved.fields)) {
       scopeOf.set(decl, scopes);
       declarations.push(decl);
     }
@@ -3436,9 +3464,17 @@ function rewriteBinding(elaborator: Elaborator, binding: Binding): ValueDeclarat
   });
 
   const parameters: Pattern[] = binding.givens.map((g) => ({ tag: "var", name: g.name, span: binding.decl.span }));
+  const parameterReps = splitFun(binding.monoType).args.map((t) => {
+    const p = prune(t);
+    const name = p.tag === "con" ? p.name.split(".").at(-1) : undefined;
+    return ["Int", "Bool", "Double", "Float", "Word", "Char"].includes(name ?? "") ? name : name === "JSVal" || name === "JSValPrim" ? "JSVal" : name === "JSString" || name === "JSStringPrim" ? "JSString" : undefined;
+  });
+  const result = splitFun(binding.monoType).result;
   return {
     ...binding.decl,
     name: binding.name,
+    resultRep: headCon(result)?.split(".").at(-1) === "Int" ? "Int" : undefined,
+    ...(parameterReps.some((r) => r !== undefined) ? { parameterReps: parameterReps as Array<"Int" | "Bool" | "Double" | "Float" | "Word" | "Char" | "JSVal" | "JSString"> } : {}),
     equations: binding.decl.equations.map((equation) => ({
       patterns: [...parameters, ...equation.patterns.map((p) => rewritePattern(elaborator, p))],
       guards: equation.guards.map(rewriteGuard),

@@ -34,8 +34,18 @@ export function sinkPgm(pgm: StgBinding[]): [UnfloatedMap, StgBinding[]] {
   // so a binder both lists name keeps the later entry. The two agree on every
   // such binder - both hand back the same `StgConApp`/`StgLit` - so inserting
   // in the same order is enough.
+  // GHC gates only `onceSinkable` on `usedOnce`; ghcts gates both. A sunk
+  // binding is rebuilt wherever `genArg` meets it, and `genArg` only ever
+  // looks at an argument - so the binding may not be left named anywhere
+  // else. GHC needs no gate on the always-sinkable boxes because SetLevels
+  // leaves a small box where it is (`notWorthFloating`) and its one use is
+  // static data; `floatConstants` lifts them and their uses can be an entered
+  // thunk or a closure payload, which codegen resolves by name and which the
+  // removed binding then leaves undefined
+  // (`h$$mainZCMainzilvl_u_173 is not defined`).
   const sinkables: UnfloatedMap = new Map();
-  for (const b of pgm) for (const [i, e] of alwaysSinkable(b)) sinkables.set(i.unique, e);
+  for (const b of pgm)
+    for (const [i, e] of alwaysSinkable(b)) if (usedOnce.has(i.unique)) sinkables.set(i.unique, e);
   for (const b of pgm)
     for (const [i, e] of onceSinkable(b)) if (usedOnce.has(i.unique)) sinkables.set(i.unique, e);
   const isSunkBind = (b: StgBinding): boolean => b.tag === "StgNonRec" && sinkables.has(b.binder.unique);

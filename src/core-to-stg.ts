@@ -31,10 +31,34 @@ import { occInfo } from "./core-opt/simplify.js";
 import { UpdateFlag, isUnboxedTupleCon, litArg, mkBinder, varArg } from "./stg.js";
 import { isAlwaysSinkableCon } from "./stg-js/sinker.js";
 
+const isStaticFingerprintCon = (rhs: StgRhs): boolean =>
+  rhs.tag === "StgRhsCon" && /fingerprint/i.test(rhs.con.name) && rhs.args.length >= 1;
+
+const isStaticWord64Core = (e: CoreExpr): boolean => {
+  if (e.tag !== "App" || e.arg.tag !== "Lit") return false;
+  const head = e.fn;
+  return head.tag === "App" && head.arg.tag === "Lit" && head.fn.tag === "Var" &&
+    /(?:word64FromHalves|bigFromHalves)$/.test(head.fn.binder.name);
+};
+
 /** Either a `let` (a real allocation) or a `case` (evaluate now), the two
  * ways CorePrep floats a non-atomic subexpression out of an argument
  * position. Applied outside-in in the order they were produced. */
 type Float = (body: StgExpr) => StgExpr;
+
+const isStaticWord64 = (rhs: StgRhs): boolean =>
+  rhs.tag === "StgRhsClosure" && rhs.args.length === 0 && rhs.body.tag === "StgApp" &&
+  /(?:word64FromHalves|bigFromHalves)$/.test(rhs.body.fn.name) && rhs.body.args.length === 2 &&
+  rhs.body.args.every((a) => a.tag === "StgLitArg");
+
+/** Primops whose result is a lifted value taken from somewhere, not
+ * computed: it may be an unevaluated thunk, so the case binder is not WHNF. */
+const LIFTED_RESULT_PRIMOPS = new Set([
+  "ReadMutVarOp", "AtomicModifyMutVar2Op", "AtomicModifyMutVar_Op", "AtomicSwapMutVarOp", "CasMutVarOp",
+  "ReadArrayOp", "IndexArrayOp", "ReadSmallArrayOp", "IndexSmallArrayOp",
+  "TakeMVarOp", "ReadMVarOp", "TryTakeMVarOp", "TryReadMVarOp", "ReadTVarOp", "ReadTVarIOOp",
+  "DeRefWeakOp", "DeRefStablePtrOp", "CatchOp", "CatchRetryOp", "CatchSTMOp", "AtomicallyOp", "KeepAliveOp",
+]);
 
 class Converter {
   /** Bindings this pass lifted out of an argument position and up to the top
@@ -48,13 +72,62 @@ class Converter {
    * `big n = n > 10` keeps `I# 10` as a local `let` - and GHC's `big` still
    * carries the empty `var` that leaves behind. */
   private toTop = false;
+  private readonly topByUnique: Map<number, Binder>;
 
   /**
    * @param topLevel every top-level binder, which `floatToTop` adds to. These
    * are never free variables of a closure: codegen resolves them to
    * module-level symbols, not payload slots.
    */
-  constructor(private readonly topLevel: Set<Binder>) {}
+  constructor(
+    private readonly topLevel: Set<Binder>,
+    private readonly topRhs: Map<Binder, CoreExpr>,
+  ) {
+    this.topByUnique = new Map([...topLevel].map((b) => [b.unique, b]));
+  }
+
+  /** GHC's `dataConWorkId`: one Binder per DataCon, shared by every argument
+   * that names the constructor and by its top-level worker binding, so free
+   * variables, `luIdDeps` and the identifier cache all see one object.
+   *
+   * `exported` is what `liveVars` reads as `isGlobalId`, keeping the worker
+   * out of closure payloads and return frames; `internal` stays unset because
+   * it would suffix the symbol and let the Sinker sink the binding. */
+  private readonly workers = new Map<DataCon, Binder>();
+  workerFor(con: DataCon): Binder {
+    let binder = this.workers.get(con);
+    if (binder === undefined) {
+      binder = {
+        name: con.name,
+        unique: con.unique,
+        exported: true,
+        topLevel: true,
+        mightBeFun: false,
+        definingUnitId: con.definingUnitId,
+        definingModuleName: con.definingModuleName,
+      };
+      this.workers.set(con, binder);
+      this.topLevel.add(binder);
+    }
+    return binder;
+  }
+
+  /** Core rewrites may clone references while retaining their unique. Keep
+   * STG's top-level function facts (arity, strictness, representation) on the
+   * canonical defining binder. */
+  private canon(b: Binder): Binder {
+    return this.aliases.get(b) ?? this.topByUnique.get(b.unique) ?? b;
+  }
+
+  /** `let x = False in e` never reaches GHC's STG: a nullary constructor is a
+   * name, so the Simplifier substitutes it. Reaching codegen as a `let` it
+   * would be an `h$c0(...)` allocation - for `Bool` a heap object where every
+   * consumer tests a raw boolean. Keyed by the binder itself, so a shadowing
+   * binder with a reused unique is a different key. */
+  private readonly aliases = new Map<Binder, Binder>();
+  /** The constructor each worker stands for, so an aliased variable in
+   * expression position becomes `StgConApp dc []`, as `Con dc []` would. */
+  private readonly aliasCon = new Map<Binder, DataCon>();
 
   private under<A>(toTop: boolean, f: () => A): A {
     const saved = this.toTop;
@@ -76,7 +149,7 @@ class Converter {
    * is emitted as its literal instead of through a `var` that names it.
    * Widening it would need a pass that can decide what the rest should cost. */
   floatToTop(binder: Binder, rhs: StgRhs): boolean {
-    if (!this.toTop || !isAlwaysSinkableCon(rhs)) return false;
+    if (!this.toTop || (!isAlwaysSinkableCon(rhs) && !isStaticWord64(rhs) && !isStaticFingerprintCon(rhs))) return false;
     this.floated.push({ tag: "StgNonRec", binder, rhs });
     // A top-level binder is a module-level symbol, never a closure payload
     // slot, so every enclosing `mkClosure` has to stop counting it free and
@@ -91,39 +164,70 @@ class Converter {
 
   /** Peel the leading lambdas, so a right-hand side becomes a function
    * closure rather than a thunk that returns one. */
-  rhs(expr: CoreExpr, owner?: Binder): StgRhs {
+  rhs(expr: CoreExpr, owner?: Binder, recursive?: Set<Binder>): StgRhs {
+    if (owner && expr.tag === "Var" && !expr.binder.sptFingerprint) {
+      const target = this.topRhs.get(expr.binder);
+      if (target?.tag === "Lam") {
+        const params: Binder[] = [];
+        let targetBody: CoreExpr = target;
+        while (targetBody.tag === "Lam") {
+          params.push(targetBody.binder);
+          targetBody = targetBody.body;
+        }
+        if (params.length > 0) {
+          expr = params.reduce<CoreExpr>(
+            (fn, param) => ({ tag: "App", fn, arg: { tag: "Var", binder: param } }),
+            { tag: "Var", binder: expr.binder },
+          );
+          for (const param of [...params].reverse()) expr = { tag: "Lam", binder: param, body: expr };
+        }
+      }
+    }
+    // A top-level alias to a static pointer is an evaluated value, not a thunk
+    // that should enter the pointer CAF. GHC's CorePrep preserves this alias
+    // as the StaticPtr constructor; retaining the constructor here also keeps
+    // `staticKey ptr` on the direct projection path.
+    if (owner && expr.tag === "Var" && expr.binder.sptFingerprint !== undefined) {
+      const target = this.topRhs.get(expr.binder);
+      if (target?.tag === "Con" && target.con.name === "StaticPtr") expr = target;
+    }
     const args: Binder[] = [];
     let body = expr;
     while (body.tag === "Lam") {
       args.push(body.binder);
       body = body.body;
     }
+    if (owner?.parameterReps) {
+      for (let i = 0; i < args.length; i++) {
+        const rep = owner.parameterReps[i];
+        if (rep) args[i] = { ...args[i]!, primitiveRep: rep, ...(rep === "Bool" ? { unboxedInt: true as const } : {}) };
+      }
+    }
     const stgBody = this.under(this.toTop && args.length === 0, () => this.expr(body));
 
     // A constructor application with atomic arguments needs no entry code at
     // all: codegen can allocate it directly. Anything that had to be floated
     // stays a thunk, since an StgRhsCon has nowhere to put the bindings.
-    if (args.length === 0 && stgBody.tag === "StgConApp") {
+    if (stgBody.tag === "StgConApp" && (args.length === 0 || stgBody.con.name === "StaticPtr")) {
+      const directBody = stgBody;
       // An unboxed tuple has no heap representation, so there is nothing to
       // bind here; reaching this means a caller put one in a lazy position
       // (an argument or a constructor field), which is exactly what GHC's
       // levity rules forbid. Failing loudly beats allocating a closure the
       // backend will never be able to enter.
-      if (isUnboxedTupleCon(stgBody.con)) throw new Error("coreToStg: unboxed tuple in a lazy position");
+      if (isUnboxedTupleCon(directBody.con)) throw new Error("coreToStg: unboxed tuple in a lazy position");
       // A constructor binding is a value, not a thunk, so every use of it is
       // already in WHNF. This is the easy half of GHC's InferTags, and
       // without it `genApp` sends each use through `h$ap_0_0_fast` to enter a
       // closure that was never going to do any work.
       if (owner) owner.evaluated = true;
-      return { tag: "StgRhsCon", con: stgBody.con, args: stgBody.args };
+      return { tag: "StgRhsCon", con: directBody.con, args: directBody.args };
     }
     if (owner && args.length > 0) {
       owner.funRepArity = args.length;
-      // A function closure is not a thunk: GHC's `isStrictId` is true of
-      // top-level Funs because they are already evaluated as functions.
-      // Without this bit, genApp never takes the saturated/oversaturated
-      // jump and every call pays `h$ap_N_M_fast`.
-      owner.strict = true;
+      // Function-ness supplies the entry arity, but not demand strictness.
+      // GHCJS's `isStrictId` is a demand fact; ordinary user functions still
+      // go through generic apply until strictness analysis proves otherwise.
       // A deliberately narrow seed set for native-region lowering: closed,
       // monomorphic primitive workers.  Later passes may reject this; no
       // caller may treat the bit as permission to skip the ABI wrapper.
@@ -131,7 +235,10 @@ class Converter {
         stgBody.tag === "StgOpApp" &&
         stgBody.op.tag === "StgPrimOp" &&
         args.every((a) => (a.arity ?? 1) === 1) &&
-        freeVarsOf(stgBody).size === 0;
+        // The lambda parameters are free in the lowered body by design. Only
+        // external captures disqualify this primitive worker from the native
+        // entry path.
+        [...freeVarsOf(stgBody)].every((v) => args.some((a) => a.unique === v.unique));
       if (owner.nativeEligible && stgBody.tag === "StgOpApp") {
         const op = stgBody.op.tag === "StgPrimOp" ? stgBody.op.op : "";
         owner.nativeResultRep =
@@ -151,7 +258,7 @@ class Converter {
         }
       }
     }
-    return this.mkClosure(args, stgBody, owner);
+    return this.mkClosure(args, stgBody, owner, recursive);
   }
 
   /** The update-flag decision, in one place.
@@ -170,15 +277,24 @@ class Converter {
    * the occurrence analysis behind GHC's update flags, and each thunk it
    * applies to saves an update frame push and a black-hole write. Guessing it
    * anywhere else fails silently rather than loudly. */
-  mkClosure(args: Binder[], body: StgExpr, owner?: Binder): StgRhs {
+  mkClosure(args: Binder[], body: StgExpr, owner?: Binder, recursive?: Set<Binder>): StgRhs {
     const update =
       args.length > 0
         ? UpdateFlag.ReEntrant
         : owner?.singleEntry === true
           ? UpdateFlag.SingleEntry
           : UpdateFlag.Updatable;
-    const bound = new Set(args);
-    const freeVars = [...freeVarsOf(body)].filter((v) => !bound.has(v) && !this.topLevel.has(v));
+    const bound = new Set(args.map((a) => a.unique));
+    const freeVars = [...freeVarsOf(body)].filter(
+      (v) => !bound.has(v.unique) && ![...(recursive ?? [])].some((r) => r.unique === v.unique) && ![...this.topLevel].some((t) => t.unique === v.unique),
+    );
+    if (process.env.GHCTS_TRACE_STG && owner) {
+      const wanted = process.env.GHCTS_TRACE_STG;
+      const text = [owner.name, ...args.map((a) => a.name), ...freeVars.map((v) => v.name)].join(" ");
+      if (wanted === "*" || text.includes(wanted)) {
+        console.error(`[ghcts stg] ${owner.name}#${owner.unique} args=[${args.map((a) => `${a.name}#${a.unique}/${a.arity ?? 1}`).join(",")}] free=[${freeVars.map((v) => `${v.name}#${v.unique}/${v.arity ?? 1}`).join(",")}] update=${update} native=${owner.nativeEligible ?? false}`);
+      }
+    }
     return { tag: "StgRhsClosure", freeVars, update, args, body };
   }
 
@@ -190,8 +306,11 @@ class Converter {
     const floats: Float[] = out ?? [];
     const done = (body: StgExpr): StgExpr => (out === undefined ? wrap(floats, body) : body);
     switch (e.tag) {
-      case "Var":
-        return { tag: "StgApp", fn: e.binder, args: [] };
+      case "Var": {
+        const alias = this.aliases.get(e.binder);
+        if (alias) return { tag: "StgConApp", con: this.aliasCon.get(alias)!, args: [] };
+        return { tag: "StgApp", fn: this.canon(e.binder), args: [] };
+      }
       case "Lit":
         return { tag: "StgLit", lit: e.lit };
       case "Con": {
@@ -223,8 +342,32 @@ class Converter {
         // not the right-hand side, so it is decided here and left on the
         // binder for `mkClosure` to read.
         if (e.bind.tag === "NonRec") {
+          // GHC marks a thunk single-entry from its cardinality analysis, never
+          // from one syntactic occurrence: a thunk passed once to a function is
+          // entered as often as the callee likes. Here that occurrence has to
+          // be the body's own `case` on it. Handed to `pack`, a once-used
+          // thunk was entered by `forceString` and left un-updated, so GHC's
+          // `h$jsstringPack` met a thunk instead of a cons and packed "" -
+          // every JSON field name in misogram's swiper came out empty.
+          if (e.bind.rhs.tag === "Con" && e.bind.rhs.args.length === 0 && !isUnboxedTupleCon(e.bind.rhs.con)) {
+            // Scoped to the body: the Simplifier's case-of-case hands sibling
+            // alternatives the same `let` binder object with different
+            // right-hand sides (`sat = []` in one, `sat = 0 : ds` in the
+            // other), and an alias left behind rewrote the second to `[]` -
+            // `magMul [2] [0,1]` came out as `[0]`.
+            const worker = this.workerFor(e.bind.rhs.con);
+            const previous = this.aliases.get(e.bind.binder);
+            this.aliases.set(e.bind.binder, worker);
+            this.aliasCon.set(worker, e.bind.rhs.con);
+            try {
+              return this.expr(e.body, out);
+            } finally {
+              if (previous) this.aliases.set(e.bind.binder, previous);
+              else this.aliases.delete(e.bind.binder);
+            }
+          }
           const occ = occInfo(e.body, e.bind.binder.unique);
-          if (occ.count === 1 && !occ.inLam) e.bind.binder.singleEntry = true;
+          if (occ.count === 1 && !occ.inLam && scrutinisedOnce(e.body, e.bind.binder.unique)) e.bind.binder.singleEntry = true;
         }
         return { tag: "StgLet", binding: this.bind(e.bind), body: this.expr(e.body) };
       }
@@ -235,6 +378,28 @@ class Converter {
         // return frame was already pushed.
         const scrutinee = this.expr(e.scrutinee, floats);
         const alts = e.alts.map((alt) => this.alt(alt));
+        const altType = altTypeOf(e.alts, e.scrutinee);
+        // CorePrep's case-of-case keeps both matches as a strict case tree.
+        // `expr` can expose the inner case here when a projection (such as
+        // staticKey) was inlined into the outer scrutinee. STG cannot use a
+        // case as an argument, so distribute the outer alternatives into the
+        // inner alternatives instead of letting `atom` turn the projection
+        // into a lazy let.
+        if (scrutinee.tag === "StgCase") {
+          return done({
+            ...scrutinee,
+            alts: scrutinee.alts.map((alt) => ({
+              ...alt,
+              body: {
+                tag: "StgCase" as const,
+                scrutinee: alt.body,
+                binder: e.binder,
+                altType,
+                alts,
+              },
+            })),
+          });
+        }
         // `case v of b { ... }`: inside the alternatives `b` and `v` denote the
         // same value, but `b` denotes it already evaluated - it is what the
         // return frame leaves in R1 - while `v` is still the original,
@@ -266,13 +431,18 @@ class Converter {
         // where every instance method written `(+) (I a) (I b) = ...` forces
         // both of its arguments through exactly such a `case`, twice per
         // arithmetic operation.
-        const altType = altTypeOf(e.alts, e.scrutinee);
         // The case binder names WHNF only when it is not the scrutinee
         // itself. Desugar reuses a `Var` scrutinee as the binder (`case p of
         // p { DEFAULT -> ... }`) so the Case still enters; marking that
         // binder evaluated makes `isInlineApp` skip the enter and unpack a
         // thunk.
-        if (scrutVar === undefined || scrutVar.unique !== e.binder.unique)
+        // ... unless the scrutinee is a primop that hands back a lifted value
+        // it never entered: `readMutVar#` returns whatever was stored, thunk
+        // included, and treating that binder as WHNF made `atomicModifyIORef'`
+        // multiply an unevaluated closure (`Math.imul(closure, 2)` is 0).
+        const liftedResult =
+          scrutinee.tag === "StgOpApp" && scrutinee.op.tag === "StgPrimOp" && LIFTED_RESULT_PRIMOPS.has(scrutinee.op.op);
+        if (!liftedResult && (scrutVar === undefined || scrutVar.unique !== e.binder.unique))
           e.binder.evaluated = true;
         if (
           scrutVar !== undefined &&
@@ -292,7 +462,7 @@ class Converter {
         const [head, args] = flatten(e);
         const atoms = args.map((arg) => this.atom(arg, floats, false));
         if (head.tag === "Var") {
-          return done({ tag: "StgApp", fn: head.binder, args: atoms });
+          return done({ tag: "StgApp", fn: this.canon(head.binder), args: atoms });
         }
         // The head is itself a computation; name it, then apply the name. Its
         // float has to come before the arguments', since the arguments may
@@ -307,14 +477,21 @@ class Converter {
   }
 
   alt(alt: CoreAlt): StgAlt {
-    return { con: alt.con, binders: alt.binders, body: this.under(false, () => this.expr(alt.body)) };
+    const dataCon = alt.con.tag === "DataAlt" ? alt.con.con : undefined;
+    const binders = dataCon
+      ? alt.binders.map((b, i) => dataCon.fieldUnboxed?.[i] === true ? { ...b, unboxedInt: true as const } : b)
+      : alt.binders;
+    return { con: alt.con, binders, body: this.under(false, () => this.expr(alt.body)) };
   }
 
   bind(bind: CoreBind, toTop = false): StgBinding {
     return this.under(toTop, () =>
       bind.tag === "NonRec"
         ? { tag: "StgNonRec", binder: bind.binder, rhs: this.rhs(bind.rhs, bind.binder) }
-        : { tag: "StgRec", pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs, b)] as [Binder, StgRhs]) },
+        : {
+            tag: "StgRec",
+            pairs: bind.pairs.map(([b, rhs]) => [b, this.rhs(rhs, b, new Set(bind.pairs.map(([binder]) => binder)))] as [Binder, StgRhs]),
+          },
     );
   }
 
@@ -348,7 +525,13 @@ class Converter {
    * not provably wasted, and a missing update frame fails silently. */
   atom(e: CoreExpr, floats: Float[], strict: boolean): StgArg {
     if (e.tag === "Lit") return litArg(e.lit);
-    if (e.tag === "Var") return varArg(e.binder);
+    if (e.tag === "Var") return varArg(this.aliases.get(e.binder) ?? e.binder);
+    // A nullary constructor is `Var (dataConWorkId dc)` in GHC's Core: trivial,
+    // so CorePrep's `cpeArg` leaves it as an argument even in a strict
+    // position, and `genArg` renders it `true_`/`false_` or the worker's
+    // static closure. Let-binding it instead would allocate `h$c0(...)`, which
+    // for `Bool` is a truthy object where GHC has `false`.
+    if (e.tag === "Con" && e.args.length === 0 && !isUnboxedTupleCon(e.con)) return varArg(this.workerFor(e.con));
     const binder = mkBinder("t");
     // A lambda is already a value, so a strict position needs no `case` around
     // it - only the allocation. That matters for `catch#`, whose action and
@@ -366,16 +549,36 @@ class Converter {
     // for a one-literal constructor - which allocates no binder of its own, so
     // the unique supply sees the same sequence it always did.
     const literalCon = e.tag === "Con" && e.args.length === 1 && e.args[0]!.tag === "Lit";
-    if (!evaluate && literalCon && this.floatToTop(binder, this.rhs(e))) return varArg(binder);
+    const staticFingerprint = e.tag === "Con" && /fingerprint/i.test(e.con.name) && e.args.length >= 1;
+    const staticWord64 = isStaticWord64Core(e);
+    if (!evaluate && (literalCon || staticFingerprint || staticWord64) && this.floatToTop(binder, this.rhs(e))) return varArg(binder);
     floats.push(
       evaluate
-        ? (body) => ({
-            tag: "StgCase",
-            scrutinee: value!,
-            binder,
-            altType: altTypeOfExpr(e),
-            alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
-          })
+        ? (body) => {
+            const altType = altTypeOfExpr(e);
+            if (value!.tag === "StgCase") {
+              return {
+                ...value!,
+                alts: value!.alts.map((alt) => ({
+                  ...alt,
+                  body: {
+                    tag: "StgCase" as const,
+                    scrutinee: alt.body,
+                    binder,
+                    altType,
+                    alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
+                  },
+                })),
+              };
+            }
+            return {
+              tag: "StgCase" as const,
+              scrutinee: value!,
+              binder,
+              altType,
+              alts: [{ con: { tag: "DEFAULT" }, binders: [], body }],
+            };
+          }
         : (body) => ({
             tag: "StgLet",
             // `rhs` rather than `mkClosure`: a constructor application with
@@ -523,11 +726,35 @@ function freeVarsOf(expr: StgExpr): Set<Binder> {
 
 /** The top-level binding GHC emits for a data constructor's worker; codegen
  * turns it into the `..._con_e` entry function allocated closures point at. */
-const conWorker = (con: DataCon): StgBinding => ({
+const conWorker = (binder: Binder, con: DataCon): StgBinding => ({
   tag: "StgNonRec",
-  binder: { name: con.name, unique: con.unique, exported: true },
+  binder,
   rhs: { tag: "StgRhsCon", con, args: [] },
 });
+
+/** Whether the binder's only occurrence is as the scrutinee of a `case` -
+ * the one shape where the body itself proves it is entered exactly once. */
+function scrutinisedOnce(e: CoreExpr, u: number): boolean {
+  let scrutinee = 0;
+  let other = 0;
+  const go = (x: CoreExpr): void => {
+    switch (x.tag) {
+      case "Var": if (x.binder.unique === u) other++; return;
+      case "Lit": return;
+      case "App": go(x.fn); go(x.arg); return;
+      case "Lam": go(x.body); return;
+      case "Let":
+        if (x.bind.tag === "NonRec") go(x.bind.rhs); else for (const [, r] of x.bind.pairs) go(r);
+        go(x.body); return;
+      case "Case":
+        if (x.scrutinee.tag === "Var" && x.scrutinee.binder.unique === u) scrutinee++; else go(x.scrutinee);
+        for (const a of x.alts) go(a.body); return;
+      case "Con": case "Op": for (const a of x.args) go(a); return;
+    }
+  };
+  go(e);
+  return scrutinee === 1 && other === 0;
+}
 
 export function coreToStg(program: CoreProgram): StgModule {
   const topLevel = new Set<Binder>();
@@ -535,13 +762,31 @@ export function coreToStg(program: CoreProgram): StgModule {
     if (bind.tag === "NonRec") topLevel.add(bind.binder);
     else for (const [b] of bind.pairs) topLevel.add(b);
   }
-  const converter = new Converter(topLevel);
+  const topRhs = new Map<Binder, CoreExpr>();
+  for (const bind of program.binds) {
+    if (bind.tag === "NonRec") topRhs.set(bind.binder, bind.rhs);
+    else for (const [b, rhs] of bind.pairs) topRhs.set(b, rhs);
+  }
+  // GHC's Id arity is available to every call site before any binding is
+  // lowered. Pre-seed it here; discovering it only while converting a later
+  // definition makes earlier calls fall through to generic apply.
+  for (const [binder, rhs] of topRhs) {
+    binder.topLevel = true;
+    let body = rhs;
+    let arity = 0;
+    while (body.tag === "Lam") { arity++; body = body.body; }
+    if (arity > 0) binder.funRepArity = arity;
+  }
+  const converter = new Converter(topLevel, topRhs);
+  // Every worker exists before any body is converted, so `mkClosure` already
+  // counts it top-level when it meets a reference.
+  const workers = program.dataCons.map((con) => conWorker(converter.workerFor(con), con));
   const bindings = program.binds.map((bind) => converter.bind(bind, true));
   return {
     name: program.name,
     // The floats go last, as CorePrep's do: nothing already emitted can refer
     // to a binder that did not exist when it was converted, and the Sinker's
     // `topSortDecls` is what puts any that survive ahead of their users.
-    bindings: [...program.dataCons.map(conWorker), ...bindings, ...converter.floated],
+    bindings: [...workers, ...bindings, ...converter.floated],
   };
 }

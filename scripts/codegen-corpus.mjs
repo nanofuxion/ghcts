@@ -25,14 +25,15 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveGhcJs } from "./ghc-path.mjs";
 
-const GHC_JS =
-  "/nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc";
+const GHC_JS = resolveGhcJs();
 
 /** Each entry is a `module Main where` with no `main` - see the header. */
 const CORPUS = [
   { name: "arith", source: "add :: Int -> Int -> Int\nadd a b = a + b\n" },
   { name: "arith3", source: "mix :: Int -> Int -> Int\nmix a b = a * b + a\n" },
+  { name: "intdiv", source: "half :: Int -> Int\nhalf n = n `div` 2\n" },
   { name: "const", source: "konst :: Int -> Int -> Int\nkonst a _ = a\n" },
   { name: "saturated", source: "add :: Int -> Int -> Int\nadd a b = a + b\nuse :: Int -> Int\nuse x = add x x\n" },
   { name: "partial", source: "add :: Int -> Int -> Int\nadd a b = a + b\nplus1 :: Int -> Int\nplus1 = add 1\n" },
@@ -53,7 +54,7 @@ const args = process.argv.slice(2);
 const verbose = args.includes("-v");
 const only = args.find((a) => !a.startsWith("-"));
 
-if (!existsSync(GHC_JS)) {
+if (!GHC_JS) {
   console.error(`No GHC JS compiler at ${GHC_JS}.\nIt comes from references/miso-lynx's flake: nix build .#miso-lynx-examples`);
   process.exit(2);
 }
@@ -62,6 +63,7 @@ const D = new URL("../dist/", import.meta.url).pathname;
 const { parseModule } = await import(`${D}parser.js`);
 const { elaborateModule } = await import(`${D}elaborate.js`);
 const { desugarModule } = await import(`${D}desugar.js`);
+const { optimiseCore } = await import(`${D}build.js`);
 const { coreToStg } = await import(`${D}core-to-stg.js`);
 const { stgToJS, renderModule } = await import(`${D}stg-js/codegen.js`);
 const { defaultStgToJSConfig: config } = await import(`${D}stg-js/types.js`);
@@ -93,7 +95,7 @@ function ghcCompile(source) {
   const work = mkdtempSync(join(tmpdir(), "corpus-"));
   const main = `main :: IO ()\nmain = ${roots.map((r) => `${r} \`seq\` `).join("")}return ()\n`;
   writeFileSync(join(work, "Main.hs"), `module Main where\n${source}${main}`);
-  execFileSync(GHC_JS, ["Main.hs", "-o", "out"], { cwd: work, stdio: "pipe" });
+  execFileSync(GHC_JS, ["-O2", "Main.hs", "-o", "out"], { cwd: work, stdio: "pipe" });
   return readFileSync(join(work, "out.jsexe", "out.js"), "utf8");
 }
 
@@ -106,7 +108,9 @@ function ghctsCompile(source) {
     (d) => d.severity === "error",
   );
   if (errors.length) throw new Error(errors.map((d) => `${d.code} ${d.message}`).join("\n"));
-  const stg = coreToStg(desugared.program);
+  // GHC is invoked with -O2 above; compare against ghcts' production Core
+  // pipeline rather than raw desugared Core.
+  const stg = coreToStg(optimiseCore(desugared.program));
   return renderModule(config, stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings));
 }
 

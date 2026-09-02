@@ -23,6 +23,13 @@ export interface ParsedModule {
   source: string;
   file: string;
 }
+
+function declaredExtensions(source: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of source.matchAll(/\{-#\s*LANGUAGE\s+([\s\S]*?)#-\}/g))
+    for (const name of m[1]!.split(/[,(\s]+/).map((x) => x.trim()).filter(Boolean)) out.add(name);
+  return out;
+}
 // Declarations supplied by imported modules carry the real fixities later in
 // the pipeline.  The parser still needs a total, deterministic fallback so a
 // symbolic application never leaks out and is misread as another declaration.
@@ -101,10 +108,23 @@ export function parseModule(
     ast = parser.module();
   }
   expandTemplateHaskell(ast);
+  const inlineNames = [...source.matchAll(/\{-#\s*INLINE\s+([^\s#}]+)\s*#-\}/g)].map((m) => m[1]!);
+  if (inlineNames.length) {
+    for (const declaration of ast.declarations) {
+      if (declaration.tag !== "instance") continue;
+      const methodNames = new Set(declaration.rawMembers.flatMap((member) => member.tokens));
+      const names = inlineNames.filter((name) => methodNames.has(name));
+      if (names.length) declaration.inlineNames = names;
+    }
+  }
+  const extensions = declaredExtensions(source);
+  const usesStaticPointer = tokens.some((token) => token.kind === "ident" && token.text === "static");
+  if (usesStaticPointer && !extensions.has("StaticPointers"))
+    result.diagnostics.push(error("E_EXTENSION", "Static pointer syntax requires the StaticPointers extension", file));
   return {
     module: result.diagnostics.some((d) => d.severity === "error")
       ? undefined
-      : { ast, source, file },
+      : { ast: inlineNames.length ? { ...ast, inlineNames } : ast, source, file },
     diagnostics: result.diagnostics,
   };
 }

@@ -74,6 +74,9 @@ const rtsJsFiles = [
  * last is one file (jsbits/genSym.js) that only links into programs depending
  * on the ghc library itself. base and ghc-prim contribute nothing. */
 const jsSourcePackages: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+  // ghcjs-base's jsstring.js comes first in GHC's link of a miso program; see
+  // the file's header for what it is and why it lives here.
+  ["src/stg-js/ghcjs-base", ["jsbits.js"]],
   ["references/ghc/libraries/ghc-internal/jsbits", ghcInternalJsFiles],
   ["references/ghc/rts/js", rtsJsFiles],
 ];

@@ -130,6 +130,7 @@ export class GenState {
    * the module is used) */
   gsGlobal: JStgStat[] = [];
 
+
   constructor(
     /** codegen settings, read-only */
     readonly gsSettings: StgToJSConfig,

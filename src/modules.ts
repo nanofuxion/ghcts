@@ -362,7 +362,7 @@ export function renameDeclarations(
   const ty = (text: string): string => renameTypeText(text, scopes.types);
   const assoc = (a: AssociatedType): AssociatedType => (a.rhs === undefined ? a : { ...a, rhs: ty(a.rhs) });
   return module.declarations.map((decl) => {
-    if (decl.tag === "value") return renameValue(decl, scopes, flatOf(decl.name), fields);
+    if (decl.tag === "value") return renameValue({ ...decl, inline: decl.inline || module.inlineNames?.includes(decl.name) }, scopes, flatOf(decl.name), fields);
     if (decl.tag === "foreign")
       return { ...decl, name: flatOf(decl.name), signature: decl.signature.map(ty) };
     if (decl.tag === "signature") return { ...decl, name: flatOf(decl.name), type: ty(decl.type) };

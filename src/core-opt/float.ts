@@ -7,11 +7,13 @@
  * returning `Main.orZero1` where ghcts builds the box again - so the branch
  * returns a pointer to something the program allocated once, at load.
  *
- * This is the constant half of GHC's `FloatOut`/full laziness. Only fully
- * literal constructor applications move, including nullary ones, so what is
- * shared is decided by looking at the term and nothing else: `Nothing`, `[]`,
- * `True`, `I# 0#`, `C# 'x'#`. Anything with a variable in it stays where it
- * is, where its scope keeps it honest.
+ * This is the constant half of GHC's `FloatOut`/full laziness. A fully literal
+ * constructor application with at least one field moves - `I# 0#`, `C# 'x'#`,
+ * `Just 1` - and what is shared is decided by looking at the term and nothing
+ * else. A nullary constructor (`Nothing`, `[]`, `True`) stays put, because it
+ * is already a name and GHC's `notWorthFloating` never lifts a variable.
+ * Anything with a variable in it stays where it is, where its scope keeps it
+ * honest.
  *
  * Identical constants share one binding, so a module that mentions `0` in
  * forty branches allocates one box rather than forty.
@@ -23,21 +25,30 @@ import { mkBinder, type Binder, type Literal } from "../stg.js";
 const litKey = (l: Literal): string =>
   l.tag === "LitLabel" ? `${l.tag}:${l.name}` : `${l.tag}:${String((l as { value?: unknown }).value ?? "")}`;
 
-/** A one-field box of an `Int`/`Char`/`Double`/… is not an allocation on this
- * backend - the value is the number itself - and `GHC.StgToJS.Sinker` unfloats
- * exactly these again, so lifting one out buys nothing and leaves a top-level
- * name for the sinker to remove out from under its own references. */
+/** GHC's FloatOut lifts constant boxes too. JavaScript codegen may later
+ * represent a one-field numeric box as a raw value, but that is a backend
+ * concern; the Core/STG shape still contains the shared constructor. */
 const UNBOXED_REP = new Set([
   "Int", "Int8", "Int16", "Int32", "Word", "Word8", "Word16", "Word32",
   "Char", "Float", "Double",
 ]);
 
 const constKey = (e: Extract<CoreExpr, { tag: "Con" }>): string | undefined => {
-  if (e.args.length === 1 && UNBOXED_REP.has(e.con.typeName)) return undefined;
+  // GHC's `notWorthFloating`: a nullary constructor is a bare `Var` in GHC's
+  // Core (its worker), and SetLevels never floats a variable.
+  // `core-to-stg`'s `atom` spells it that way now, so floating it here would
+  // put a `lvl` where GHC has `false` or `h$...ZMZN`.
+  if (e.args.length === 0) return undefined;
   const parts: string[] = [];
   for (const a of e.args) {
-    if (a.tag !== "Lit") return undefined;
-    parts.push(litKey(a.lit));
+    // A field already floated to a shared constant (`lvl`, `staticValue`) is
+    // as constant as a literal: a string literal is a cons chain whose
+    // characters float first, one box each, and without this the chain
+    // itself stayed behind, rebuilt on every call - misogram allocated the
+    // list "type" and packed it 1,371 times per render.
+    if (a.tag === "Var" && a.binder.staticValue === true) parts.push(`v${a.binder.unique}`);
+    else if (a.tag === "Lit") parts.push(litKey(a.lit));
+    else return undefined;
   }
   return `${e.con.typeName}|${e.con.name}|${parts.join(",")}`;
 };
@@ -65,18 +76,29 @@ function shapeKey(e: CoreExpr): string | undefined {
   }
 }
 
-/** A literal, or a constructor built only out of those. */
-const constArg = (e: CoreExpr): boolean =>
-  e.tag === "Lit" || (e.tag === "Con" && e.args.every(constArg));
+/** A literal, a constructor built only out of those, a constant this pass
+ * already floated, or a class dictionary: `fromString $fIsStringMisoString
+ * "type"` is what every `MisoString` literal is before dictionaries are
+ * resolved, and this pass runs first, so without the dictionary case misogram
+ * rebuilt and packed the key "type" 1,371 times on every render. */
+const constArg = (e: CoreExpr, dictionaries: boolean): boolean =>
+  e.tag === "Lit" ||
+  (e.tag === "Var" && (e.binder.staticValue === true || (dictionaries && e.binder.name.startsWith("$f")))) ||
+  (e.tag === "Con" && e.args.every((a) => constArg(a, dictionaries)));
 
-/** `f "a" ['b']`: a known function applied to nothing but constants. */
+/** `f "a" ['b']`: a known function applied to nothing but constants. A
+ * dictionary argument is admitted only under `fromString`: a string literal
+ * is pure whatever its target type, while another method on a literal -
+ * `toJSVal` - may mint a JavaScript handle that its caller frees, and sharing
+ * that between two call sites is the `classes is not iterable` failure
+ * described above (misogram then never left its splash screen). */
 const constApp = (e: CoreExpr): boolean => {
   let head = e;
-  while (head.tag === "App") {
-    if (!constArg(head.arg)) return false;
-    head = head.fn;
-  }
-  return head.tag === "Var";
+  while (head.tag === "App") head = head.fn;
+  if (head.tag !== "Var") return false;
+  const dictionaries = head.binder.name === "fromString";
+  for (let x = e; x.tag === "App"; x = x.fn) if (!constArg(x.arg, dictionaries)) return false;
+  return true;
 };
 
 const nodes = (e: CoreExpr): number => {
@@ -89,6 +111,8 @@ const nodes = (e: CoreExpr): number => {
     case "Con":
     case "Op":
       return 1 + e.args.reduce((n, a) => n + nodes(a), 0);
+    case "Lam":
+      return 1 + nodes(e.body);
     default:
       return 1000;
   }
@@ -106,8 +130,12 @@ export function floatConstants(program: CoreProgram): CoreProgram {
   for (const b of program.binds)
     if (b.tag === "NonRec") tops.add(b.binder.unique);
     else for (const [x] of b.pairs) tops.add(x.unique);
+  // Bindings this pass itself creates count as top-level from then on: a
+  // string literal's characters float first, one box each, and the chain
+  // referring to them must still be `closed`, or `pack "type"` under a
+  // lambda never lifts and is rebuilt on every call.
   const closed = (e: CoreExpr): boolean =>
-    [...coreFreeVars(e)].every((v) => tops.has(v.unique));
+    [...coreFreeVars(e)].every((v) => v && tops.has(v.unique));
 
   /** Full laziness, narrowed to calls on constants. `pack "Miso.patches"`
    * inside a function is recomputed on every call - the counter app packs 311
@@ -130,10 +158,46 @@ export function floatConstants(program: CoreProgram): CoreProgram {
     if (key === undefined) return undefined;
     let binder = shared.get(key);
     if (!binder) {
-      binder = mkBinder("lvl", { internal: true });
+      binder = mkBinder("lvl", { internal: true, staticValue: true });
       shared.set(key, binder);
+      tops.add(binder.unique);
       floated.push({ tag: "NonRec", binder, rhs: e });
     }
+    return { tag: "Var", binder };
+  };
+
+  // GHC's FloatOut also gives a closed callback passed to a higher-order
+  // function its own top-level binding. Without this, Core-to-STG must make
+  // the lambda atomic with a local `let`, so `map (\x -> ...) xs` starts as a
+  // `let` in ghcts while GHC starts with the `map` call itself. A lambda that
+  // mentions an enclosing value is deliberately not lifted: turning it into
+  // a top-level function would require a new closure/application convention.
+  const liftLambda = (e: CoreExpr): CoreExpr | undefined => {
+    const lambdaNodes = (x: CoreExpr): number => {
+      switch (x.tag) {
+        case "Var":
+        case "Lit":
+          return 1;
+        case "App":
+          return 1 + lambdaNodes(x.fn) + lambdaNodes(x.arg);
+        case "Lam":
+          return 1 + lambdaNodes(x.body);
+        case "Con":
+        case "Op":
+          return 1 + x.args.reduce((n, a) => n + lambdaNodes(a), 0);
+        case "Let":
+          return 1 +
+            (x.bind.tag === "NonRec"
+              ? lambdaNodes(x.bind.rhs)
+              : x.bind.pairs.reduce((n, [, rhs]) => n + lambdaNodes(rhs), 0)) +
+            lambdaNodes(x.body);
+        case "Case":
+          return 1 + lambdaNodes(x.scrutinee) + x.alts.reduce((n, a) => n + lambdaNodes(a.body), 0);
+      }
+    };
+    if (e.tag !== "Lam" || lambdaNodes(e) > MAX_FLOAT || !closed(e)) return undefined;
+    const binder = mkBinder("lvl", { internal: true, staticValue: true });
+    floated.push({ tag: "NonRec", binder, rhs: e });
     return { tag: "Var", binder };
   };
 
@@ -147,7 +211,8 @@ export function floatConstants(program: CoreProgram): CoreProgram {
           const lifted = lift(e);
           if (lifted) return lifted;
         }
-        return { tag: "App", fn: go(e.fn, underLam), arg: go(e.arg, underLam) };
+        const arg = e.arg.tag === "Lam" && underLam ? liftLambda(e.arg) : undefined;
+        return { tag: "App", fn: go(e.fn, underLam), arg: arg ?? go(e.arg, underLam) };
       }
       case "Lam":
         return { tag: "Lam", binder: e.binder, body: go(e.body, true) };
@@ -174,8 +239,9 @@ export function floatConstants(program: CoreProgram): CoreProgram {
         if (!binder) {
           // GHC names these `lvl`; keeping the name makes the two dumps line
           // up when they are read side by side.
-          binder = mkBinder("lvl", { internal: true });
+          binder = mkBinder("lvl", { internal: true, staticValue: true });
           shared.set(key, binder);
+      tops.add(binder.unique);
           floated.push({ tag: "NonRec", binder, rhs: e });
         }
         return { tag: "Var", binder };

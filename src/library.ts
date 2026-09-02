@@ -1001,20 +1001,22 @@ unpackStep s i n cp =
 -- The \`case\` is not decoration: a JS string is a machine value, and a
 -- *function call* in a constructor field is let-bound as a thunk. Scrutinising
 -- it first is what puts the string, and not a thunk, in the field.
+-- As ghcjs-base has it: \`pack = js_pack . rnf\`. Every cons cell and every
+-- character is forced here, in Haskell, and then GHC's own \`h$jsstringPack\`
+-- (lib.js) walks the evaluated cells in one JavaScript loop. A walker can
+-- only tell a forced \`C#\` box from a thunk once the list has been forced,
+-- which is what \`forceString\` is for; that walk reads \`GHC.Types.(:)\`'s
+-- entry symbol, so the list constructors carry their ghc-prim identity.
 pack :: [Char] -> JSString
-pack cs = case packOnto cs (jsStringEmpty 0) of
-  s -> JSString s
+pack cs = case forceString cs of
+  () -> JSString (jsStringPack cs)
 
--- Forces one cons cell at a time. A JS-side walker reading \`.d1\`/\`.d2\` off
--- the cells would be faster, but it cannot tell a forced \`C#\` box from an
--- unevaluated thunk - both carry a \`.d1\`, and a thunk's is whatever its first
--- free variable happens to be. Reading that as a code point silently builds
--- the wrong string, or throws \`RangeError: invalid code point\`. Only the RTS
--- can force safely, so this stays in Haskell.
-packOnto :: [Char] -> JSStringPrim -> JSStringPrim
-packOnto cs acc = case cs of
-  [] -> acc
-  (C c : rest) -> packOnto rest (jsStringSnoc acc c)
+forceString :: [Char] -> ()
+forceString cs = case cs of
+  [] -> ()
+  (C _ : rest) -> forceString rest
+
+foreign import javascript unsafe "((xs) => h$jsstringPack(xs))" jsStringPack :: [Char] -> JSStringPrim
 
 uncons :: JSString -> Maybe (Char, JSString)
 uncons (JSString s) =
@@ -3090,7 +3092,10 @@ export const libraryModuleNames: ReadonlySet<string> = new Set(Object.keys(sourc
 
 export function withLibraryModules(modules: ReadonlyMap<string, Module>): ReadonlyMap<string, Module> {
   const out = new Map(modules);
-  const queue = [...modules.values()].flatMap((m) => m.imports.map((i) => i.module));
+  // GHC.JS.Prim always links, as ghc-internal always does in GHC: the static
+  // runtime's ghcjs-base half builds `h$jsstringEmpty` from the `JSVal`
+  // constructor at load time, before any program code runs.
+  const queue = ["GHC.JS.Prim", ...[...modules.values()].flatMap((m) => m.imports.map((i) => i.module))];
   while (queue.length) {
     const name = queue.pop()!;
     if (out.has(name)) continue;

@@ -35,6 +35,7 @@
  * the rewrite; removing it needs demand analysis and worker/wrapper.
  */
 import type { CoreAlt, CoreBind, CoreExpr, CoreProgram } from "../core.js";
+import { coreFreeVars, mkLams } from "../core.js";
 import { mkBinder, type Binder } from "../stg.js";
 
 /** Bodies above this many nodes are left alone. A class method at a known
@@ -46,9 +47,11 @@ const MAX_METHOD = 120;
 
 /** A callee we are willing to inline: `params.length` leading lambdas with
  * `body` underneath. */
-interface Candidate {
+export interface Candidate {
   params: Binder[];
   body: CoreExpr;
+  /** Explicit source INLINE pragma; permits GHC's larger method budget. */
+  inline?: boolean;
 }
 
 const size = (e: CoreExpr): number => {
@@ -103,20 +106,47 @@ function refs(e: CoreExpr, out: Set<number>): void {
   }
 }
 
-const isTrivial = (e: CoreExpr): boolean => e.tag === "Var" || e.tag === "Lit";
+function refBinders(e: CoreExpr, out: Set<Binder>): void {
+  switch (e.tag) {
+    case "Var": out.add(e.binder); return;
+    case "Lit": return;
+    case "App": refBinders(e.fn, out); refBinders(e.arg, out); return;
+    case "Lam": refBinders(e.body, out); return;
+    case "Let":
+      if (e.bind.tag === "NonRec") refBinders(e.bind.rhs, out);
+      else for (const [, r] of e.bind.pairs) refBinders(r, out);
+      refBinders(e.body, out); return;
+    case "Case":
+      refBinders(e.scrutinee, out); for (const a of e.alts) refBinders(a.body, out); return;
+    case "Con":
+    case "Op": for (const a of e.args) refBinders(a, out); return;
+  }
+}
+
+export const isTrivial = (e: CoreExpr): boolean => e.tag === "Var" || e.tag === "Lit";
 
 /** Already in weak head normal form, so substituting it can duplicate an
  * allocation but never any work: a saturated constructor whose fields are
  * themselves trivial. `I 1`, the second argument of every `n - 1`, is the
  * case that matters. Nullary and unboxable constructors are free to
  * duplicate on this backend - an `I` is the number itself. */
-const isCheapValue = (e: CoreExpr): boolean => {
+export const isCheapValue = (e: CoreExpr): boolean => {
   if (e.tag !== "Con" || !e.args.every(isTrivial)) return false;
   return e.args.length === 0 || e.args.length === 1;
 };
 
 const isMethodName = (name: string): boolean =>
-  name.startsWith("$c") || name.startsWith("$s") || name.startsWith("$dm");
+  name.startsWith("$c") || name.startsWith("$f") && name.includes("_$c") || name.startsWith("$s") || name.startsWith("$dm") || /(?:from|to)JS(?:Val|Value)/.test(name);
+
+/** Primitive Int operators are strict in all their arguments.  GHC's
+ * simplifier can therefore float a non-trivial nested operator into a let
+ * before unfolding the outer operator. */
+const isStrictIntMethod = (name: string): boolean =>
+  /^\$fNumInt_\$c(?:[+*\-/])$/.test(name) || /^\$cNumInt\$(?:[+*\-/])$/.test(name) ||
+  /^\$fOrdInt_\$c(?:[<>]=?|compare)$/.test(name) || /^\$cOrdInt\$(?:[<>]=?|compare)$/.test(name);
+
+
+
 
 /** Workers are what worker/wrapper just created: the big, boxed-argument-free
  * half. GHC gives the *wrapper* the INLINE unfolding and leaves the worker
@@ -126,7 +156,7 @@ const isWorkerName = (name: string): boolean => name.startsWith("$w");
 /** Substitute, renaming every binder the copy introduces. `sub` maps a
  * unique to the expression replacing it; `fresh` maps a unique to the binder
  * replacing it. */
-export function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
+export function copy(e: CoreExpr, sub: Map<number | Binder, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
   /** A renaming that reaches only where the new binders are in scope.
    *
    * `fresh` used to be one map mutated for the whole walk, which is only sound
@@ -151,7 +181,7 @@ export function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number,
       // An inner binding shadows a parameter, so the renaming is asked first.
       const f = fresh.get(e.binder.unique);
       if (f) return { tag: "Var", binder: f };
-      return sub.get(e.binder.unique) ?? e;
+      return sub.get(e.binder) ?? sub.get(e.binder.unique) ?? e;
     }
     case "Lit":
       return e;
@@ -200,24 +230,30 @@ function spine(e: CoreExpr): { head: CoreExpr; args: CoreExpr[] } {
   return { head, args };
 }
 
-export function inlineKnownCalls(program: CoreProgram): CoreProgram {
+/** Every top-level, non-recursive, small-enough binding, by its own unique -
+ * the set `inlineKnownCalls` substitutes at a saturated call site, and the
+ * set `src/core-opt/specconstr.ts` substitutes into a higher-order loop's
+ * function parameter. Shared so both passes agree on what "known and small"
+ * means, and so a program that changes the size cap only has to change it
+ * once. */
+export function collectInlineCandidates(program: CoreProgram): Map<Binder, Candidate> {
   // Only top-level non-recursive bindings are candidates, and only those
   // whose own right-hand side does not reach back to any of them.
-  const tops = new Map<number, { rhs: CoreExpr; name: string }>();
+  const tops = new Map<Binder, { rhs: CoreExpr; name: string }>();
   for (const b of program.binds)
-    if (b.tag === "NonRec") tops.set(b.binder.unique, { rhs: b.rhs, name: b.binder.name });
+    if (b.tag === "NonRec") tops.set(b.binder, { rhs: b.rhs, name: b.binder.name });
 
-  const reaches = new Map<number, Set<number>>();
-  for (const [u, { rhs }] of tops) {
-    const s = new Set<number>();
-    refs(rhs, s);
-    reaches.set(u, s);
+  const reaches = new Map<Binder, Set<Binder>>();
+  for (const [binder, { rhs }] of tops) {
+    const s = new Set<Binder>();
+    refBinders(rhs, s);
+    reaches.set(binder, s);
   }
   // Transitive closure over the candidate set, so a mutually recursive pair
   // is excluded even though neither names itself.
   for (let changed = true; changed; ) {
     changed = false;
-    for (const [u, s] of reaches)
+    for (const [binder, s] of reaches)
       for (const v of [...s]) {
         const t = reaches.get(v);
         if (!t) continue;
@@ -229,9 +265,9 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
       }
   }
 
-  const candidates = new Map<number, Candidate>();
-  for (const [u, { rhs, name }] of tops) {
-    if (reaches.get(u)?.has(u)) continue;
+  const candidates = new Map<Binder, Candidate>();
+  for (const [binder, { rhs, name }] of tops) {
+    if (reaches.get(binder)?.has(binder)) continue;
     if (isWorkerName(name)) continue;
     const params: Binder[] = [];
     let body = rhs;
@@ -240,20 +276,68 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
       body = body.body;
     }
     if (params.length === 0) continue;
-    if (size(body) > (isMethodName(name) ? MAX_METHOD : MAX_BODY)) continue;
-    candidates.set(u, { params, body });
+    const inline = binder.inline === true;
+    if (size(body) > (inline || isMethodName(name) ? MAX_METHOD : MAX_BODY)) continue;
+    candidates.set(binder, { params, body, ...(inline ? { inline: true } : {}) });
+  }
+  return candidates;
+}
+
+export function inlineKnownCalls(
+  program: CoreProgram,
+  options: { preserveUnreferencedTopLevelBodies?: boolean; roots?: readonly string[] } = {},
+): CoreProgram {
+  const candidates = collectInlineCandidates(program);
+  // Core rewrites may clone a reference binder while preserving its unique.
+  // Candidate membership is therefore keyed by unique as well as object
+  // identity; otherwise a specialized method is visible in the top-level
+  // environment but its call sites silently miss the inline rule.
+  const candidatesByUnique = new Map<number, Candidate>();
+  for (const [binder, candidate] of candidates) candidatesByUnique.set(binder.unique, candidate);
+
+  // GHC does not spend simplifier budget rewriting the RHS of an exported
+  // binding that has no local use.  In particular, the corpus' `add` binding
+  // is deliberately uncalled (`main = pure ()`): expanding its Num method
+  // changes the binding's observable STG head from a dictionary call to a
+  // case, without helping any call site.  Keep this policy opt-in so the
+  // standalone pass remains useful for focused Core tests.
+  const referenced = new Set<number>();
+  if (options.roots) {
+    const byBinder = new Map<Binder, CoreExpr>();
+    for (const b of program.binds) {
+      if (b.tag === "NonRec") byBinder.set(b.binder, b.rhs);
+      else for (const [binder, rhs] of b.pairs) byBinder.set(binder, rhs);
+    }
+    const queue = [...byBinder.keys()].filter((b) => options.roots!.includes(b.name));
+    const live = new Set<Binder>();
+    while (queue.length) {
+      const binder = queue.pop()!;
+      if (live.has(binder)) continue;
+      live.add(binder);
+      referenced.add(binder.unique);
+      for (const ref of refBindersIn(byBinder.get(binder)!)) if (byBinder.has(ref)) queue.push(ref);
+    }
+  } else if (options.preserveUnreferencedTopLevelBodies) {
+    for (const b of program.binds) {
+      const pairs = b.tag === "NonRec" ? [[b.binder, b.rhs] as const] : b.pairs;
+      for (const [, rhs] of pairs) {
+        const seen = new Set<number>();
+        refs(rhs, seen);
+        for (const u of seen) referenced.add(u);
+      }
+    }
   }
 
-  const go = (e: CoreExpr): CoreExpr => {
+  const go = (e: CoreExpr, demanded = true, lazyBoundary = false): CoreExpr => {
     switch (e.tag) {
       case "Var":
       case "Lit":
         return e;
       case "App": {
         const { head, args } = spine(e);
-        const done = args.map(go);
-        if (head.tag === "Var") {
-          const c = candidates.get(head.binder.unique);
+        const done = args.map((arg) => go(arg, false, lazyBoundary));
+        if (head.tag === "Var" && head.binder) {
+          const c = candidates.get(head.binder) ?? candidatesByUnique.get(head.binder.unique);
           // Only trivial arguments, or ones that are already values. Binding a
           // non-trivial argument with a `let` and inlining anyway is what GHC
           // does, and it is worth roughly a millisecond a tap here - but it
@@ -263,34 +347,73 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
             c !== undefined &&
             c.params.length === done.length &&
             done.every((a) => isTrivial(a) || isCheapValue(a));
-          if (c && substitutable) {
+          // A known function applied to only a trivial prefix can be
+          // specialized without changing the original function's ABI.  This
+          // is GHC's small partial-application unfolding (`plus1 = add 1`):
+          // retain the remaining lambdas, but substitute the supplied prefix.
+          if (
+            c && done.length > 0 && done.length < c.params.length &&
+            done.every((a) => isTrivial(a) || isCheapValue(a)) &&
+            (!lazyBoundary || isMethodName(head.binder.name))
+          ) {
             const sub = new Map<number, CoreExpr>();
-            c.params.forEach((p, i) => sub.set(p.unique, done[i]!));
-            return go(copy(c.body, sub, new Map()));
+            done.forEach((arg, i) => sub.set(c.params[i]!.unique, arg));
+            return mkLams(c.params.slice(done.length), copy(c.body, sub, new Map()));
+          }
+          // A lazy binding must remain a thunk, but inlining a known strict
+          // method inside that thunk is still semantics-preserving: it changes
+          // only the thunk's payload, not when the payload is entered. GHC's
+          // simplifier performs this rewrite for boxed numeric methods, which
+          // is what exposes the cases/primop to CPR and worker/wrapper.
+          if ((!lazyBoundary || isMethodName(head.binder.name)) && c && substitutable && (demanded || isMethodName(head.binder.name))) {
+            const sub = new Map<number, CoreExpr>();
+            c.params.forEach((p, i) => {
+              sub.set(p.unique, done[i]!);
+            });
+            return go(copy(c.body, sub, new Map()), demanded);
+          }
+          if (c && isStrictIntMethod(head.binder.name) && c.params.length === done.length && (demanded || done.some((a) => a.tag === "Case")) && !lazyBoundary) {
+            const sub = new Map<number, CoreExpr>();
+            const lets: Array<{ binder: Binder; rhs: CoreExpr }> = [];
+            c.params.forEach((p, i) => {
+              const arg = done[i]!;
+              if (isTrivial(arg) || isCheapValue(arg)) sub.set(p.unique, arg);
+              else {
+                const binder = mkBinder("$inline");
+                lets.push({ binder, rhs: arg });
+                sub.set(p.unique, { tag: "Var", binder });
+              }
+            });
+            let body = go(copy(c.body, sub, new Map()), demanded);
+            for (let i = lets.length - 1; i >= 0; i--) {
+              const let_ = lets[i]!;
+              body = { tag: "Let", bind: { tag: "NonRec", binder: let_.binder, rhs: let_.rhs }, body };
+            }
+            return body;
           }
         }
-        return done.reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), go(head));
+        return done.reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), go(head, true, false));
       }
       case "Lam":
-        return { tag: "Lam", binder: e.binder, body: go(e.body) };
+        return { tag: "Lam", binder: e.binder, body: go(e.body, true, false) };
       case "Let": {
         const bind: CoreBind =
           e.bind.tag === "NonRec"
-            ? { tag: "NonRec", binder: e.bind.binder, rhs: go(e.bind.rhs) }
-            : { tag: "Rec", pairs: e.bind.pairs.map(([b, r]) => [b, go(r)] as [Binder, CoreExpr]) };
-        return { tag: "Let", bind, body: go(e.body) };
+            ? { tag: "NonRec", binder: e.bind.binder, rhs: go(e.bind.rhs, false, true) }
+            : { tag: "Rec", pairs: e.bind.pairs.map(([b, r]) => [b, go(r, false, true)] as [Binder, CoreExpr]) };
+        return { tag: "Let", bind, body: go(e.body, demanded, lazyBoundary) };
       }
       case "Case":
         return {
           tag: "Case",
-          scrutinee: go(e.scrutinee),
+          scrutinee: go(e.scrutinee, true, false),
           binder: e.binder,
-          alts: e.alts.map((a) => ({ ...a, body: go(a.body) })),
+          alts: e.alts.map((a) => ({ ...a, body: go(a.body, demanded, lazyBoundary) })),
         };
       case "Con":
-        return { tag: "Con", con: e.con, args: e.args.map(go) };
+        return { tag: "Con", con: e.con, args: e.args.map((arg) => go(arg, false, true)) };
       case "Op":
-        return { tag: "Op", op: e.op, arity: e.arity, args: e.args.map(go) };
+        return { tag: "Op", op: e.op, arity: e.arity, args: e.args.map((arg) => go(arg, true, false)) };
     }
   };
 
@@ -298,8 +421,14 @@ export function inlineKnownCalls(program: CoreProgram): CoreProgram {
     ...program,
     binds: program.binds.map((b) =>
       b.tag === "NonRec"
-        ? { tag: "NonRec", binder: b.binder, rhs: go(b.rhs) }
+        ? { tag: "NonRec", binder: b.binder, rhs: options.preserveUnreferencedTopLevelBodies && !referenced.has(b.binder.unique) ? b.rhs : go(b.rhs) }
         : { tag: "Rec", pairs: b.pairs.map(([bd, r]) => [bd, go(r)] as [Binder, CoreExpr]) },
     ),
   };
+}
+
+function refBindersIn(e: CoreExpr): Set<Binder> {
+  const out = new Set<Binder>();
+  refBinders(e, out);
+  return out;
 }

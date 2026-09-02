@@ -14,7 +14,7 @@
  * demand, for any app.
  *
  *   node scripts/ghc-lynx-oracle.mjs <exe-name> <out-dir> -- <nix-build-args...>
- *   node scripts/ghc-lynx-oracle.mjs counter references/miso-lynx/examples/dist/ghc-jsexe -- .#miso-lynx-examples
+ *   node scripts/ghc-lynx-oracle.mjs vtree /tmp/ghc-vtree-jsexe -- ./references/miso-lynx#packages.aarch64-darwin.miso-lynx-examples
  *   node scripts/ghc-lynx-oracle.mjs miso-gram /tmp/ghc-misogram-jsexe -- --override-input miso path:../miso
  *     (run the misogram form from inside references/misogram)
  *
@@ -80,7 +80,6 @@ mkdirSync(outDir, { recursive: true });
 for (const file of ["out.js", "lib.js", "rts.js", "out.frefs.js"]) {
   writeFileSync(join(outDir, file), readFileSync(join(jsexe, file)));
 }
-
 const outJs = readFileSync(join(jsexe, "out.js"), "utf8");
 const MAIN_ALIAS = "h$mainZCZCMainzimain";
 if (!outJs.includes(MAIN_ALIAS)) {
@@ -92,5 +91,6 @@ if (!outJs.includes(MAIN_ALIAS)) {
 }
 writeFileSync(join(outDir, "runmain.js"), `h$main(${MAIN_ALIAS});\n`);
 writeFileSync(join(outDir, "NOTES.txt"), "note: emscripten clibs.js omitted (wasm-ld link fails locally on this host, unrelated to JS codegen); runmain.js hand-written per GHC.StgToJS.Linker.Linker.writeRunMain's non-emcc branch\n");
+writeFileSync(join(outDir, "all.js"), ["rts.js", "lib.js", "out.js", "runmain.js"].map((file) => readFileSync(join(outDir, file), "utf8")).join("\n"));
 
 console.error(`wrote ${outDir}/{out.js,lib.js,rts.js,out.frefs.js,runmain.js,NOTES.txt}`);

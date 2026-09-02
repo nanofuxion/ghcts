@@ -40,9 +40,9 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveGhcJs } from "./ghc-path.mjs";
 
-const GHC =
-  "/nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc";
+const GHC = resolveGhcJs();
 
 const ROOT = "/Volumes/Storage/Projects/ghcts";
 // One scratch directory per corpus case, kept between runs so a dump can be
@@ -58,6 +58,14 @@ const CORPUS = [
     // it kept the class method or specialised it away.
     source: ["add :: Int -> Int -> Int", "add a b = a + b"],
     want: ["add"],
+  },
+  {
+    name: "arith3",
+    // Two primitive operations in one result. This catches whether CorePrep
+    // and Core-to-STG preserve GHC's compact continuation shape for an
+    // overloaded arithmetic chain.
+    source: ["mix :: Int -> Int -> Int", "mix a b = a * b + a"],
+    want: ["mix"],
   },
   {
     name: "loop",
@@ -169,6 +177,7 @@ const args = process.argv.slice(2);
 const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : undefined;
 const show = args.includes("--show") ? args[args.indexOf("--show") + 1] : undefined;
 const stage = args.includes("--stage") ? args[args.indexOf("--stage") + 1] : "all";
+const keep = args.includes("--keep");
 const wantCore = stage === "all" || stage === "core";
 const wantStg = stage === "all" || stage === "stg";
 
@@ -182,10 +191,13 @@ function parseGhcStg(text) {
   // unindented lines instead would cut the name away from its own flags.
   const blocks = text.split(/\n\s*\n/);
   for (const block of blocks) {
+    // Recursive groups are printed as `Rec {` followed by the first binding;
+    // the group marker is not part of a binding header.
+    const header = block.replace(/^Rec\s*\{\s*\n/, "");
     // `Name :: Type`, but an inline pragma can sit between them and push the
     // `::` onto the next line: `Main.sumTo [InlPrag=[2]]\n  :: Int -> ...`.
-    const m = /^([A-Za-z0-9_.$']+)(?:\s*\[[^\]]*\])?\s*::/.exec(block)
-      || /^([A-Za-z0-9_.$']+)\s*\[InlPrag[^\n]*\n\s*::/.exec(block);
+    const m = /^([A-Za-z0-9_.$']+)(?:\s*\[[^\]]*\])?\s*::/.exec(header)
+      || /^([A-Za-z0-9_.$']+)\s*\[InlPrag[^\n]*\n\s*::/.exec(header);
     if (!m) continue;
     const full = m[1];
     const name = full.replace(/^Main\./, "");
@@ -239,7 +251,9 @@ function ghcHead(rhs) {
   // the bang marks a top-level allocation, not constructor-ness.
   const con = /^([A-Za-z0-9_.$']+)!?\s*\[/.exec(body);
   if (con && /^[A-Z:]/.test(short(con[1]))) return `con:${short(con[1])}`;
-  const call = /^([A-Za-z0-9_.$'#]+)/.exec(body);
+  // GHC's z-encoded class-method names retain an operator suffix such as
+  // `$fNumInt_$c+`; keep it in the fact instead of truncating at `$c`.
+  const call = /^([A-Za-z0-9_.$'#,+*/<>=:?!&|%\-]+)/.exec(body);
   if (call) return /#$/.test(call[1]) ? `prim:${call[1]}` : `call:${short(call[1])}`;
   return "?";
 }
@@ -388,7 +402,7 @@ function ghctsCoreFacts(program) {
 
 function runCase(c) {
   const dir = join(WORK, c.name);
-  rmSync(dir, { recursive: true, force: true });
+  if (!keep) rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const src = [
     ...(c.pragmas ?? []),
@@ -423,7 +437,7 @@ function runCase(c) {
   };
 }
 
-if (!existsSync(GHC)) {
+if (!GHC) {
   console.error(`No GHC JS compiler at ${GHC}`);
   process.exit(2);
 }

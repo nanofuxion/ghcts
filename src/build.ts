@@ -20,13 +20,14 @@ import { RTS_SEATS } from "./prelude.js";
 import { BINDING_OVERRIDES } from "./binding-overrides.js";
 import { desugarModule } from "./desugar.js";
 import { coreToStg } from "./core-to-stg.js";
-import type { CoreProgram } from "./core.js";
+import type { CoreExpr, CoreProgram } from "./core.js";
 import { floatConstants } from "./core-opt/float.js";
 import { inlineKnownCalls } from "./core-opt/inline.js";
 import { simplifyCore } from "./core-opt/simplify.js";
 import { specialiseKnownDicts } from "./core-opt/specialise.js";
 import { forceStrictArgs } from "./core-opt/strictness.js";
 import { workWrap } from "./core-opt/workwrap.js";
+import { specConstr } from "./core-opt/specconstr.js";
 import { genUnits, stgToJS } from "./stg-js/codegen.js";
 import { link, type ModuleCode } from "./linker/linker.js";
 import { runG, type IdCache } from "./stg-js/monad.js";
@@ -35,6 +36,7 @@ import { error } from "./diagnostics.js";
 import type { Diagnostic, GhctsConfig } from "./types.js";
 import type { Module } from "./ast.js";
 import type { StgBinding } from "./stg.js";
+import { mkBinder } from "./stg.js";
 import type { Ident } from "./js/ident.js";
 
 export interface BuildResult {
@@ -178,15 +180,44 @@ function ghcModules(config: StgToJSConfig, root: string, bindings: StgBinding[])
 
   let idents: IdCache = new Map();
   let mint: Map<Ident, number> = new Map();
+  const groups = new Map<string, StgBinding[]>();
+  const groupKey = (b: StgBinding): string => {
+    const binder = b.tag === "StgNonRec" ? b.binder : b.pairs[0]?.[0];
+    return binder?.definingUnitId && binder.definingModuleName
+      ? `${binder.definingUnitId}:${binder.definingModuleName}`
+      : `${mainMod.unitId}:${mainMod.moduleName}`;
+  };
+  for (const b of program) {
+    const key = groupKey(b);
+    const group = groups.get(key);
+    if (group) group.push(b);
+    else groups.set(key, [b]);
+  }
+  const mainKey = `${mainMod.unitId}:${mainMod.moduleName}`;
+  const mainProgram = groups.get(mainKey) ?? [];
   const mainUnits = runG(config, mainMod, new Map(), (gs) => {
-    const units = genUnits(gs, mainMod, program);
+    const units = genUnits(gs, mainMod, mainProgram);
     idents = gs.gsIdents;
     mint = gs.gsIdentMint;
     return units;
   });
-
+  const imported = [...groups.entries()]
+    .filter(([key]) => key !== mainKey)
+    .map(([key, group]) => {
+      const split = key.indexOf(":");
+      const module = { unitId: key.slice(0, split), moduleName: key.slice(split + 1) };
+      return {
+        module,
+        units: runG(config, module, new Map(), (gs) => {
+          for (const [cacheKey, ident] of idents) gs.gsIdents.set(cacheKey, ident);
+          for (const [ident, order] of mint) gs.gsIdentMint.set(ident, order);
+          return genUnits(gs, module, group);
+        }),
+      };
+    });
   return [
     { module: mainMod, units: mainUnits },
+    ...imported,
     ...moved.map((m) => ({
       module: m.module,
       units: runG(config, m.module, new Map(), (gs) => {
@@ -196,6 +227,33 @@ function ghcModules(config: StgToJSConfig, root: string, bindings: StgBinding[])
       }),
     })),
   ];
+}
+
+/** The elaborator flattens imported declarations into one Core program so
+ * name resolution can stay simple. Recover the defining module from the
+ * stable flat-name prefix before code generation; without this, every Miso
+ * binding is emitted as `main:Main` instead of `miso-1.13.0.0:Miso.*`. */
+function annotateDefiningModules(program: CoreProgram, root: string, moduleNames: Iterable<string>, unitId: string): void {
+  const modules = [...moduleNames]
+    .filter((name) => name !== root && name.startsWith("Miso."))
+    .sort((a, b) => b.length - a.length);
+  for (const bind of program.binds) {
+    const binders = bind.tag === "NonRec" ? [bind.binder] : bind.pairs.map(([binder]) => binder);
+    for (const binder of binders) {
+      const moduleName = modules.find((name) => binder.name.startsWith(`${name.replace(/\./g, "_")}_`));
+      if (moduleName) {
+        binder.definingUnitId = unitId;
+        binder.definingModuleName = moduleName;
+      }
+    }
+  }
+  for (const con of program.dataCons) {
+    const moduleName = modules.find((name) => con.name.startsWith(`${name.replace(/\./g, "_")}_`));
+    if (moduleName) {
+      con.definingUnitId = unitId;
+      con.definingModuleName = moduleName;
+    }
+  }
 }
 
 /** Finds a dependency with no `ghcts.json` sourceRoot to search from yet: the
@@ -293,6 +351,15 @@ async function packageDir(project: string, config: GhctsConfig, name: string): P
   return undefined;
 }
 
+async function packageUnitId(project: string, config: GhctsConfig, name: string): Promise<string> {
+  const dir = await packageDir(project, config, name);
+  if (!dir) return name;
+  const source = await readFile(join(dir, `${name}.cabal`), "utf8");
+  const packageName = /^name:\s*([^\s]+)/mi.exec(source)?.[1] ?? name;
+  const version = /^version:\s*([^\s]+)/mi.exec(source)?.[1];
+  return version ? `${packageName}-${version}` : packageName;
+}
+
 /** Every dependency's `js-sources`, concatenated in declaration order.
  *
  * This is the same thing `renderStaticRts` does for the boot packages, for the
@@ -319,15 +386,47 @@ async function packageJs(project: string, config: GhctsConfig): Promise<string> 
  * `scripts/bench-vs-ghc.mjs` and `scripts/stg-diff.mjs` call this too, so what
  * they measure and compare is what a build actually emits.
  */
-export function optimiseCore(program: CoreProgram): CoreProgram {
+export function optimiseCore(
+  program: CoreProgram,
+  options: { preserveUnreferencedTopLevelBodies?: boolean; roots?: readonly string[] } = {},
+): CoreProgram {
   if (process.env.GHCTS_NO_OPT) return program;
+  const trace = (label: string, p: CoreProgram): CoreProgram => {
+    if (process.env.GHCTS_TRACE_CORE) {
+      const wanted = process.env.GHCTS_TRACE_CORE === "1" ? undefined : new Set(process.env.GHCTS_TRACE_CORE.split(","));
+      for (const b of p.binds) if (b.tag === "NonRec" && (!wanted || wanted.has(b.binder.name))) {
+        const shape = (e: CoreExpr): string => {
+          switch (e.tag) {
+            case "Lam": return `lam(${shape(e.body)})`;
+            case "Case": return `case(${shape(e.scrutinee)}=>${e.alts.length})`;
+            case "Let": return e.bind.tag === "NonRec"
+              ? `let(${e.bind.binder.name}=${shape(e.bind.rhs)} in ${shape(e.body)})`
+              : `letrec(${e.bind.pairs.map(([b, r]) => `${b.name}=${shape(r)}`).join(";")} in ${shape(e.body)})`;
+            case "Con": return `con:${e.con.name}[${e.args.map(shape).join(",")}]`;
+            case "Op": return `op:${e.op.tag}`;
+            case "App": return `app(${shape(e.fn)},${shape(e.arg)})`;
+            case "Var": return `var:${e.binder.name}`;
+            case "Lit": return "lit";
+          }
+          return "unknown";
+        };
+        console.error(`[ghcts core] ${label} ${b.binder.name} rep=${b.binder.resultRep ?? "-"}: ${shape(b.rhs)}`);
+      }
+    }
+    return p;
+  };
   const skip = new Set((process.env.GHCTS_SKIP ?? "").split(",").filter(Boolean));
-  const on = <T,>(name: string, f: (x: T) => T) => (x: T) => (skip.has(name) ? x : f(x));
+  const on = <T, A extends unknown[]>(name: string, f: (x: T, ...rest: A) => T) =>
+    (x: T, ...rest: A) => (skip.has(name) ? x : f(x, ...rest));
   const float = on("float", floatConstants);
   const inline = on("inline", inlineKnownCalls);
   const spec = on("spec", specialiseKnownDicts);
   const strict = on("strict", forceStrictArgs);
   const simpl = on("simplify", simplifyCore);
+  const inlineOptions = {
+    preserveUnreferencedTopLevelBodies: options.preserveUnreferencedTopLevelBodies ?? true,
+    roots: options.roots,
+  };
   // WorkWrap hands its worker a rebuilt box and leaves it to the Simplifier to
   // delete again. That is not only a size trade: building misogram with
   // `GHCTS_SKIP=simplify` and WorkWrap still on dies at startup with
@@ -335,16 +434,70 @@ export function optimiseCore(program: CoreProgram): CoreProgram {
   // two run together or not at all, and this debug switch cannot ask for the
   // half that does not work.
   const ww = on("workwrap", skip.has("simplify") ? (x: CoreProgram) => x : workWrap);
-  if (process.env.GHCTS_SKIP)
-    return float(inline(simpl(ww(simpl(strict(inline(spec(inline(float(program))))))))));
+  // The bounded map-only pass is validated against vtree and the Miso startup
+  // corpus; its narrow candidate filter remains inside specConstr.
+  const specc = on("specconstr", (p: CoreProgram) => specConstr(p, { allowLambdaCallbacks: false, requireKnownCollection: true }));
   // Sharing constants comes first, while a `pack "type"` is still one call to
   // one literal. Inlining rewrites it into the loop it is made of, and a loop
   // is no longer a shape this can recognise, so every use site would keep its
   // own copy and rebuild the same JS string on every draw.
-  const shared0 = floatConstants(program);
-  const specialised = inlineKnownCalls(specialiseKnownDicts(inlineKnownCalls(shared0)));
-  const demanded = simplifyCore(forceStrictArgs(specialised));
-  return floatConstants(inlineKnownCalls(simplifyCore(workWrap(demanded))));
+  const shared0 = trace("float", float(program));
+  const specialised = trace("specialise", inline(
+    spec(inline(shared0, inlineOptions), { inlineGenerated: true, lowerStaticPtrProjection: true }),
+    inlineOptions,
+  ));
+  const constrained = trace("specconstr", specc(specialised));
+  if (process.env.GHCTS_CHECK_CORE) {
+    const check = (e: CoreExpr, path: string): void => {
+      if (e.tag === "Var" && !e.binder) throw new Error(`invalid Core Var at ${path}: ${JSON.stringify(e)}`);
+      if (e.tag === "App") { check(e.fn, `${path}.fn`); check(e.arg, `${path}.arg`); }
+      else if (e.tag === "Lam") check(e.body, `${path}.body`);
+      else if (e.tag === "Let") {
+        if (e.bind.tag === "NonRec") check(e.bind.rhs, `${path}.rhs`);
+        else e.bind.pairs.forEach(([, rhs], i) => check(rhs, `${path}.rec[${i}]`));
+        check(e.body, `${path}.body`);
+      } else if (e.tag === "Case") { check(e.scrutinee, `${path}.scrutinee`); e.alts.forEach((a, i) => check(a.body, `${path}.alt[${i}]`)); }
+      else if (e.tag === "Con" || e.tag === "Op") e.args.forEach((a, i) => check(a, `${path}.arg[${i}]`));
+    };
+    const checkProgram = (p: CoreProgram, label: string) =>
+      p.binds.forEach((b, i) => check(b.tag === "NonRec" ? b.rhs : b.pairs[0]![1], `${label}[${i}]`));
+    checkProgram(specialised, "before-specconstr");
+    checkProgram(constrained, "after-specconstr");
+  }
+  const demanded = trace("demand", simpl(inline(strict(constrained), inlineOptions)));
+  const final = float(inline(simpl(ww(demanded)), inlineOptions));
+  const intCon = final.dataCons.find((c) => c.name === "I" && (c.typeName === "Int" || c.typeName.endsWith(".Int")));
+  if (!intCon) return trace("final", final);
+  // A primop result is a raw machine value, and so is a worker's (its result
+  // is `unboxWorkerResults`' primop). Any other call returns whatever its
+  // callee returns. A worker call is boxed *strictly* - `case $w a b of r ->
+  // I# r` - never as `I# ($w a b)`: that makes the call a lazy field, so
+  // `remSmall`'s wrapper handed back the thunk of `$wremSmall a b` instead
+  // of calling it, and `hexDigitChar` computed on a thunk - `show` of every
+  // Word64 came out as NUL characters.
+  const spine = (x: CoreExpr): CoreExpr => (x.tag === "App" ? spine(x.fn) : x);
+  const workerCall = (x: CoreExpr): boolean => {
+    const head = spine(x);
+    return head.tag === "Var" && head.binder.name.startsWith("$w");
+  };
+  const box = (e: CoreExpr, underCase = false): CoreExpr => {
+    switch (e.tag) {
+      case "Op": return underCase ? { tag: "Con", con: intCon, args: [e] } : e;
+      case "App": {
+        if (!underCase || !workerCall(e)) return e;
+        const r = mkBinder("r", { unboxedInt: true, primitiveRep: "Int" });
+        return { tag: "Case", scrutinee: e, binder: r, alts: [{ con: { tag: "DEFAULT" }, binders: [], body: { tag: "Con", con: intCon, args: [{ tag: "Var", binder: r }] } }] };
+      }
+      case "Case": return { ...e, alts: e.alts.map((a) => ({ ...a, body: box(a.body, true) })) };
+      case "Let": return { ...e, body: box(e.body, underCase) };
+      case "Lam": return { ...e, body: box(e.body, underCase) };
+      case "Var":
+      case "Lit":
+      case "Con": return e;
+    }
+  };
+  return trace("final", { ...final, binds: final.binds.map((b) =>
+    b.tag === "NonRec" && b.binder.resultRep === "boxed-int" ? { ...b, rhs: box(b.rhs) } : b) });
 }
 
 export async function build(options: {
@@ -387,11 +540,14 @@ export async function build(options: {
   diagnostics.push(...desugared.diagnostics);
   log(`desugared to ${desugared.program.binds.length} Core binding${desugared.program.binds.length === 1 ? "" : "s"}`);
   if (diagnostics.some((d) => d.severity === "error")) return { diagnostics };
+  const misoUnitId = await packageUnitId(project, config, "miso");
+  annotateDefiningModules(desugared.program, root, loaded.modules.keys(), misoUnitId);
 
   // `optimization: "none"` skips the Core-to-Core pipeline, so the
   // un-optimised Core remains reachable for oracle comparison.
   const optimised =
-    stgConfig.optimization === "none" ? desugared.program : optimiseCore(desugared.program);
+    stgConfig.optimization === "none" ? desugared.program : optimiseCore(desugared.program, { roots: [config.entry.export] });
+  annotateDefiningModules(optimised, root, loaded.modules.keys(), misoUnitId);
   if (stgConfig.optimization !== "none")
     log(`optimised Core, ${optimised.binds.length} binding${optimised.binds.length === 1 ? "" : "s"}`);
 

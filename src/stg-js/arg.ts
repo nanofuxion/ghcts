@@ -66,6 +66,16 @@ export function genStaticArg(gs: GenState, a: StgArg): StaticArg[] {
 
 function unfloatedStatic(gs: GenState, x: StgExpr): StaticArg[] {
   if (x.tag === "StgLit") return genStaticLit(x.lit).map(staticLitArg);
+  // Fingerprint fields are Word64 values built by this pure helper during
+  // CorePrep. GHC's static-data encoder unpacks the two halves instead of
+  // treating the helper call as a runtime thunk.
+  if (
+    x.tag === "StgApp" &&
+    /(?:word64FromHalves|bigFromHalves)$/.test(x.fn.name) &&
+    x.args.length === 2
+  ) {
+    return x.args.flatMap((a) => genStaticArg(gs, a));
+  }
   if (x.tag === "StgConApp") {
     const dc = x.con;
     if (isBoolDataCon(dc) || isUnboxableCon(dc)) {
@@ -75,7 +85,7 @@ function unfloatedStatic(gs: GenState, x: StgExpr): StaticArg[] {
     const as = x.args.flatMap((a) => genStaticArg(gs, a));
     return [{ tag: "StaticConArg", name: identForDataConWorker(gs, dc), args: as }];
   }
-  throw new Error(`genArg: unexpected unfloated expression: ${x.tag}`);
+  throw new Error(`genArg: unexpected unfloated expression: ${x.tag}${x.tag === "StgApp" ? ` (${x.fn.name})` : ""}`);
 }
 
 /** Generate JS code for an StgArg. */

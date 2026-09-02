@@ -175,6 +175,11 @@ export function genPrim(
         assign_(r, if01(strictEq_(tmp, toI32(tmp)))),
       ])));
     }
+    // GHC's Cmm optimizer may replace a signed quotient by a power of two
+    // with a sign-corrected shift before this backend sees it. Keep the
+    // general operation exact here; the pattern rewrite belongs in the STG
+    // lowering pass because it must know whether the result is quot/rem or a
+    // boxed `div` projection.
     case "IntQuotOp": { const [r] = rs, [x, y] = as; return PrimInline(assign_(r, toI32(Div(x, y)))); }
     case "IntRemOp": { const [r] = rs, [x, y] = as; return PrimInline(assign_(r, Mod(x, y))); }
     case "IntQuotRemOp": {

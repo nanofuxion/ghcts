@@ -19,15 +19,16 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
+import { resolveGhcJs } from "./ghc-path.mjs";
 
-const GHC_JS = "/nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc";
+const GHC_JS = resolveGhcJs();
 
 const file = process.argv[2];
 if (!file || !existsSync(file)) {
   console.error("usage: ghc-js-diff.mjs <file.hs> [--rts]");
   process.exit(2);
 }
-if (!existsSync(GHC_JS)) {
+if (!GHC_JS) {
   console.error(`No GHC JS compiler at ${GHC_JS}.\nIt comes from references/miso-lynx's flake: nix build .#miso-lynx-examples`);
   process.exit(2);
 }
@@ -52,7 +53,7 @@ const withMain = /^main\s*::/m.test(source)
   ? source
   : `${source}\nmain :: IO ()\nmain = ${roots.map((r) => `${r} \`seq\` `).join("")}return ()\n`;
 writeFileSync(hs, withMain);
-execFileSync(GHC_JS, [hs, "-o", join(work, "out")], { cwd: work, stdio: "pipe" });
+execFileSync(GHC_JS, ["-O2", hs, "-o", join(work, "out")], { cwd: work, stdio: "pipe" });
 const jsexe = join(work, "out.jsexe");
 const ghcOut = readFileSync(join(jsexe, "out.js"), "utf8");
 const ghcRts = readFileSync(join(jsexe, "rts.js"), "utf8");
@@ -61,6 +62,7 @@ const ghcRts = readFileSync(join(jsexe, "rts.js"), "utf8");
 const { parseModule } = await import("../dist/parser.js");
 const { elaborateModule } = await import("../dist/elaborate.js");
 const { desugarModule } = await import("../dist/desugar.js");
+const { optimiseCore } = await import("../dist/build.js");
 const { coreToStg } = await import("../dist/core-to-stg.js");
 const { stgToJS, renderModule } = await import("../dist/stg-js/codegen.js");
 const { renderRts } = await import("../dist/stg-js/rts.js");
@@ -75,7 +77,7 @@ try {
   const errors = [...(elaborated.diagnostics ?? []), ...desugared.diagnostics].filter((d) => d.severity === "error");
   if (errors.length) failure = errors;
   else {
-    const stg = coreToStg(desugared.program);
+    const stg = coreToStg(optimiseCore(desugared.program));
     const units = stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings);
     ours = renderModule(config, units);
   }

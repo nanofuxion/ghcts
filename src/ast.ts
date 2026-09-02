@@ -9,7 +9,7 @@ export interface Span { start: number; end: number; line: number; column: number
  * `voidRep` it is written by `src/elaborate.ts`, the only pass that has types,
  * and read by `src/desugar.ts`, which puts it on the binder. Absent means
  * "unknown", never "is a function". */
-export type Pattern = { tag: 'wild'; voidRep?: true; notFun?: true; /** A pattern type signature, as source text; see `Elaborator.inferPattern`. */ signature?: string; span: Span } | { tag: 'var'; name: string; voidRep?: true; notFun?: true; /** A pattern type signature, as source text; see `Elaborator.inferPattern`. */ signature?: string; span: Span } | { tag: 'as'; name: string; pattern: Pattern; span: Span } | { tag: 'int'; value: number; span: Span } | { tag: 'double'; value: number; span: Span } | { tag: 'string'; value: string; span: Span } | { tag: 'char'; value: string; span: Span } | { tag: 'con'; name: string; args: Pattern[]; span: Span } | { tag: 'record'; name: string; fields: Array<{ name: string; pattern: Pattern }>; wildcard: boolean; span: Span };
+export type Pattern = { tag: 'wild'; voidRep?: true; notFun?: true; primitiveRep?: 'Bool'; /** A pattern type signature, as source text; see `Elaborator.inferPattern`. */ signature?: string; span: Span } | { tag: 'var'; name: string; voidRep?: true; notFun?: true; primitiveRep?: 'Bool'; /** A pattern type signature, as source text; see `Elaborator.inferPattern`. */ signature?: string; span: Span } | { tag: 'as'; name: string; pattern: Pattern; span: Span } | { tag: 'int'; value: number; span: Span } | { tag: 'double'; value: number; span: Span } | { tag: 'string'; value: string; span: Span } | { tag: 'char'; value: string; span: Span } | { tag: 'con'; name: string; args: Pattern[]; span: Span } | { tag: 'record'; name: string; fields: Array<{ name: string; pattern: Pattern }>; wildcard: boolean; span: Span };
 /** One `|` qualifier.  Haskell's guards are a *sequence* of these, evaluated
  * left to right, and a `p <- e` binds for everything to its right as well as
  * for the body - which is why they cannot be a single condition plus an
@@ -28,7 +28,7 @@ export type Expr = { tag: 'var'; name: string; span: Span } | { tag: 'int'; valu
 /** `strict` is BangPatterns' `let !x = e`: the binding is forced where the
  * group's body begins, which `src/desugar.ts` renders as a `Case`. */
 export interface LocalBinding { name: string; patterns: Pattern[]; value: Expr; guards?: Guard[]; whereBindings?: LocalBinding[]; strict?: true; /** A `let`/`where` type signature, as source text; `src/elaborate.ts` parses it. */ signature?: string; span: Span; }
-export interface ValueDeclaration { tag: 'value'; name: string; equations: Array<{ patterns: Pattern[]; guards: Guard[]; whereBindings: LocalBinding[] }>; span: Span; /** Four 32-bit MD5 words of a `static e` fingerprint, when this declaration was floated from one. */ sptFingerprint?: [number, number, number, number]; }
+export interface ValueDeclaration { tag: 'value'; name: string; equations: Array<{ patterns: Pattern[]; guards: Guard[]; whereBindings: LocalBinding[] }>; span: Span; /** Explicit INLINE pragma carried through module renaming. */ inline?: boolean; /** Result representation inferred for the ordinary boxed entry point. */ resultRep?: 'Int'; /** Primitive representations of source parameters, in entry order. */ parameterReps?: Array<'Int' | 'Bool' | 'Double' | 'Float' | 'Word' | 'Char' | 'JSVal' | 'JSString'>; /** Four 32-bit MD5 words of a `static e` fingerprint, when this declaration was floated from one. */ sptFingerprint?: [number, number, number, number]; }
 export interface DataDeclaration { tag: 'data'; name: string; /** The name as the declaring module wrote it: `deriving Generic`'s `datatypeName` and `deriving Show`'s output are the surface name, not the module-scoped one. */ surfaceName?: string; parameters: string[]; constructors: Array<{ name: string; arity: number; fields?: string[]; fieldTypes?: string[];
     /** The constructor's own context, one source string per constraint:
      * `forall a. Show a => MkShowable a` keeps `["Show a"]`.  Each constraint
@@ -50,7 +50,7 @@ export interface DataDeclaration { tag: 'data'; name: string; /** The name as th
   derivingNewtype?: string[];
   newtype?: boolean; span: Span; }
 /** The signature is split at top-level arrows, preserving the declared Haskell types. */
-export interface ForeignDeclaration { tag: 'foreign'; name: string; javascript: string; signature: string[]; arity: number; span: Span; }
+export interface ForeignDeclaration { tag: 'foreign'; name: string; javascript: string; signature: string[]; arity: number; /** Primitive representations of foreign parameters, when directly known. */ parameterReps?: Array<'Int' | 'Bool' | 'Double' | 'Float' | 'Word' | 'Char' | 'JSVal' | 'JSString'>; span: Span; }
 /** `isDefault` marks GHC's DefaultSignatures form, `default f :: ty` in a class
  * body: the type of the class's *default implementation* of `f`, which may be
  * more constrained than `f`'s own. */
@@ -68,7 +68,7 @@ export interface ClassMemberSlice { tokens: string[]; span: Span; }
  * parameter the class's own parameters determine - see `src/elaborate.ts`. */
 export interface AssociatedType { name: string; rhs?: string; }
 export interface ClassDeclaration { tag: 'class'; name: string; associatedTypes: AssociatedType[]; /** Superclass constraints, one string per item of the `=>` context. */ context: string[]; parameters: string[]; /** `| m -> s, a b -> c`: each dependency names parameters, by name. */ fundeps: Array<{ from: string[]; to: string[] }>; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
-export interface InstanceDeclaration { tag: 'instance'; head: string; associatedTypes: AssociatedType[]; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; }
+export interface InstanceDeclaration { tag: 'instance'; head: string; associatedTypes: AssociatedType[]; members: Declaration[]; rawMembers: ClassMemberSlice[]; span: Span; /** INLINE names belonging to methods in this instance. */ inlineNames?: string[]; }
 /** Parsed but not yet represented in Core.  Keeping these explicit ensures a
  * later phase reports one accurate unsupported-feature diagnostic instead of
  * pretending the declaration was absent. */
@@ -90,4 +90,4 @@ export interface ImportDeclaration {
   hidingConstructors?: string[];
   span: Span;
 }
-export interface Module { name: string; imports: ImportDeclaration[]; /** Named values/types explicitly exported by the module header. */ exports: string[]; /** Modules explicitly re-exported from the module header. */ reexports: string[]; declarations: Declaration[]; }
+export interface Module { name: string; imports: ImportDeclaration[]; /** Named values/types explicitly exported by the module header. */ exports: string[]; /** Modules explicitly re-exported from the module header. */ reexports: string[]; declarations: Declaration[]; /** Names marked INLINE by source pragmas. */ inlineNames?: string[]; }

@@ -150,7 +150,10 @@ function reachableUnits(mods: ModuleCode[], extraRoots: readonly string[] = []):
     const u = queue.pop()!;
     for (const ident of unitDeps(u)) {
       const target = bySymbol.get(ident);
-      if (target) addRoot(target);
+      if (target && !reachable.has(target)) {
+        reachable.add(target);
+        queue.push(target);
+      }
     }
   }
   return reachable;

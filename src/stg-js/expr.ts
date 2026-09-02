@@ -49,6 +49,7 @@ import { allocData, dataFieldName, jsClosureCount } from "./closure.js";
 import type { ExprCtx } from "./expr-ctx.js";
 import {
   ctxClearLneFrame,
+  ctxAddEval,
   ctxIsEvaluated,
   ctxIsLneBinding,
   ctxIsLneLiveVar,
@@ -153,6 +154,7 @@ function idJSRep(i: Binder): JSRep[] {
   const n = idSlotCount(i);
   if (n === 0) return [JSRep.VoidV];
   if (n === 2) return [JSRep.LongV];
+  if (i.unboxedInt === true || i.primitiveRep === "Bool") return [JSRep.IntV];
   return [JSRep.PtrV];
 }
 
@@ -167,6 +169,7 @@ function idPrimReps(i: Binder): PrimRep[] {
   const n = idSlotCount(i);
   if (n === 0) return [];
   if (n === 2) return [{ tag: "Int64Rep" }];
+  if (i.unboxedInt === true || i.primitiveRep === "Bool") return [{ tag: "IntRep" }];
   return [{ tag: "BoxedRep", levity: "Lifted" }];
 }
 
@@ -182,10 +185,10 @@ export function storeIdFields(gs: GenState, i: Binder, dst: TypedExpr[]): JStgSt
 }
 
 /** `GHC.StgToJS.Utils.isInlineExpr`. */
-export function isInlineExpr(e: StgExpr): boolean {
+export function isInlineExpr(e: StgExpr, evaluated: ReadonlySet<number> = new Set()): boolean {
   switch (e.tag) {
     case "StgApp":
-      return isInlineApp(e.fn, e.args);
+      return isInlineApp(e.fn, e.args, evaluated);
     case "StgLit":
       return true;
     case "StgConApp":
@@ -195,17 +198,17 @@ export function isInlineExpr(e: StgExpr): boolean {
       if (e.op.tag === "StgFCallOp") return e.op.target.safety !== "interruptible";
       return false;
     case "StgCase":
-      return isInlineExpr(e.scrutinee) && e.alts.every((a) => isInlineExpr(a.body));
+      return isInlineExpr(e.scrutinee, evaluated) && e.alts.every((a) => isInlineExpr(a.body, evaluated));
     case "StgLet":
     case "StgLetNoEscape":
-      return isInlineExpr(e.body);
+      return isInlineExpr(e.body, evaluated);
   }
 }
 
 /** `GHC.StgToJS.Utils.isInlineApp`. */
-function isInlineApp(i: Binder, args: StgArg[]): boolean {
+function isInlineApp(i: Binder, args: StgArg[], evaluated: ReadonlySet<number>): boolean {
   if (i.join) return false;
-  if (args.length === 0) return isUnboxedTupleId(i) || isStrictTypeId(i) || ctxIsEvaluated(i);
+  if (args.length === 0) return isUnboxedTupleId(i) || isStrictTypeId(i) || i.evaluated === true || evaluated.has(i.unique);
   return false;
 }
 
@@ -304,6 +307,27 @@ function isStrictId(i: Binder): boolean {
   return i.strict === true || i.evaluated === true || (i.funRepArity ?? 0) > 0;
 }
 
+/** Class-method entry points are polymorphic ABI values, even when their STG
+ * binder happens to carry a function arity. GHC leaves these calls through
+ * the apply machinery; treating the arity as a native jump target changes the
+ * register contract (notably for `$cNumInt$+`). */
+function isMethodId(i: Binder): boolean {
+  return /(?:^|\$)(?:c|zdc)[A-Za-z0-9_$]*[+$=<>/!-]/.test(i.name) || i.name.includes("$c");
+}
+
+function isNativeMethod(i: Binder): boolean {
+  return isMethodId(i) && i.nativeEligible === true && i.nativeResultRep !== undefined;
+}
+
+/** Strictness inferred by Core-to-Core is not, by itself, the GHC JS
+ * backend's proof that a boxed entry may be entered with the native ABI. A
+ * non-native target may still need the generic apply path. */
+function isDirectJumpStrict(i: Binder): boolean {
+  if (i.directJumpEligible !== undefined) return i.directJumpEligible;
+  return isStrictId(i) && (i.strict !== true || i.nativeEligible === true);
+}
+
+
 /** Unlifted / void / prim-suffixed names stand in for `isStrictType`. */
 function isStrictTypeId(i: Binder): boolean {
   return i.arity === 0 || i.name.endsWith("#");
@@ -314,8 +338,9 @@ function isUnboxedTupleId(i: Binder): boolean {
 }
 
 function isLocalId(i: Binder): boolean {
-  return i.exported !== true || i.internal === true;
+  return i.topLevel !== true && (i.exported !== true || i.internal === true);
 }
+
 
 /** GHC.StgToJS.Apply.jumpToII - avoid one indirection for global ids. */
 function jumpToII(gs: GenState, i: Binder, vars: JStgExpr[], loadAppInR1: JStgStat): JStgStat {
@@ -360,7 +385,10 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
 
   // unboxable heap object already evaluated: Int/Double payload, or the box
   const vt = idJSRep(i);
-  if (args.length === 0 && vt.length === 1 && isUnboxable(vt[0]!) && ctxIsEvaluated(i)) {
+  if (args.length === 0 && i.unboxedInt === true && targets.length === 1) {
+    return [assign_(targets[0]!.expr[0]!, varForId(gs, i)), "ExprInline"];
+  }
+  if (args.length === 0 && vt.length === 1 && isUnboxable(vt[0]!) && ctxIsEvaluated(i, ctx)) {
     const fields = targets.flatMap((t) => t.expr);
     const is = varsForId(gs, i);
     if (fields.length === 1 && is.length === 1) {
@@ -369,7 +397,7 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
   }
 
   // known evaluated (or strict type): return fields without entering
-  if (args.length === 0 && targets.length > 0 && (ctxIsEvaluated(i) || isStrictTypeId(i))) {
+  if (args.length === 0 && targets.length > 0 && (ctxIsEvaluated(i, ctx) || isStrictTypeId(i))) {
     return [storeIdFields(gs, i, targets), "ExprInline"];
   }
 
@@ -383,13 +411,15 @@ export function genApp(gs: GenState, ctx: ExprCtx, i: Binder, args: StgArg[]): [
   const loadFun = assignAll([...regsFromR1.map(register)], varsForId(gs, i));
 
   // fully saturated global function
-  if (ghc && args.length !== 0 && arity === args.length && !isLocalId(i) && isStrictId(i)) {
+  // Core-to-STG may canonicalize a worker reference through the generated
+  // demand-worker spelling (`$dw...`); both are private worker entry points.
+  if (ghc && args.length !== 0 && arity === args.length && !isLocalId(i) && isDirectJumpStrict(i)) {
     const vars = args.flatMap((a) => genArg(gs, a));
     return [jumpToII(gs, i, vars, loadFun), "ExprCont"];
   }
 
   // oversaturated function: push extra args as a continuation, then jump
-  if (ghc && arity !== undefined && arity < args.length && isStrictId(i) && arity > 0) {
+  if (ghc && arity !== undefined && arity < args.length && isDirectJumpStrict(i) && arity > 0) {
     const reg = args.slice(0, arity);
     const over = args.slice(arity);
     const vars = reg.flatMap((a) => genArg(gs, a));
@@ -440,7 +470,7 @@ export function genBind(gs: GenState, ctx: ExprCtx, bndr: StgBinding): [JStgStat
     if (r.tag === "StgRhsClosure" && r.args.length === 0) {
       const sel = matchSelectorThunk(gs, b, r.body);
       if (sel !== undefined) return sel;
-      if (isInlineExpr(r.body)) {
+      if (isInlineExpr(r.body, ctx.ctxEval)) {
         const d = declVarsForId(gs, b);
         const tgt = varsForId(gs, b);
         const ictx = ctxSetTarget(assocIdExprs(b, tgt), ctx);
@@ -456,13 +486,18 @@ export function genBind(gs: GenState, ctx: ExprCtx, bndr: StgBinding): [JStgStat
   if (bndr.tag === "StgNonRec") {
     const ja = assign(bndr.binder, bndr.rhs);
     const j = ja !== undefined ? ja : allocCls(gs, undefined, [[bndr.binder, bndr.rhs]]);
-    return [j, ctx];
+    const evaluated = bndr.rhs.tag === "StgRhsCon" ||
+      (bndr.rhs.tag === "StgRhsClosure" && bndr.rhs.update === UpdateFlag.ReEntrant);
+    return [j, evaluated ? ctxAddEval([bndr.binder], ctx) : ctx];
   }
   const jas = bndr.pairs.map(([b, r]) => assign(b, r));
   const defined = jas.filter((x): x is JStgStat => x !== undefined);
   const m = jas.length === 0 ? undefined : mconcatJStgStat(defined);
   const rest = bndr.pairs.filter((_, k) => jas[k] === undefined);
-  return [allocCls(gs, m, rest), ctx];
+  const evaluated = bndr.pairs
+    .filter(([, r]) => r.tag === "StgRhsCon" || (r.tag === "StgRhsClosure" && r.update === UpdateFlag.ReEntrant))
+    .map(([b]) => b);
+  return [allocCls(gs, m, rest), ctxAddEval(evaluated, ctx)];
 }
 
 /** The `assign` clause of genBind that recognises a record selector thunk and
@@ -792,8 +827,6 @@ export function genStaticRefs(gs: GenState, lv: LiveVars): CIStatic {
   return { staticRefs: refs };
 }
 
-const slotKey = (s: StackSlot): string => (s.tag === "SlotUnknown" ? "?" : `${s.id.unique}|${s.size}`);
-
 /** Reorder the things we need to push to reuse existing stack values as much
  * as possible. The Bool is True if the value is already on the stack at that
  * location. */
@@ -807,6 +840,7 @@ export function optimizeFree(gs: GenState, offset: number, ids: Binder[]): Array
   const window: StackSlot[] = Array.from({ length: l }, (_, k) => all[k] ?? slotUnknown).slice(offset);
 
   // M.fromList keeps the last binding for duplicate keys
+  const slotKey = (s: StackSlot): string => (s.tag === "SlotUnknown" ? "?" : `${s.id.unique}|${s.size}`);
   const slm = new Map<string, number>();
   window.forEach((s, k) => slm.set(slotKey(s), k));
 
@@ -831,15 +865,9 @@ export function allocCls(gs: GenState, dynMiddle: JStgStat | undefined, xs: Arra
   const stat: JStgStat[] = [];
   const dyn: ClsEntry[] = [];
   for (const [i, rhs] of xs) {
-    // GHC's `toCl` has three cases, and the nullary one comes first: a
-    // no-argument constructor is `allocCon`'d, which for `Bool` and the other
-    // unboxable types yields the static value rather than a fresh - and so
-    // always truthy - closure.
-    if (rhs.tag === "StgRhsCon" && rhs.args.length === 0) {
-      const ii = identForId(gs, i);
-      stat.push(mconcatJStgStat([decl(ii), allocCon(gs, ii, rhs.con, [])]));
-      continue;
-    }
+    // Match GHCJS: zero-argument constructors remain dynamic here. GHCJS
+    // deliberately does not make them static because doing so changes the
+    // heap-object representation expected by selectors and continuations.
     if (rhs.tag === "StgRhsCon" && rhs.args.length === 1 && isUnboxableCon(rhs.con)) {
       // statics
       const ii = identForId(gs, i);
@@ -894,7 +922,7 @@ export function genCase(
     }
   }
 
-  if (isInlineExpr(e)) {
+  if (isInlineExpr(e, ctx.ctxEval)) {
     const bndi = identsForId(gs, bnd);
     const ctx_ = ctxSetTop(bnd, ctxSetTarget(assocIdExprs(bnd, bndi.map(Var)), ctx));
     const [ej, r] = genExpr(gs, ctx_, e);
@@ -927,7 +955,10 @@ export function genRet(
   const ctx_ = ctxLneShrinkStack(ctx, lneLive);
   const lneVars = ctxLneFrameVars(ctx_).map(([v]) => v);
   const isLne = (i: Binder): boolean => ctxIsLneBinding(ctx, i) || ctxIsLneLiveVar(ctx_, i);
-  const nonLne = [...l.values()].filter((i) => !isLne(i));
+  // GHC's FloatOut values are top-level static references, not dynamic
+  // continuation payloads. Keeping them in the frame turns a literal-only
+  // case (for example enum ranking) into an unnecessary h$p4 frame.
+  const nonLne = [...l.values()].filter((i) => !isLne(i) && i.staticValue !== true && i.topLevel !== true);
 
   const altRegs = ((): JSRep[] => {
     switch (at.tag) {
@@ -1024,6 +1055,32 @@ export function genAlts(
       case "AlgAlt": {
         if (alts.length === 1 && at.typeName.startsWith("(#")) {
           throw new Error("genAlts: unexpected unboxed tuple");
+        }
+        // Bool is represented as a raw JS boolean, not a heap constructor. A
+        // source case commonly has one explicit Bool alternative and a
+        // DEFAULT (for example `when`/`freeable`); the pattern matcher may
+        // leave that DEFAULT in place when it cannot refine the type. Treat
+        // the DEFAULT as the other Boolean branch instead of reading `.f.a`.
+        if (
+          alts.length === 2 &&
+          alts.some((a) => a.con.tag === "DataAlt" && isBoolDataCon(a.con.con)) &&
+          alts.some((a) => a.con.tag === "DEFAULT")
+        ) {
+          const explicit = alts.find((a) => a.con.tag === "DataAlt" && isBoolDataCon(a.con.con))!;
+          const fallback = alts.find((a) => a.con.tag === "DEFAULT")!;
+          const [r, nbs] = normalizeBranches(
+            ctx,
+            [explicit, fallback].map((a) => isolateSlots(st, () => mkAlgBranch(gs, ctx, e, a))),
+          );
+          if (nbs.length !== 2) throw new Error("genAlts: invalid branches for Bool default");
+          const [explicitBranch, fallbackBranch] = nbs;
+          const value = varForId(gs, e);
+          const explicitIsTrue = explicit.con.tag === "DataAlt" && explicit.con.con.tag === 2;
+          const s: JStgStat = explicitIsTrue
+            ? { tag: "IfStat", cond: value, then: explicitBranch.branch_stat, else: fallbackBranch.branch_stat }
+            : { tag: "IfStat", cond: value, then: fallbackBranch.branch_stat, else: explicitBranch.branch_stat };
+          setSlots(st, []);
+          return [s, r];
         }
         if (alts.length === 1) {
           const b = mkAlgBranch(gs, ctx, e, alts[0]);
@@ -1257,13 +1314,25 @@ export function branchResult(xs: ExprResult[]): ExprResult {
 /** Push return arguments onto the stack. The Bool tracks whether the value is
  * already on the stack or not, used in 'StgToJS.Stack.pushOptimized'. */
 export function pushRetArgs(gs: GenState, free: Array<[Binder, number, boolean]>, fun: JStgExpr): JStgStat {
-  const rs = free.map(([i, n, b]): [JStgExpr, boolean] => [genIdArg(gs, i)[n - 1], b]);
+  const rs = free.map(([i, n, b]): [JStgExpr, boolean] => {
+    const vars = genIdArg(gs, i);
+    const value = vars[n - 1];
+    if (value === undefined)
+      throw new Error(`pushRetArgs: binder ${i.name}#${i.unique} has no slot ${n} (width ${vars.length})`);
+    return [value, b];
+  });
   return pushOptimized(stackState(gs), getSettings(gs), [...rs, [fun, false]]);
 }
 
 /** Load the return arguments then pop the stack frame */
 export function loadRetArgs(gs: GenState, free: Array<[Binder, number, boolean]>): JStgStat {
-  const ids = free.map(([i, n]) => genIdStackArgI(gs, i)[n - 1]);
+  const ids = free.map(([i, n]) => {
+    const vars = genIdStackArgI(gs, i);
+    const value = vars[n - 1];
+    if (value === undefined)
+      throw new Error(`loadRetArgs: binder ${i.name}#${i.unique} has no slot ${n} (width ${vars.length})`);
+    return value;
+  });
   return popSkipI(stackState(gs), 1, ids);
 }
 

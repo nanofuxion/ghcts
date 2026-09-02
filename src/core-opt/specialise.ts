@@ -9,9 +9,10 @@
  * Only `$f…` arguments are treated as dictionaries, so an ordinary function
  * that happens to take a CAF is left alone.
  */
-import type { CoreAlt, CoreBind, CoreExpr, CoreProgram } from "../core.js";
+import type { CoreBind, CoreExpr, CoreProgram } from "../core.js";
 import { coreFreeVars, mkLams } from "../core.js";
 import { mkBinder, type Binder } from "../stg.js";
+import { copy } from "./inline.js";
 
 const dictName = (e: CoreExpr): string | undefined =>
   e.tag === "Var" && e.binder.name.startsWith("$f") ? e.binder.name : undefined;
@@ -34,53 +35,6 @@ function lambdas(e: CoreExpr): { params: Binder[]; body: CoreExpr } {
     body = body.body;
   }
   return { params, body };
-}
-
-function copy(e: CoreExpr, sub: Map<number, CoreExpr>, fresh: Map<number, Binder>): CoreExpr {
-  const rename = (b: Binder): Binder => {
-    const out: Binder = { ...b, unique: mkBinder(b.name).unique };
-    fresh.set(b.unique, out);
-    return out;
-  };
-  switch (e.tag) {
-    case "Var": {
-      const s = sub.get(e.binder.unique);
-      if (s) return s;
-      const f = fresh.get(e.binder.unique);
-      return f ? { tag: "Var", binder: f } : e;
-    }
-    case "Lit":
-      return e;
-    case "App":
-      return { tag: "App", fn: copy(e.fn, sub, fresh), arg: copy(e.arg, sub, fresh) };
-    case "Lam": {
-      const b = rename(e.binder);
-      return { tag: "Lam", binder: b, body: copy(e.body, sub, fresh) };
-    }
-    case "Let": {
-      if (e.bind.tag === "NonRec") {
-        const rhs = copy(e.bind.rhs, sub, fresh);
-        const b = rename(e.bind.binder);
-        return { tag: "Let", bind: { tag: "NonRec", binder: b, rhs }, body: copy(e.body, sub, fresh) };
-      }
-      const bs = e.bind.pairs.map(([b]) => rename(b));
-      const pairs = e.bind.pairs.map(([, r], i) => [bs[i]!, copy(r, sub, fresh)] as [Binder, CoreExpr]);
-      return { tag: "Let", bind: { tag: "Rec", pairs }, body: copy(e.body, sub, fresh) };
-    }
-    case "Case": {
-      const scrutinee = copy(e.scrutinee, sub, fresh);
-      const binder = rename(e.binder);
-      const alts: CoreAlt[] = e.alts.map((a) => {
-        const binders = a.binders.map(rename);
-        return { con: a.con, binders, body: copy(a.body, sub, fresh) };
-      });
-      return { tag: "Case", scrutinee, binder, alts };
-    }
-    case "Con":
-      return { tag: "Con", con: e.con, args: e.args.map((a) => copy(a, sub, fresh)) };
-    case "Op":
-      return { tag: "Op", op: e.op, arity: e.arity, args: e.args.map((a) => copy(a, sub, fresh)) };
-  }
 }
 
 /** Does this expression bind a `static e` form? `sptFingerprint` is set on
@@ -138,17 +92,65 @@ function hasStaticPtr(e: CoreExpr): boolean {
 const specKey = (fn: string, dicts: string[]): string => `$s${fn}$${dicts.map((d) => d.slice(2)).join("$")}`;
 
 const dictMethod = (sel: string, dict: string, names: ReadonlySet<string>): string | undefined => {
-  const impl = `$c${dict.slice(2)}$${sel}`;
-  return names.has(impl) ? impl : undefined;
+    const suffix = dict.slice(2);
+    const impl = `$f${suffix}_$c${sel}`;
+    if (names.has(impl)) return impl;
+    // Keep consuming older elaborated programs while the canonical name is
+    // being adopted throughout the pipeline.
+    const legacy = `$c${suffix}$${sel}`;
+    return names.has(legacy) ? legacy : undefined;
 };
 
-export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
+// These selectors are the defaults whose result is immediately projected or
+// further specialized.  A default body commonly contains `fst (divMod ...)`;
+// the generic application walk marks the argument to `fst` lazy, but that
+// would incorrectly hide the known dictionary from the nested selector.
+const integralDefaults = new Set(["div", "divMod", "quot", "quotRem", "rem", "mod"]);
+// Miso's concrete JS marshalling instance methods carry INLINE pragmas in
+// the GHC source. Keep their dictionary projections unfoldable even when the
+// call sits in a lazy dictionary field; the pragma is the source-level proof
+// that this is the intended representation-preserving rewrite.
+const inlineMarshalMethod = (name: string): boolean =>
+  /(?:from|to)JS(?:Val|Value)/.test(name);
+
+export function specialiseKnownDicts(program: CoreProgram, options: { inlineGenerated?: boolean; lowerStaticPtrProjection?: boolean } = {}): CoreProgram {
   const rhsOf = new Map<string, { binder: Binder; rhs: CoreExpr }>();
   for (const b of program.binds) {
     const pairs = b.tag === "NonRec" ? [[b.binder, b.rhs] as const] : b.pairs.map((p) => [p[0], p[1]] as const);
     for (const [binder, rhs] of pairs) rhsOf.set(binder.name, { binder, rhs });
   }
   const names = new Set(rhsOf.keys());
+  // GHC's simplifier collapses a top-level `f = g` binding when it is used as
+  // a value.  This matters for the native marshal path: dictionary fields are
+  // frequently wired through several zero-argument aliases before reaching
+  // the actual foreign import.  Only direct top-level aliases qualify; local
+  // bindings and lambdas retain their ordinary sharing semantics.
+  const aliases = new Map<number, Binder>();
+  for (const { binder, rhs } of rhsOf.values()) {
+    const direct = lambdas(rhs);
+    // A source-level `ptr = static handler` is represented as an alias to the
+    // floated `$staticN` binding. Unlike ordinary aliases, that binding has
+    // static-pointer identity and must not be canonicalised through a generic
+    // value substitution.
+    if (
+      direct.params.length === 0 &&
+      direct.body.tag === "Var" &&
+      direct.body.binder.unique !== binder.unique &&
+      direct.body.binder.sptFingerprint === undefined
+    )
+      aliases.set(binder.unique, direct.body.binder);
+  }
+  const aliasTarget = (binder: Binder): Binder => {
+    const seen = new Set<number>();
+    let out = binder;
+    while (!seen.has(out.unique)) {
+      seen.add(out.unique);
+      const next = aliases.get(out.unique);
+      if (!next) break;
+      out = next;
+    }
+    return out;
+  };
   const topUniques = new Set<number>();
   for (const { binder } of rhsOf.values()) topUniques.add(binder.unique);
   const specs = new Map<string, Binder>();
@@ -159,7 +161,17 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
     const hit = specs.get(key);
     if (hit) return hit;
     if (names.has(key)) return rhsOf.get(key)?.binder;
-    const src = rhsOf.get(fn);
+    // Class selectors such as `div` have only the dictionary projection as
+    // their RHS. When an instance supplies no concrete `$c...$div` binding,
+    // specialize the class default method instead; its remaining lambdas are
+    // the actual numeric arguments. Specializing the selector itself creates
+    // a zero-argument case and loses those lambdas.
+    const defaultMethod = fn === "div" ? "$dmIntegral$div" :
+      fn === "divMod" ? "$dmIntegral$divMod" :
+      fn === "quot" ? "$dmIntegral$quot" :
+      fn === "rem" ? "$dmIntegral$rem" :
+      fn === "mod" ? "$dmIntegral$mod" : undefined;
+    const src = defaultMethod ? (rhsOf.get(defaultMethod) ?? rhsOf.get(fn)) : rhsOf.get(fn);
     if (!src) return undefined;
     const { params, body } = lambdas(src.rhs);
     if (params.length < dicts.length) return undefined;
@@ -169,7 +181,7 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
       if (!found) return undefined;
       dictVars.push({ tag: "Var", binder: found.binder });
     }
-    const sub = new Map<number, CoreExpr>();
+    const sub = new Map<number | Binder, CoreExpr>();
     params.slice(0, dicts.length).forEach((p, i) => sub.set(p.unique, dictVars[i]!));
     const specialised = mkLams(params.slice(dicts.length), copy(body, sub, new Map()));
     // A copy is only usable if everything it still names is in scope where it
@@ -195,22 +207,68 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
     return binder;
   };
 
-  const go = (e: CoreExpr): CoreExpr => {
+  // A dictionary method appearing as a constructor field is still lazy. Do
+  // not turn that field into a direct call: GHC keeps the call in a thunk (and
+  // evaluates it only when the field is demanded). The old unconditional
+  // rewrite changed the evaluation order and showed up as a `call` instead of
+  // `let` in the STG differential corpus.
+  const unrolling = new Set<string>();
+  const go = (e: CoreExpr, lazy = false): CoreExpr => {
     switch (e.tag) {
-      case "Var":
+      case "Var": {
+        const target = aliasTarget(e.binder);
+        return target === e.binder ? e : { tag: "Var", binder: target };
+      }
       case "Lit":
         return e;
       case "App": {
         const { head, args } = spine(e);
-        const done = args.map(go);
-        if (head.tag === "Var" && done.length > 0) {
+        const done = args.map((arg) => go(arg, true));
+        if (options.lowerStaticPtrProjection && head.tag === "Var" && head.binder.name === "deRefStaticPtr" && done.length === 1) {
+          const p = done[0];
+          if (p?.tag === "Var") {
+            let ptr = rhsOf.get(p.binder.name)?.rhs;
+            const seen = new Set<string>();
+            while (ptr?.tag === "Var" && !seen.has(ptr.binder.name)) {
+              seen.add(ptr.binder.name);
+              ptr = rhsOf.get(ptr.binder.name)?.rhs;
+            }
+            if (ptr?.tag === "Con" && ptr.con.name === "StaticPtr") {
+              const value = mkBinder("staticPtrValue");
+              return {
+                tag: "Case",
+                scrutinee: p,
+                binder: mkBinder("staticPtr"),
+                alts: [{ con: { tag: "DataAlt", con: ptr.con }, binders: [mkBinder("staticPtrKey"), value], body: { tag: "Var", binder: value } }],
+              };
+            }
+          }
+        }
+        // Selecting a concrete equality method does not evaluate the method's
+        // arguments. Generated Eq dictionaries reach their concrete methods
+        // through lazy fields, so permit this one selector there. Keep other
+        // dictionary methods behind the lazy barrier: recursively expanding
+        // every lazy dictionary call can copy cyclic generated dictionaries.
+        const lazyEq = head.tag === "Var" && (head.binder.name === "==" || head.binder.name.endsWith("$=="));
+        if ((!lazy || lazyEq || (head.tag === "Var" && integralDefaults.has(head.binder.name)) || (head.tag === "Var" && inlineMarshalMethod(head.binder.name))) && head.tag === "Var" && done.length > 0) {
           const d0 = dictName(done[0]!);
           if (d0) {
             const implName = dictMethod(head.binder.name, d0, names);
             if (implName) {
-              const impl = rhsOf.get(implName)?.binder;
-              if (impl)
+              const implInfo = rhsOf.get(implName);
+              const impl = implInfo?.binder;
+              if (impl) {
+                // Primitive FromJSVal/FromJSValue methods are often emitted as
+                // zero-argument aliases to a foreign import. They are values,
+                // not lambda candidates, so canonicalise the alias here just
+                // as GHC's Simplifier does when it selects the dictionary
+                // field. Keeping the wrapper adds a closure entry on every
+                // native event decode.
+                const direct = lambdas(implInfo.rhs);
+                if (direct.params.length === 0 && direct.body.tag === "Var")
+                  return done.slice(1).reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), { tag: "Var", binder: direct.body.binder });
                 return done.slice(1).reduce<CoreExpr>((fn, arg) => ({ tag: "App", fn, arg }), { tag: "Var", binder: impl });
+              }
             }
             {
               const dicts: string[] = [];
@@ -220,6 +278,30 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
                 dicts.push(n);
               }
               const spec = ensure(head.binder.name, dicts);
+              if (spec)
+                if (options.inlineGenerated) {
+                  const generated = rhsOf.get(spec.name);
+                  const lam = generated && lambdas(generated.rhs);
+                  const callArgs = done.slice(dicts.length);
+                  // A specialisation that calls itself would be unrolled
+                  // without end: GHC never inlines a loop breaker, and this
+                  // one keeps a call to a copy already being unrolled as the
+                  // call it is.
+                  if (lam && lam.params.length === callArgs.length && !unrolling.has(spec.name)) {
+                    const sub = new Map<number | Binder, CoreExpr>();
+                    lam.params.forEach((p, i) => sub.set(p.unique, callArgs[i]!));
+                    // The generated default may immediately call another
+                    // class default (Integral.div -> divMod -> quotRem).
+                    // Continue through the copied body so its now-concrete
+                    // dictionary arguments are specialized as well.
+                    unrolling.add(spec.name);
+                    try {
+                      return go(copy(lam.body, sub, new Map()));
+                    } finally {
+                      unrolling.delete(spec.name);
+                    }
+                  }
+                }
               if (spec)
                 return done
                   .slice(dicts.length)
@@ -234,8 +316,8 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
       case "Let": {
         const bind: CoreBind =
           e.bind.tag === "NonRec"
-            ? { tag: "NonRec", binder: e.bind.binder, rhs: go(e.bind.rhs) }
-            : { tag: "Rec", pairs: e.bind.pairs.map(([b, r]) => [b, go(r)] as [Binder, CoreExpr]) };
+              ? { tag: "NonRec", binder: e.bind.binder, rhs: go(e.bind.rhs, lazy) }
+            : { tag: "Rec", pairs: e.bind.pairs.map(([b, r]) => [b, go(r, lazy)] as [Binder, CoreExpr]) };
         return { tag: "Let", bind, body: go(e.body) };
       }
       case "Case":
@@ -246,9 +328,9 @@ export function specialiseKnownDicts(program: CoreProgram): CoreProgram {
           alts: e.alts.map((a) => ({ ...a, body: go(a.body) })),
         };
       case "Con":
-        return { tag: "Con", con: e.con, args: e.args.map(go) };
+        return { tag: "Con", con: e.con, args: e.args.map((arg) => go(arg, true)) };
       case "Op":
-        return { tag: "Op", op: e.op, arity: e.arity, args: e.args.map(go) };
+        return { tag: "Op", op: e.op, arity: e.arity, args: e.args.map((arg) => go(arg, false)) };
     }
   };
 

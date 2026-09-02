@@ -19,9 +19,9 @@
  * one-constructor type over a primitive field; a `[Char]` is walked into a JS
  * string, which is the one thing `putStrLn` would otherwise be for.
  */
-import { readFileSync, statSync } from "node:fs";
+import { createContext, runInContext } from "node:vm";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { walk } from "../dist/compiler.js";
 import { renderRts } from "../dist/stg-js/rts.js";
 import { renderStaticRts } from "../dist/stg-js/rts-static.js";
 import { stgToJS, renderModule } from "../dist/stg-js/codegen.js";
@@ -30,12 +30,25 @@ import { parseModule } from "../dist/parser.js";
 import { elaborateProgram, USER_MAIN } from "../dist/elaborate.js";
 import { desugarModule } from "../dist/desugar.js";
 import { coreToStg } from "../dist/core-to-stg.js";
+import { optimiseCore } from "../dist/build.js";
 import { formatDiagnostic } from "../dist/diagnostics.js";
 
 const show = process.argv.includes("--print");
 const forceThreaded = process.argv.includes("--threaded");
+/** `--only <text>`: run just the corpus programs whose name contains it. */
+const only = process.argv.includes("--only") ? process.argv[process.argv.indexOf("--only") + 1] : undefined;
 const config = defaultStgToJSConfig;
 const rts = renderRts(config) + "\n" + renderStaticRts(config);
+
+function walk(root) {
+  const out = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = resolve(root, entry.name);
+    if (entry.isDirectory()) out.push(...walk(path));
+    else if (entry.isFile()) out.push(path);
+  }
+  return out;
+}
 
 /** Test-only scaffolding: a stack, a trampoline and a stop frame that
  * captures R1 so a program's value can be read back. GHC's own h$main
@@ -107,10 +120,16 @@ function h$runThreaded(c) {
  * `sources` is a list of `{ file, source }`; the module named `Main` is the
  * root, and the rest are reachable only through its imports, exactly as
  * `src/modules.ts` resolves them. */
-function compile(sources, file) {
+function compile(sources, file, optimise) {
   const modules = new Map();
   for (const unit of sources) {
-    const parsed = parseModule(unit.source, unit.file);
+    // Built-in probes are snippets rather than complete Cabal modules; keep
+    // their source concise while still giving StaticPtr probes the extension
+    // pragma that a real GHC source file must carry.
+    const source = /\bstatic\b/.test(unit.source) && !/LANGUAGE[^\n]*StaticPointers/.test(unit.source)
+      ? "{-# LANGUAGE StaticPointers #-}\n" + unit.source
+      : unit.source;
+    const parsed = parseModule(source, unit.file);
     if (parsed.diagnostics.some((d) => d.severity === "error")) {
       throw new Error(parsed.diagnostics.map(formatDiagnostic).join("\n"));
     }
@@ -122,7 +141,11 @@ function compile(sources, file) {
     throw new Error(elaborated.diagnostics.map(formatDiagnostic).join("\n"));
   }
   const desugared = desugarModule(elaborated.module, file);
-  const stg = coreToStg(desugared.program);
+  // What a real build runs. Every program goes through both, because the
+  // Core-to-Core passes have miscompiled things the plain lowering got right,
+  // and the unit tests never see a program run.
+  const program = optimise ? optimiseCore(desugared.program, { roots: ["main"] }) : desugared.program;
+  const stg = coreToStg(program);
   const units = stgToJS(config, { unitId: "main", moduleName: "Main" }, stg.bindings);
   const emitted = renderModule(config, units);
   const mainBinder = stg.bindings
@@ -134,7 +157,15 @@ function compile(sources, file) {
     emitted,
     symbol: unit.luObjBlock.oiSymbols[0],
     // An IO main is wrapped, and the wrapper is applied rather than entered.
-    wrapped: stg.bindings.some((b) => b.tag === "StgNonRec" && b.binder.name === USER_MAIN),
+    // ... or, once the optimiser has inlined that wrapper away, a `main` that
+    // is itself a function of the void state token: an IO action as GHC
+    // shapes it, to be applied with h$ap_1_0 rather than entered.
+    wrapped: stg.bindings.some(
+      (b) =>
+        b.tag === "StgNonRec" &&
+        (b.binder.name === USER_MAIN ||
+          (b.binder.name === "main" && b.rhs.tag === "StgRhsClosure" && b.rhs.args.length > 0 && b.rhs.args.every((a) => a.arity === 0))),
+    ),
     diagnostics: [...elaborated.diagnostics, ...desugared.diagnostics],
   };
 }
@@ -163,7 +194,10 @@ function run(emitted, symbol, probe, threaded, wrapped, bundled) {
     ? `h$runThreaded(${symbol})`
     : wrapped
       ? `h$runWrapped(${symbol})`
-      : `h$runEntry(function(){ h$r1 = ${symbol}; return h$r1.f; })`;
+      : // A `main` the optimiser reduced to a constructor is emitted the way
+        // any static constructor is - an unboxable `I 42` is the bare number -
+        // so there is nothing to enter; only a closure gets the trampoline.
+        `(function(){ var c = ${symbol}; return c !== null && typeof c === "object" ? h$runEntry(function(){ h$r1 = c; return c.f; }) : c; })()`;
   const body =
     `${rts}\n${bootstrap}\n${emitted}\n;var h$testEntry = (function(){ h$initStatic.forEach(function(f){f();}); h$initStatic.length = 0;` +
     ` return { value: ${enter}, probed: ${probe ?? "undefined"},` +
@@ -174,7 +208,16 @@ function run(emitted, symbol, probe, threaded, wrapped, bundled) {
   // and webpack wrap each module, so an RTS symbol reached through
   // `globalThis['h$...']` rather than by name reads back `undefined` there and
   // nowhere else. That divergence is invisible under a plain eval.
-  const entry = (0, eval)(bundled ? `(function(){ ${body} return h$testEntry; })()` : `${body} h$testEntry`);
+  // `GHCTS_HS_RUN_DUMP=<file>` writes the exact script that is about to run,
+  // RTS included, so a wrong answer can be re-run under node with a
+  // `console.log` patched into one entry function.
+  if (process.env.GHCTS_HS_RUN_DUMP) writeFileSync(process.env.GHCTS_HS_RUN_DUMP, `${body}\nglobalThis.h$testEntry = h$testEntry;\n`);
+  // Each program gets a global object of its own, as a plain script would:
+  // sharing one globalThis let a probe counter or an updated CAF from one run
+  // leak into the next, so a program's -O run failed only after its plain run.
+  const context = createContext({ console, process, setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate, queueMicrotask, TextEncoder, TextDecoder, URL, performance });
+  context.globalThis = context;
+  const entry = runInContext(bundled ? `(function(){ ${body} return h$testEntry; })()` : `${body} h$testEntry`, context, { filename: "hs-run.js" });
   const { value, probed, force } = entry();
   if (probe !== undefined) return probed;
   // `Int`, `Char` and `Bool` arrive as plain JS values: the backend unboxes a
@@ -519,12 +562,12 @@ const programs = [
   {
     name: "error raises",
     source: 'module Main where\nmain = error "boom"\n',
-    throws: "Prelude.error",
+    throws: "boom",
   },
   {
     name: "head of an empty list raises through error",
     source: "module Main where\nmain = head []\n",
-    throws: "Prelude.error",
+    throws: "Prelude.head: empty list",
   },
   // Either.
   {
@@ -1069,7 +1112,7 @@ const programs = [
     // frontend evaluates. If it did not evaluate, this would return 1.
     name: "seq forces its first argument",
     source: 'module Main where\nmain :: Int\nmain = seq (error "forced") 1\n',
-    throws: "Prelude.error",
+    throws: "forced",
   },
   {
     // An action built but never run must have no effect: that is the whole
@@ -4084,9 +4127,26 @@ const programs = [
     ].join("\n"),
     expect: "1:02:05 1:05 0:05",
   },
+  {
+    // The sign of the bignum carrier is a `Bool` field. GHC's JS backend keeps
+    // `Bool` as a raw `true`/`false`, so a nullary constructor argument has to
+    // be the constructor worker (`false`), never a let-bound `h$c0(...)`
+    // closure - which is truthy, and flipped every one of these negative.
+    name: "a nullary Bool field is a raw boolean, so Integer keeps its sign",
+    source: [
+      "module Main where",
+      "import Data.Word (Word64)",
+      "import GHC.Fingerprint (Fingerprint(Fingerprint))",
+      "",
+      "main :: [Char]",
+      "main = show (1 :: Integer) ++ \" \" ++ show (1 :: Word64) ++ \" \" ++ show (2 :: Word64) ++ \" \" ++ show (Fingerprint 1 2)",
+      "",
+    ].join("\n"),
+    expect: "1 1 2 00000000000000010000000000000002",
+  },
 ];
 
-const file = process.argv.slice(2).find((a) => !a.startsWith("--"));
+const file = process.argv.slice(2).find((a, k, all) => !a.startsWith("--") && all[k - 1] !== "--only");
 /** A *directory* on the command line is the multi-module program; a file is
  * only itself. Pulling in the named file's whole directory - what this used to
  * do - silently merged every scratch `module Main` sitting beside it into one
@@ -4110,10 +4170,11 @@ const cases = file
     }));
 
 let failures = 0;
-for (const program of cases) {
+for (const base of cases) for (const optimise of [false, true]) {
+  const program = optimise ? { ...base, name: `${base.name} [-O]` } : base;
   let compiled;
   try {
-    compiled = compile(program.sources, file ?? `${program.name}.hs`);
+    compiled = compile(program.sources, file ?? `${base.name}.hs`, optimise);
   } catch (cause) {
     console.log(`  FAIL  ${program.name}: ${cause instanceof Error ? cause.message : cause}`);
     failures++;
@@ -4127,6 +4188,7 @@ for (const program of cases) {
     failures++;
     continue;
   }
+  if (only !== undefined && !program.name.includes(only)) continue;
   try {
     const result = run(compiled.emitted, compiled.symbol, program.probe, program.threaded || forceThreaded, compiled.wrapped, program.bundled);
     if (program.throws !== undefined) {
@@ -4151,5 +4213,5 @@ for (const program of cases) {
   }
 }
 
-console.log(`\n${cases.length - failures}/${cases.length} Haskell programs compiled and ran`);
+console.log(`\n${cases.length * 2 - failures}/${cases.length * 2} Haskell programs compiled and ran, plain and -O`);
 process.exit(failures ? 1 : 0);

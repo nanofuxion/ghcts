@@ -30,12 +30,22 @@ export interface Binder {
   name: string;
   /** Unique within a module; supplies the `_u` suffix on generated names. */
   unique: number;
+  /** Defining module for a top-level imported binding. The frontend flattens
+   * Core names for resolution, but StgToJS must still emit the binding in the
+   * package/module namespace GHC compiled it in. Local binders leave this
+   * unset and use the current codegen module. */
+  definingUnitId?: string;
+  definingModuleName?: string;
   /** How many JS values this binder occupies - see JSRep/varSize. A void
    * binder occupies none and is dropped entirely by codegen. */
   arity?: number;
   /** Set on a top-level binder that other modules can reference. Codegen also
    * reads it as GHC's `isGlobalId` - see `liveVars` in src/stg-js/utils.ts. */
   exported?: boolean;
+  /** Binder is a module-level binding, including compiler-generated workers.
+   * This is distinct from `exported`: GHC's internal top-level workers are
+   * local symbols but are still non-local Ids for saturated direct apply. */
+  topLevel?: boolean;
   /** GHC's `isNothing (nameModule_maybe (idName i))`: this name was invented by
    * the compiler and belongs to no module, so nothing outside can ever spell
    * it. Only `GHC.StgToJS.Sinker` asks (src/stg-js/sinker.ts), and only about
@@ -60,6 +70,8 @@ export interface Binder {
   singleEntry?: boolean;
   /** The binder is known to be strict/evaluated at its use site. */
   strict?: boolean;
+  /** GHC's separate proof that a known-arity entry may use direct apply. */
+  directJumpEligible?: boolean;
   evaluated?: boolean;
   /** The binding is entered at most once (GHC's one-shot information). */
   oneShot?: boolean;
@@ -70,6 +82,17 @@ export interface Binder {
   nativeEligible?: boolean;
   /** Result representation proven by the narrow native-candidate analysis. */
   nativeResultRep?: "i32" | "f64" | "bool" | "string";
+  /** Source-level primitive representation retained for worker/wrapper. */
+  primitiveRep?: "Int" | "Bool" | "Double" | "Float" | "Word" | "Char" | "JSVal" | "JSString";
+  parameterReps?: Array<"Int" | "Bool" | "Double" | "Float" | "Word" | "Char" | "JSVal" | "JSString">;
+  /** Source declaration carried an explicit GHC INLINE pragma. */
+  inline?: boolean;
+  /** Closed floated value that lives at a top-level static binding. */
+  staticValue?: boolean;
+  /** Boxed result type retained from elaboration for CPR/worker-wrapper. */
+  resultRep?: "boxed-int";
+  /** Case alternative binder already carries an unboxed Int payload. */
+  unboxedInt?: true;
   /** 128-bit static-pointer fingerprint as two Word64 halves. Set on the
    * binder of each `static e` form so StgToJS can push `h$hs_spt_insert`
    * onto `h$initStatic` the way GHC's `initStaticPtrs` does. */
@@ -104,11 +127,21 @@ export type Literal =
 export interface DataCon {
   name: string;
   unique: number;
+  /** Defining module for an imported constructor. The STG backend derives a
+   * worker Binder from this record, so provenance must survive that step. */
+  definingUnitId?: string;
+  definingModuleName?: string;
   /** 1-based, in declaration order. The RTS compares against this. */
   tag: number;
   arity: number;
   /** The type this constructor belongs to, for `AlgAlt` dispatch. */
   typeName: string;
+  /** Source field representations, when known. */
+  fieldReps?: Array<"boxed-int" | "other">;
+  /** Fields delivered as raw machine values when pattern-matched. */
+  fieldUnboxed?: boolean[];
+  /** A newtype's constructor: erased by `src/erase-newtypes.ts`, never built. */
+  newtype?: true;
 }
 
 /** An unboxed tuple, spelled `(#,#)` as GHC spells it. It is not a heap
@@ -226,6 +259,6 @@ let nextUnique = 0;
 export function mkBinder(name: string, extra: Partial<Binder> = {}): Binder {
   return { name, unique: nextUnique++, ...extra };
 }
-export function mkDataCon(name: string, tag: number, arity: number, typeName: string): DataCon {
-  return { name, unique: nextUnique++, tag, arity, typeName };
+export function mkDataCon(name: string, tag: number, arity: number, typeName: string, fieldReps?: DataCon["fieldReps"]): DataCon {
+  return { name, unique: nextUnique++, tag, arity, typeName, ...(fieldReps ? { fieldReps } : {}) };
 }
