@@ -1,0 +1,130 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GHC in the browser</title>
+<style>
+  :root { color-scheme: light dark; --edge: #8883; }
+  body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+  header { display: flex; gap: .75rem; align-items: center; padding: .6rem .9rem; border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
+  h1 { font-size: 1rem; margin: 0 .5rem 0 0; font-weight: 600; }
+  button { font: inherit; padding: .3rem .8rem; border: 1px solid var(--edge); border-radius: 6px; background: transparent; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: #888; margin-left: auto; }
+  main { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+  textarea, pre { margin: 0; padding: .8rem; font: 13px/1.5 ui-monospace, monospace; border: 0; background: transparent; color: inherit; }
+  textarea { resize: none; border-right: 1px solid var(--edge); }
+  pre { overflow: auto; white-space: pre-wrap; }
+  #files { font: 12px ui-monospace, monospace; color: #888; }
+</style>
+
+<header>
+  <h1>GHC, in the browser</h1>
+  <button id="run" disabled>Compile and run</button>
+  <button id="open">Open a folder…</button>
+  <span id="files"></span>
+  <span id="status">loading the compiler…</span>
+</header>
+<main>
+  <textarea id="source" spellcheck="false">module Main where
+
+main :: IO ()
+main = putStrLn (unwords (map show (take 10 primes)))
+  where
+    primes = sieve [2 ..]
+    sieve (p : xs) = p : sieve [x | x <- xs, x `mod` p /= 0]
+    sieve [] = []
+</textarea>
+  <pre id="out"></pre>
+</main>
+
+<script type="module">
+import { Vfs } from "./vfs.mjs";
+import { runCompiler } from "./host.mjs";
+
+const $ = (id) => document.getElementById(id);
+const say = (t) => ($("status").textContent = t);
+const print = (t) => ($("out").textContent += t);
+
+const fetchBytes = async (url, onProgress) => {
+  const res = await fetch(url);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const chunks = [];
+  let got = 0;
+  for await (const chunk of res.body) {
+    chunks.push(chunk);
+    got += chunk.length;
+    if (total) onProgress?.(got / total);
+  }
+  const all = new Uint8Array(got);
+  let at = 0;
+  for (const c of chunks) { all.set(c, at); at += c.length; }
+  return all;
+};
+
+const pct = (x) => `${Math.round(x * 100)}%`;
+
+say("fetching the compiler…");
+const [source, libBin, libIndex] = await Promise.all([
+  fetchBytes("./ghc.cjs", (p) => say(`compiler ${pct(p)}`)).then((b) => new TextDecoder().decode(b)),
+  fetchBytes("./assets/lib.bin", (p) => say(`libraries ${pct(p)}`)),
+  fetch("./assets/lib.json").then((r) => r.json()),
+]);
+
+/** The libraries are one blob; each file is a slice, decoded on first read. */
+const vfs = new Vfs();
+for (const { path, offset, size } of libIndex)
+  vfs.writeFile(`/lib/${path}`, { size, load: () => libBin.subarray(offset, offset + size) }, 1_600_000_000_000);
+vfs.mkdirp("/work");
+vfs.mkdirp("/tmp");
+vfs.cwd = "/work";
+
+say("ready");
+$("run").disabled = false;
+
+/** A folder the user picked, mounted read/write like any other directory. */
+let projectHandle;
+$("open").onclick = async () => {
+  if (!window.showDirectoryPicker) return say("this browser has no folder picker");
+  projectHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+  let count = 0;
+  const mount = async (handle, at) => {
+    for await (const [name, entry] of handle.entries()) {
+      if (entry.kind === "directory") { vfs.mkdirp(`${at}/${name}`); await mount(entry, `${at}/${name}`); }
+      else {
+        const file = await entry.getFile();
+        vfs.writeFile(`${at}/${name}`, new Uint8Array(await file.arrayBuffer()), file.lastModified);
+        count++;
+      }
+    }
+  };
+  vfs.mkdirp("/project");
+  await mount(projectHandle, "/project");
+  vfs.cwd = "/project";
+  $("files").textContent = `${projectHandle.name}/ — ${count} files`;
+  say("folder mounted; edit and compile as usual");
+};
+
+$("run").onclick = async () => {
+  $("run").disabled = true;
+  $("out").textContent = "";
+  const inProject = vfs.cwd === "/project";
+  if (!inProject) vfs.writeFile("/work/Main.hs", new TextEncoder().encode($("source").value));
+  say("compiling…");
+  const started = performance.now();
+  const code = await runCompiler({
+    source,
+    vfs,
+    argv: ["/lib", "-ddisable-js-c-sources", "-O0", "Main.hs"],
+    onOutput: print,
+  });
+  const took = ((performance.now() - started) / 1000).toFixed(1);
+  if (code !== 0) { say(`compile failed in ${took}s`); $("run").disabled = false; return; }
+
+  say(`compiled in ${took}s — running`);
+  const built = new TextDecoder().decode(vfs.readFile(`${vfs.cwd}/Main.jsexe/all.js`));
+  // The program is another node-shaped bundle; give it the same host.
+  await runCompiler({ source: built, vfs, argv: [], onOutput: print });
+  say(`done in ${took}s to compile`);
+  $("run").disabled = false;
+};
+</script>

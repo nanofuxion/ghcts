@@ -38,12 +38,21 @@ if (!result.ok) process.exit(result.code);
 | --- | --- |
 | `src/` | the CLI and its library API, TypeScript |
 | `build/` | the pipeline that produces the compiler, and the ~40-line GHC-API driver it compiles |
+| `playground/` | the same compiler in a browser, over a filesystem made of `Uint8Array`s |
 | `scripts/` | Lynx helpers: pack a bundle, serve it, drive it headless |
 
 `node build/build-compiler.mjs` turns a GHC JavaScript-target installation
 into `dist/ghc.cjs` (the compiler, 276 MB at `-O0`) and `dist/lib` (the boot
 libraries a compiled program needs, 147 MB). Run it once per GHC version.
 See `build/README.md`.
+
+## In a browser
+
+`playground/` runs the same `ghc.cjs` in a page: it supplies the four node
+modules GHC's runtime asks for and a virtual filesystem, and the compiler
+never knows the difference. Compiling and running a small program takes about
+15 seconds in Chrome. "Open a folder…" mounts a real project directory through
+the File System Access API. See `playground/README.md`.
 
 ## Two things worth knowing
 

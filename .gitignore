@@ -23,3 +23,7 @@ compiler-wasm/build/
 compiler-wasm/toolchain/
 compiler-wasm/extracted/
 compiler-wasm/probes/
+
+# Built compiler assets (node build/build-compiler.mjs, node playground/pack-assets.mjs)
+playground/assets/
+playground/ghc.cjs
