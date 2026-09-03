@@ -55,7 +55,7 @@ let work;
 if (process.argv.includes("--lib-only")) {
   console.log("keeping the existing ghc.cjs (--lib-only)");
 } else {
-  work = mkdtempSync(join(tmpdir(), "ghc-js-build-"));
+  work = mkdtempSync(join(tmpdir(), "ghcts-build-"));
   cpSync(join(here, "Driver.hs"), join(work, "Driver.hs"));
   console.log("linking the GHC API driver (this takes a few minutes)...");
   run(ghc, ["-package", "ghc", "-O0", "-ddisable-js-c-sources", "-o", "driver", "Driver.hs"], { cwd: work });
@@ -97,4 +97,4 @@ if (!process.argv.includes("--no-lib")) {
 }
 
 if (work) rmSync(work, { recursive: true, force: true });
-console.log("\ndone. `node dist/cli.js --ghc-js-version`");
+console.log("\ndone. `node dist/cli.js --ghcts-version`");

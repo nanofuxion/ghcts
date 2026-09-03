@@ -10,14 +10,14 @@ const cli = new URL("../dist/cli.js", import.meta.url).pathname;
 const built = bundledCompiler() !== undefined;
 const skip = built ? false : "compiler not built (npm run build:compiler)";
 
-test("--ghc-js-version says where the compiler is", { skip }, () => {
-  const out = execFileSync(process.execPath, [cli, "--ghc-js-version"], { encoding: "utf8" });
+test("--ghcts-version says where the compiler is", { skip }, () => {
+  const out = execFileSync(process.execPath, [cli, "--ghcts-version"], { encoding: "utf8" });
   ok(out.includes("ghc.cjs"), out);
   ok(out.includes("libdir"), out);
 });
 
 test("compiles and links a program that runs", { skip, timeout: 600_000 }, () => {
-  const work = mkdtempSync(join(tmpdir(), "ghc-js-test-"));
+  const work = mkdtempSync(join(tmpdir(), "ghcts-test-"));
   try {
     writeFileSync(join(work, "Main.hs"), 'module Main where\nmain :: IO ()\nmain = putStrLn (show (sum [1..10 :: Int]))\n');
     execFileSync(process.execPath, [cli, "-O0", "Main.hs"], { cwd: work, stdio: "pipe" });
@@ -29,7 +29,7 @@ test("compiles and links a program that runs", { skip, timeout: 600_000 }, () =>
 });
 
 test("GHC's own flags reach GHC", { skip, timeout: 600_000 }, () => {
-  const work = mkdtempSync(join(tmpdir(), "ghc-js-test-"));
+  const work = mkdtempSync(join(tmpdir(), "ghcts-test-"));
   try {
     writeFileSync(join(work, "Bad.hs"), "module Bad where\nx :: Int\nx = True\n");
     let stderr = "";

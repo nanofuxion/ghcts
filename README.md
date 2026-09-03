@@ -1,4 +1,4 @@
-# ghc-js
+# ghcts
 
 GHC's JavaScript backend, as a JavaScript program.
 
@@ -10,23 +10,23 @@ cross compiler's — not similar, identical. There is no port to keep in sync.
 Nothing at run time needs Haskell, nix, or a native toolchain. Node runs it.
 
 ```bash
-npm install ghc-js
+npm install ghcts
 
-ghc-js Main.hs                    # compile and link to Main.jsexe
+ghcts Main.hs                    # compile and link to Main.jsexe
 node Main.jsexe/all.js
 
-ghc-js -O2 -o app Main.hs
-ghc-js -c Foo.hs Bar.hs           # compile only
-GHC_PACKAGE_PATH=db1:db2 ghc-js -isrc Main.hs
+ghcts -O2 -o app Main.hs
+ghcts -c Foo.hs Bar.hs           # compile only
+GHC_PACKAGE_PATH=db1:db2 ghcts -isrc Main.hs
 ```
 
 Every GHC flag passes straight through. Two are our own:
-`--ghc-js-version` and `--ghc-js-libdir <dir>`.
+`--ghcts-version` and `--ghcts-libdir <dir>`.
 
 ## As a library
 
 ```ts
-import { compile } from "ghc-js";
+import { compile } from "ghcts";
 
 const result = await compile({ args: ["-O2", "Main.hs"], packageDbs: [db] });
 if (!result.ok) process.exit(result.code);

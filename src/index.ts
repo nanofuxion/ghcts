@@ -1,5 +1,5 @@
 /**
- * ghc-js — GHC's JavaScript backend as a JavaScript program.
+ * ghcts — GHC's JavaScript backend as a JavaScript program.
  *
  * The compiler here is GHC itself: GHC's compiler library, compiled to
  * JavaScript by GHC's own JavaScript backend, driven through the GHC API.

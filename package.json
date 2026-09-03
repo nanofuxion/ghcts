@@ -1,5 +1,5 @@
 {
-  "name": "ghc-js",
+  "name": "ghcts",
   "version": "0.1.0",
   "description": "GHC's JavaScript backend, as a JavaScript program: GHC compiled to JS by its own JS backend, with a ghc-shaped CLI",
   "license": "MIT",
@@ -7,7 +7,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "ghc-js": "./dist/cli.js"
+    "ghcts": "./dist/cli.js"
   },
   "files": [
     "dist",

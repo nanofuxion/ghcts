@@ -1,7 +1,7 @@
 # Building the compiler
 
 `node build/build-compiler.mjs` turns a GHC JavaScript-target installation
-into `dist/ghc.js` — GHC itself, as one JavaScript file — plus the trimmed
+into `dist/ghc.cjs` — GHC itself, as one JavaScript file — plus the trimmed
 `dist/lib/` a compiled program needs.
 
 It is a build-time step, run once per GHC version. Nothing at runtime needs

@@ -44,7 +44,7 @@ const libdirFromInstall = (): string | undefined => {
 };
 
 /**
- * Run the compiler over `args`, the way the `ghc-js` command does.
+ * Run the compiler over `args`, the way the `ghcts` command does.
  *
  * `-ddisable-js-c-sources` is passed unless the caller already said something
  * about it: a package's C sources would otherwise be linked by `emcc`, a
