@@ -1,69 +1,62 @@
-# ghcts
+# ghc-js
 
-`ghcts` is a TypeScript-native Haskell-to-TypeScript compiler. Install it with
-`npm install ghcts`, add `ghcts.json` to a local Haskell project, then run:
+GHC's JavaScript backend, as a JavaScript program.
 
-```sh
-npx ghcts build --project .
+The compiler here is GHC itself. GHC's compiler library is compiled to
+JavaScript by GHC's own JavaScript backend and driven through the GHC API, so
+its output is byte-identical to a native `javascript-unknown-ghcjs-ghc`
+cross compiler's — not similar, identical. There is no port to keep in sync.
+
+Nothing at run time needs Haskell, nix, or a native toolchain. Node runs it.
+
+```bash
+npm install ghc-js
+
+ghc-js Main.hs                    # compile and link to Main.jsexe
+node Main.jsexe/all.js
+
+ghc-js -O2 -o app Main.hs
+ghc-js -c Foo.hs Bar.hs           # compile only
+GHC_PACKAGE_PATH=db1:db2 ghc-js -isrc Main.hs
 ```
 
-To build and serve the browser output without a separate server dependency:
+Every GHC flag passes straight through. Two are our own:
+`--ghc-js-version` and `--ghc-js-libdir <dir>`.
 
-```sh
-npx ghcts serve --project .
+## As a library
+
+```ts
+import { compile } from "ghc-js";
+
+const result = await compile({ args: ["-O2", "Main.hs"], packageDbs: [db] });
+if (!result.ok) process.exit(result.code);
 ```
 
-The build emits inspectable TypeScript and ESM for a source-driven Haskell
-program. It includes layout-aware parsing, module/import resolution, retained
-signatures and constraints, typed Core lowering, curried lazy evaluation,
-algebraic data, records, pattern matching, `IO`, CPP selection, and generic
-JavaScript FFI. The Miso fixture is compiled from the checked-in Haskell
-sources; there is no generated counter implementation or `Miso.*` compiler
-replacement. Browser builds package the selected Miso JavaScript asset and a
-Node-native `serve` command is provided for local testing.
+## What is in here
 
-Runtime code generation defaults to the ABI-preserving `ghc` mode. Set
-`optimization` to `none` in `ghcts.json` to reproduce the conservative apply
-path, or to `native` to opt into experimental native-region work as it becomes
-available. The current native mode includes the same safe direct-entry paths;
-unsupported cases always fall back to the GHC-shaped RTS convention.
+| | |
+| --- | --- |
+| `src/` | the CLI and its library API, TypeScript |
+| `build/` | the pipeline that produces the compiler, and the ~40-line GHC-API driver it compiles |
+| `scripts/` | Lynx helpers: pack a bundle, serve it, drive it headless |
 
-The current release targets the reachable default-browser Miso graph and Haskell 2010/GHC-compatible syntax used by that graph. Hackage solving, Template Haskell execution, arbitrary C FFI, and the remaining GHC extension surface are intentionally diagnosed as unsupported until implemented.
+`node build/build-compiler.mjs` turns a GHC JavaScript-target installation
+into `dist/ghc.cjs` (the compiler, 276 MB at `-O0`) and `dist/lib` (the boot
+libraries a compiled program needs, 147 MB). Run it once per GHC version.
+See `build/README.md`.
 
-## Credits
+## Two things worth knowing
 
-ghcts was influenced by the design and conventions of several Haskell and
-Haskell-to-JavaScript projects:
+`-ddisable-js-c-sources` is passed by default. Without it GHC links a
+package's C sources with `emcc`, which is a native toolchain, and on some
+packages it fails outright. The flag is what keeps this pure JavaScript.
 
-- [**miso**](https://github.com/dmjio/miso) — the compile-and-run benchmark and
-  the application model ghcts targets; browser builds package Miso's JavaScript
-  assets rather than substituting a compiler-owned implementation.
-- [**GHCJS**](https://github.com/ghcjs/ghcjs) — lazy call-by-need evaluation,
-  `foreign import javascript` FFI (including `GHCJS_NEW` callback-style
-  imports), and the CPP branch conventions Miso's browser Cabal target expects.
-- [**MicroHs**](https://github.com/augustss/MicroHs) — a compact, self-hosting
-  Haskell compiler with combinator-based execution and a JavaScript runtime,
-  showing how far a minimal compiler pipeline can reach in the browser.
-- [**GHC**](https://www.haskell.org/ghc/) — wired-in boot libraries, Core-style
-  lowering, and the Haskell 2010/GHC-compatible language surface ghcts aims to
-  support.
-- [**aihc**](https://github.com/ai-haskell-compiler/aihc) — phased compiler
-  structure (parse, module resolution, typechecking) and layout-sensitive
-  parsing patterns.
+The compiler bundle is `.cjs`, not `.js`. GHC's runtime finds node through
+`require` and `module`; loaded as an ES module it starts with no arguments
+and no filesystem.
 
-miso, GHCJS, GHC, and aihc are tracked as git submodules under `references/`.
-After cloning, initialize them with:
+## Verified against real code
 
-```sh
-git submodule update --init --recursive
-```
-
-The phrase "Any application that can be written in JavaScript, will eventually
-be written in JavaScript" is known as **Jeff Atwood's Law**, coined by the
-co-founder of Stack Overflow in 2009.
-
-### Special thanks
-
-Special thanks to [**dmjio**](https://github.com/dmjio) of
-[**haskell-miso**](https://github.com/haskell-miso) for sparking an interest in
-the idea, and also for creating the perfect framework to benchmark with.
+`ghc-in-js/MISOGRAM.md` records this compiler building misogram — 1,632 lines
+over miso, ghcjs-base and aeson — to an `out.js` matching the native build
+byte for byte, and that bundle running on an Android device.

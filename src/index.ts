@@ -1,17 +1,10 @@
-export { build, loadConfig, loadProgram } from './build.js';
-export { formatDiagnostic } from './diagnostics.js';
-export { serveProject } from './server.js';
-export { checkModule } from './typecheck.js';
-export { classMembers, collectDictionaries, instanceHead, instanceMembers, instanceMethodValues, selectInstance } from './dictionary.js';
-export { elaborateModule, elaborateProgram } from './elaborate.js';
-export { PRELUDE_SOURCE } from './prelude.js';
-export { desugarModule } from './desugar.js';
-export { coreToStg } from './core-to-stg.js';
-export { link, renderModules } from './linker/linker.js';
-export type { RunningServer, ServeOptions } from './server.js';
-export type { CompileProjectOptions, CompileResult, Diagnostic, GhctsConfig, Target } from './types.js';
-
-/** GHC.JS: the JavaScript AST, printer and optimizer, ported 1:1. */
-export * as GhcJs from './ghc-js.js';
-/** GHC.StgToJS: the code generator and the RTS it emits. */
-export * as StgToJs from './stg-to-js.js';
+/**
+ * ghc-js — GHC's JavaScript backend as a JavaScript program.
+ *
+ * The compiler here is GHC itself: GHC's compiler library, compiled to
+ * JavaScript by GHC's own JavaScript backend, driven through the GHC API.
+ * Its output is byte-identical to a native GHC cross compiler's.
+ */
+export { compile } from "./compiler.js";
+export type { CompileOptions, CompileResult } from "./compiler.js";
+export { bundledCompiler, findGhcJs, ghcLibdir } from "./find-ghc.js";

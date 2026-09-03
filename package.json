@@ -1,21 +1,33 @@
 {
-  "name": "ghcts",
+  "name": "ghc-js",
   "version": "0.1.0",
-  "description": "A TypeScript-native Haskell to TypeScript compiler",
+  "description": "GHC's JavaScript backend, as a JavaScript program: GHC compiled to JS by its own JS backend, with a ghc-shaped CLI",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": { "ghcts": "./dist/cli.js" },
-  "files": ["dist"],
+  "bin": {
+    "ghc-js": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "build",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "build:lynx": "npm run build && node scripts/build-lynx-bundles.mjs",
-    "build:bundles": "npm run build:lynx",
-    "test": "npm run build && node --test test/**/*.test.mjs",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "build:compiler": "npm run build && node build/build-compiler.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build:lynx": "node scripts/build-lynx-bundles.mjs"
   },
-  "dependencies": { "typescript": "^5.8.3" },
-  "devDependencies": { "@types/node": "^22.0.0" },
-  "engines": { "node": ">=20" }
+  "dependencies": {
+    "typescript": "^5.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }
