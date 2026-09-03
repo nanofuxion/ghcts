@@ -36,8 +36,11 @@ const apps = {
   // ghcts, so the two can be run back to back on one device.
   //
   //   counter-ghc   checked-in reference bundle
-  //   misogram-ghc  `nix build --override-input miso path:<repo>/references/miso
-  //                  --out-link /tmp/ghc-misogram` in references/misogram
+  //   misogram-ghc  compile with GHC-in-JavaScript (see ghc-in-js/MISOGRAM.md),
+  //                 then `node scripts/pack-lynx.mjs --js <jsexe>/all.js
+  //                 --out /tmp/ghc-misogram --styles references/misogram/
+  //                 styles.css --assets references/misogram/assets --registry
+  //                 __misoGramAssets`
   //
   // A route whose file is missing is skipped at startup rather than 404-ing
   // mid-session, so this list can name a bundle that has not been built yet.

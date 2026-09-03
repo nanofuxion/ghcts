@@ -96,6 +96,9 @@ await writeFile(
         "@lynx-js/react": "latest",
         "@lynx-js/react-rsbuild-plugin": "latest",
         "@lynx-js/rspeedy": "latest",
+        // rspeedy 0.16.5 imports typescript from its own register hook and
+        // does not depend on it, so a fresh install has no `typescript`.
+        typescript: "latest",
       },
     },
     null,
