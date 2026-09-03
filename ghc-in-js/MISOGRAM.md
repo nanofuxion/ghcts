@@ -10,9 +10,12 @@ and its output matches the native compiler's exactly.
 | --- | --- | --- |
 | time (misogram's own 6 modules) | 43.2 s | ~4 s |
 | `out.js` | 11,085,834 bytes | 11,085,834 bytes |
-| `lib.js`, `rts.js`, `out.frefs.js` | identical | identical |
+| `lib.js`, `out.frefs.js` | identical | identical |
+| `rts.js` | identical | identical |
 
-`out.js` is identical once two per-build values are normalised: GHC's
+`rts.js` matches once its fresh loop-variable names (`h$RTS_joHt` against
+`h$RTS_j34J`) are normalised. `out.js` is identical once two per-build values
+are normalised: GHC's
 linker-local `h$$…` names, and the `StaticPtr` keys (a hash of the compiling
 unit's ABI, different between any two separate builds of the same source).
 20,700 functions and 260,454 lines either way.
