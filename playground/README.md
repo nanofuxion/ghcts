@@ -6,10 +6,18 @@ startup, and a filesystem built out of `Uint8Array`s.
 
 ```bash
 node build/build-compiler.mjs        # dist/ghc.cjs and dist/lib
-node playground/pack-assets.mjs --minimal
-ln -s ../dist/ghc.cjs playground/ghc.cjs
+node playground/pack-assets.mjs --minimal   # also copies ghc.cjs into assets/
 npx serve playground                 # any static server
 ```
+
+The packer copies the compiler rather than linking it: a static server that
+will not follow a symlink out of its root answers 404, and the page would
+then evaluate the error document as JavaScript. If anything fails to load,
+the status line names the URL and its status.
+
+Both `assets/ghc.cjs` (276 MB) and `assets/lib.bin` (79 MB) are worth serving
+precompressed with a long cache. Content types do not matter: the page
+fetches them as bytes.
 
 Compiling and running a ten-primes program takes about 15 s in Chrome.
 

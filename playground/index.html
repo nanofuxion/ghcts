@@ -47,6 +47,7 @@ const print = (t) => ($("out").textContent += t);
 
 const fetchBytes = async (url, onProgress) => {
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${new URL(url, location.href)}`);
   const total = Number(res.headers.get("content-length")) || 0;
   const chunks = [];
   let got = 0;
@@ -64,11 +65,18 @@ const fetchBytes = async (url, onProgress) => {
 const pct = (x) => `${Math.round(x * 100)}%`;
 
 say("fetching the compiler…");
-const [source, libBin, libIndex] = await Promise.all([
-  fetchBytes("./ghc.cjs", (p) => say(`compiler ${pct(p)}`)).then((b) => new TextDecoder().decode(b)),
-  fetchBytes("./assets/lib.bin", (p) => say(`libraries ${pct(p)}`)),
-  fetch("./assets/lib.json").then((r) => r.json()),
-]);
+let source, libBin, libIndex;
+try {
+  [source, libBin, libIndex] = await Promise.all([
+    fetchBytes("./assets/ghc.cjs", (p) => say(`compiler ${pct(p)}`)).then((b) => new TextDecoder().decode(b)),
+    fetchBytes("./assets/lib.bin", (p) => say(`libraries ${pct(p)}`)),
+    fetch("./assets/lib.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for lib.json`)))),
+  ]);
+} catch (e) {
+  // The run button stays disabled: there is nothing to run.
+  say(`could not load: ${e.message}`);
+  throw e;
+}
 
 /** The libraries are one blob; each file is a slice, decoded on first read. */
 const vfs = new Vfs();
@@ -107,24 +115,30 @@ $("open").onclick = async () => {
 $("run").onclick = async () => {
   $("run").disabled = true;
   $("out").textContent = "";
-  const inProject = vfs.cwd === "/project";
-  if (!inProject) vfs.writeFile("/work/Main.hs", new TextEncoder().encode($("source").value));
-  say("compiling…");
-  const started = performance.now();
-  const code = await runCompiler({
-    source,
-    vfs,
-    argv: ["/lib", "-ddisable-js-c-sources", "-O0", "Main.hs"],
-    onOutput: print,
-  });
-  const took = ((performance.now() - started) / 1000).toFixed(1);
-  if (code !== 0) { say(`compile failed in ${took}s`); $("run").disabled = false; return; }
+  try {
+    const inProject = vfs.cwd === "/project";
+    if (!inProject) vfs.writeFile("/work/Main.hs", new TextEncoder().encode($("source").value));
+    say("compiling…");
+    const started = performance.now();
+    const code = await runCompiler({
+      source,
+      vfs,
+      argv: ["/lib", "-ddisable-js-c-sources", "-O0", "Main.hs"],
+      onOutput: print,
+    });
+    const took = ((performance.now() - started) / 1000).toFixed(1);
+    if (code !== 0) { say(`compile failed in ${took}s`); return; }
 
-  say(`compiled in ${took}s — running`);
-  const built = new TextDecoder().decode(vfs.readFile(`${vfs.cwd}/Main.jsexe/all.js`));
-  // The program is another node-shaped bundle; give it the same host.
-  await runCompiler({ source: built, vfs, argv: [], onOutput: print });
-  say(`done in ${took}s to compile`);
-  $("run").disabled = false;
+    say(`compiled in ${took}s — running`);
+    const built = new TextDecoder().decode(vfs.readFile(`${vfs.cwd}/Main.jsexe/all.js`));
+    // The program is another node-shaped bundle; give it the same host.
+    await runCompiler({ source: built, vfs, argv: [], onOutput: print });
+    say(`done in ${took}s to compile`);
+  } catch (e) {
+    say(`failed: ${e.message}`);
+    print(`\n${e.stack ?? e}\n`);
+  } finally {
+    $("run").disabled = false;
+  }
 };
 </script>

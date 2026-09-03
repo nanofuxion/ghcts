@@ -9,7 +9,7 @@
  * `--minimal` keeps only the packages a Prelude program needs, which is what
  * makes the download 78 MB instead of 147 MB.
  */
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,6 +39,18 @@ const kept = files.filter((f) => {
 });
 
 mkdirSync(out, { recursive: true });
+
+// The compiler is copied, not symlinked: a static server that refuses to
+// follow a link out of its root answers 404, and the page then evaluates the
+// error document as JavaScript.
+const compiler = join(root, "dist/ghc.cjs");
+if (!existsSync(compiler)) {
+  console.error(`${compiler} is missing. Build it first: node build/build-compiler.mjs`);
+  process.exit(2);
+}
+cpSync(compiler, join(out, "ghc.cjs"));
+console.log(`${(statSync(compiler).size / 1e6).toFixed(0)} MB -> ${join(out, "ghc.cjs")}`);
+
 const chunks = [];
 let offset = 0;
 const index = kept.map((f) => {

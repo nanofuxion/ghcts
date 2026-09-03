@@ -32,7 +32,7 @@ export function runCompiler({ source, vfs, argv, env = {}, onOutput = () => {} }
   };
 
   
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (code) => {
       if (!settled) {
@@ -147,7 +147,17 @@ export function runCompiler({ source, vfs, argv, env = {}, onOutput = () => {} }
     // that expects to be a node module. It is exactly what node's own module
     // wrapper does, minus the process isolation.
     const names = Object.keys(sandbox);
-    const run = new Function(...names, `"use strict";\n${source}\n;return typeof h$main === "function";`);
+    let run;
+    try {
+      run = new Function(...names, `"use strict";\n${source}\n;return typeof h$main === "function";`);
+    } catch (e) {
+      return reject(
+        new Error(
+          `the compiler bundle did not parse as JavaScript (${e.message}). ` +
+            "Is assets/ghc.cjs the file build-compiler.mjs wrote? A 404 page served in its place is the usual cause.",
+        ),
+      );
+    }
     try {
       guard(() => run(...names.map((n) => sandbox[n])))();
       // The compiler runs under its own scheduler and keeps going after this
