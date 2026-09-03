@@ -16,9 +16,5 @@ references/miso-lynx/
 references/misogram/
 references/video/
 
-# compiler-wasm: bootstrap experiment. Its build/ and toolchain/ hold multi-GB
-# vendored GHC/emsdk checkouts; only the notes and the extraction manifest are
-# worth tracking.
-
 # Built compiler assets (node build/build-compiler.mjs, node playground/pack-assets.mjs)
 playground/assets/
