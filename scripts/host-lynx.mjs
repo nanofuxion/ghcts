@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 /**
- * Serve packed Lynx bundles on the LAN for Lynx Explorer.
+ * Serve the two Lynx apps on the LAN for Lynx Explorer.
  *
  *   node scripts/host-lynx.mjs
  *   node scripts/host-lynx.mjs --port 8080
+ *
+ * Both are built by `javascript-unknown-ghcjs-ghc` through this package's own
+ * CLI - see `scripts/build-lynx-bundles.mjs`, which needs a package database
+ * holding miso `+native`; run that first.
  *
  * Explorer URLs (phone and this machine must be on the same network):
  *   http://<lan-ip>:8080/counter/main.lynx.bundle
@@ -32,23 +36,6 @@ const apps = {
     root,
     "references/misogram/dist/lynx/main.lynx.bundle",
   ),
-  // Same sources, built by GHC 9.12.2's own JavaScript backend instead of
-  // ghcts, so the two can be run back to back on one device.
-  //
-  //   counter-ghc   checked-in reference bundle
-  //   misogram-ghc  compile with GHC-in-JavaScript (see ghc-in-js/MISOGRAM.md),
-  //                 then `node scripts/pack-lynx.mjs --js <jsexe>/all.js
-  //                 --out /tmp/ghc-misogram --styles references/misogram/
-  //                 styles.css --assets references/misogram/assets --registry
-  //                 __misoGramAssets`
-  //
-  // A route whose file is missing is skipped at startup rather than 404-ing
-  // mid-session, so this list can name a bundle that has not been built yet.
-  "/counter-ghc/main.lynx.bundle": join(
-    root,
-    "references/miso-lynx/examples/main.lynx.bundle",
-  ),
-  "/misogram-ghc/main.lynx.bundle": "/tmp/ghc-misogram/main.lynx.bundle",
 };
 
 const lanAddresses = () => {
@@ -89,19 +76,18 @@ const indexPage = (hosts) => {
 };
 
 // A bundle that has not been built yet drops out of the table instead of
-// killing the server: the GHC-built comparison routes come from a separate
-// toolchain, and one of them being absent should not stop the ghcts ones from
-// being servable.
+// killing the server, so this can start before `build:lynx` has run for
+// the very first time.
 for (const [path, file] of Object.entries(apps)) {
   try {
     await stat(file);
   } catch {
-    console.error(`skipping ${path}\n  not built: ${file}`);
+    console.error(`skipping ${path}\n  not built: ${file}\n  run: npm run build:lynx`);
     delete apps[path];
   }
 }
 if (Object.keys(apps).length === 0) {
-  console.error("No bundles to serve; pack one first with scripts/pack-lynx.mjs");
+  console.error("No bundles to serve; run: npm run build:lynx");
   process.exit(1);
 }
 
