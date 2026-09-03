@@ -12,20 +12,25 @@ by that cross compiler, producing a `.jsexe` bundle that IS the compiler.
 
 ```bash
 GHC=/nix/store/…-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2
-$GHC/bin/javascript-unknown-ghcjs-ghc-9.12.2 -package ghc -O0 -o driver Driver.hs
-node patch.mjs driver.jsexe/all.js driver-patched.js
-node --stack-size=40000 driver-patched.js \
-  $GHC/lib/javascript-unknown-ghcjs-ghc-9.12.2/lib Prog.hs
+$GHC/bin/javascript-unknown-ghcjs-ghc-9.12.2 -package ghc -O0 \
+  -ddisable-js-c-sources -o driver Driver.hs
+cat jsbi-shim.js driver.jsexe/all.js > ghc.js
+node --stack-size=40000 ghc.js \
+  $GHC/lib/javascript-unknown-ghcjs-ghc-9.12.2/lib -ddisable-js-c-sources Prog.hs
 ```
 
-`patch.mjs` fixes two things the linked bundle needs on node:
+`-ddisable-js-c-sources` is GHC's own flag for skipping the C-source step.
+It is what keeps this pure JavaScript: without it the link shells out to
+`emcc`, which is a native toolchain, and the bundle then needs the
+Emscripten runtime at startup. Pass it when building the compiler AND when
+building programs with it.
 
-1. The RTS reads `Module.HEAP8` for its Emscripten C shim; this Emscripten
-   build does not put the heap views on `Module`.
-2. The RTS's 64-bit helpers call `JSBI.*`, a polyfill nothing defines. Node
-   has native BigInt, which is what JSBI wraps.
-
-Both belong upstream in GHC's JS linker; neither touches code generation.
+`jsbi-shim.js` is the one thing still prepended. GHC's RTS calls `JSBI.*` in
+its 64-bit helpers, and nothing in the bundle defines it - `h$hs_remWord64`
+is on the path of GHC's own `Unique` hashing, so the compiler cannot start
+without it. JSBI is a BigInt polyfill; node has BigInt, so the shim is 20
+lines of identity functions. It belongs upstream in GHC's JS RTS and it
+touches no code generation.
 
 ## Result
 

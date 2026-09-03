@@ -20,11 +20,22 @@ linker-local `h$$…` names, and the `StaticPtr` keys (a hash of the compiling
 unit's ABI, different between any two separate builds of the same source).
 20,700 functions and 260,454 lines either way.
 
-Both compilers then fail the same way at the very end, in emscripten:
-`wasm-ld: section too large`, linking `references/miso/cbits/foreign.c`.
-That is the known miso-native C-stub failure `scripts/ghc-lynx-oracle.mjs`
-already documents and works around; it happens after GHC has written the JS
-it generates, and it is not specific to the JavaScript-hosted compiler.
+## The emscripten link failure, and why it is gone
+
+Without `-ddisable-js-c-sources` both compilers fail identically at the very
+end: `wasm-ld: error: section too large`, linking miso's `cbits/foreign.c`
+through emscripten. That is the failure `scripts/ghc-lynx-oracle.mjs` works
+around by salvaging the four files GHC had already written.
+
+With the flag there is nothing to salvage: GHC skips the C step, writes
+`runmain.js` from its non-emcc branch and combines the whole bundle itself.
+misogram links to a complete 12,252,685-byte `all.js` in 46 s, `out.js`
+still byte-identical to the native build, and it runs: 778 elements in
+`scripts/lynx-run.mjs`, and `--swipe 84` moves the carousel to 2/3.
+
+The three symbols the C file provided - `miso_x_store`, `miso_x_get`,
+`miso_x_clear` - are GHCi live-reload only (`references/miso/src/Miso/
+Reload.hs`) and appear nowhere in the linked bundle.
 
 ## How
 
