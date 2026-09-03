@@ -7,14 +7,14 @@
  * See build/README.md. Run once per GHC version; nothing at runtime needs
  * Haskell, nix, or a native toolchain.
  *
- *   node build/build-compiler.mjs [--ghc <bindir>] [--out dist] [--no-lib]
+ *   node build/build-compiler.mjs [--ghc <binary|bindir>] [--out dist] [--no-lib]
  */
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { findGhcJs, ghcLibdir } from "../dist/find-ghc.js";
+import { findGhcJs, ghcInstallAt } from "../dist/find-ghc.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -23,15 +23,17 @@ const arg = (name, fallback) => {
   return i === -1 ? fallback : process.argv[i + 1];
 };
 
-const bindir = arg("ghc", findGhcJs());
-if (!bindir) {
-  console.error("No javascript-unknown-ghcjs-ghc found. Pass --ghc <bindir>.");
+const wanted = arg("ghc");
+const install = wanted ? ghcInstallAt(wanted) : findGhcJs();
+if (!install) {
+  console.error(
+    "No javascript-unknown-ghcjs-ghc found.\n" +
+      "Looked at GHCTS_GHC, then PATH, then ghcup. Set GHCTS_GHC, or pass --ghc <binary|bindir>.",
+  );
   process.exit(2);
 }
+const { ghc, libdir, ghcPkg } = install;
 const out = resolve(root, arg("out", "dist"));
-const ghc = join(bindir, readdirSync(bindir).find((f) => /^javascript-unknown-ghcjs-ghc-\d/.test(f)));
-const libdir = ghcLibdir(bindir);
-
 /** Packages that exist only to build the compiler, and ways nothing links. */
 const buildOnly = /^(ghc-\d|Cabal|Cabal-syntax|haddock|xhtml|ghc-heap)/;
 const unusedWay = (f) => f.endsWith(".p_hi") || f.endsWith("_p.a") || f.includes("_debug") || f.includes("_thr");
@@ -44,7 +46,7 @@ const run = (cmd, args, opts = {}) => {
   }
 };
 
-console.log(`GHC     ${ghc}`);
+console.log(`GHC     ${ghc} (${install.version})`);
 console.log(`libdir  ${libdir}`);
 console.log(`out     ${out}\n`);
 
@@ -69,8 +71,8 @@ if (process.argv.includes("--lib-only")) {
 // 3. The libdir a compiled program needs: boot packages only, one way each.
 if (!process.argv.includes("--no-lib")) {
   const dst = join(out, "lib");
-  // Everything came out of the nix store read-only, so a previous run's copy
-  // cannot simply be deleted.
+  // A GHC installation may be read-only (nix serves them that way), so a
+  // previous run's copy cannot simply be deleted.
   if (existsSync(dst)) {
     run("chmod", ["-R", "u+w", dst], { stdio: "ignore" });
     rmSync(dst, { recursive: true, force: true });
@@ -85,13 +87,14 @@ if (!process.argv.includes("--no-lib")) {
       return !unusedWay(src);
     },
   });
-  // Copied out of the nix store, so read-only; ghc-pkg has to rewrite the cache.
+  // The copy inherits the source's permissions; ghc-pkg has to rewrite the cache.
   run("chmod", ["-R", "u+w", dst], { stdio: "ignore" });
   // The package database caches absolute paths from the source installation.
-  run(join(bindir, readdirSync(bindir).find((f) => /^javascript-unknown-ghcjs-ghc-pkg-\d/.test(f))), [
-    "recache",
-    `--package-db=${join(dst, "package.conf.d")}`,
-  ]);
+  if (!ghcPkg) {
+    console.error(`\n${ghc} has no ghc-pkg beside it, so the copied database cannot be recached.`);
+    process.exit(1);
+  }
+  run(ghcPkg, ["recache", `--package-db=${join(dst, "package.conf.d")}`]);
   const size = spawnSync("du", ["-sm", dst], { encoding: "utf8" }).stdout?.split("\t")[0] ?? "?";
   console.log(`wrote ${dst} (${size} MB)`);
 }

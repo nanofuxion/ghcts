@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { bundledCompiler, findGhcJs, ghcLibdir } from "./find-ghc.js";
+import { bundledCompiler, findGhcJs } from "./find-ghc.js";
 
 export interface CompileOptions {
   /** GHC flags and source files, exactly as `ghc` takes them. */
@@ -38,10 +38,7 @@ const resolveCompiler = (o: CompileOptions) => {
   return { ghc, libdir };
 };
 
-const libdirFromInstall = (): string | undefined => {
-  const bindir = findGhcJs();
-  return bindir ? ghcLibdir(bindir) : undefined;
-};
+const libdirFromInstall = (): string | undefined => findGhcJs()?.libdir;
 
 /**
  * Run the compiler over `args`, the way the `ghcts` command does.

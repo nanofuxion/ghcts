@@ -14,7 +14,7 @@
  *   --ghcts-version   what this is, and where its pieces live
  *   --ghcts-libdir <dir>
  */
-import { bundledCompiler, findGhcJs, ghcLibdir } from "./find-ghc.js";
+import { bundledCompiler, findGhcJs } from "./find-ghc.js";
 import { compile } from "./compiler.js";
 
 const argv = process.argv.slice(2);
@@ -32,6 +32,7 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
       "  --ghcts-libdir <dir>   use another GHC libdir",
       "",
       "Package databases come from GHC_PACKAGE_PATH, as with ghc.",
+      "The build needs a GHC JavaScript cross compiler: GHCTS_GHC, then PATH, then ghcup.",
     ].join("\n"),
   );
   process.exit(argv.length === 0 ? 2 : 0);
@@ -39,10 +40,11 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
 
 if (argv[0] === "--ghcts-version") {
   const bundled = bundledCompiler();
-  const bindir = findGhcJs();
+  const install = findGhcJs();
   console.log(`ghcts`);
   console.log(`  compiler  ${bundled?.ghc ?? "(not built — run `node build/build-compiler.mjs`)"}`);
-  console.log(`  libdir    ${bundled?.libdir ?? (bindir ? ghcLibdir(bindir) : "(none)")}`);
+  console.log(`  libdir    ${bundled?.libdir ?? install?.libdir ?? "(none)"}`);
+  console.log(`  ghc       ${install ? `${install.ghc} (${install.version})` : "(none found; set GHCTS_GHC)"}`);
   process.exit(0);
 }
 

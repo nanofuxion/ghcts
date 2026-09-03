@@ -7,4 +7,5 @@
  */
 export { compile } from "./compiler.js";
 export type { CompileOptions, CompileResult } from "./compiler.js";
-export { bundledCompiler, findGhcJs, ghcLibdir } from "./find-ghc.js";
+export { bundledCompiler, findGhcJs, ghcInstallAt, ghcLibdir } from "./find-ghc.js";
+export type { GhcInstall } from "./find-ghc.js";

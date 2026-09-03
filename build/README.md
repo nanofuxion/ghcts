@@ -14,7 +14,9 @@ the `ghc` library. That is what makes this possible: GHC's own compiler
 library, already compiled for the JavaScript target, so a driver written
 against the GHC API links into a JavaScript bundle that *is* GHC.
 
-The script finds one in the nix store, or takes `--ghc <path-to-bin>`.
+It is found the way its own users install one: `GHCTS_GHC` if set, then
+`PATH`, then ghcup. `--ghc <binary|bindir>` overrides all three. Whichever is
+found is asked for its own `--print-libdir` and `--numeric-version`.
 
 ## Steps
 
