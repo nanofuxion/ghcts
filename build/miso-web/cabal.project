@@ -1,0 +1,20 @@
+-- miso for the *web*: no flags at all, which is what selects the DOM
+-- backend (CPP -DGHCJS_BOTH -DGHCJS_NEW, js-sources js/miso.js, FFI dir
+-- ffi/js). references/miso's own cabal.project asks for +native, and listing
+-- it as a package here is what overrides that.
+packages: ../../references/miso
+          ./ghcjs-base
+
+optimization: False
+
+-- The boot libraries shipped with the JavaScript cross compiler are newer
+-- than these packages were written against.
+allow-newer: all:base, all:template-haskell, all:ghc-prim, all:bytestring,
+             all:text, all:containers, all:primitive, all:time,
+             all:transformers, all:mtl, all:deepseq, all:binary
+
+package miso
+  ghc-options: -ddisable-js-c-sources
+
+package ghcjs-base
+  ghc-options: -ddisable-js-c-sources

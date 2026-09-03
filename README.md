@@ -51,8 +51,12 @@ See `build/README.md`.
 `playground/` runs the same `ghc.cjs` in a page: it supplies the four node
 modules GHC's runtime asks for and a virtual filesystem, and the compiler
 never knows the difference. Compiling and running a small program takes about
-15 seconds in Chrome. "Open a folder…" mounts a real project directory through
-the File System Access API. See `playground/README.md`.
+15 seconds in Chrome. A collapsible file tree on the left edits whatever is
+mounted; "Open a folder…" mounts a real project through the File System
+Access API and reads its `.cabal` file to find where the program starts. A
+"miso" template (or a folder whose `.cabal` depends on it) compiles a real
+DOM app and renders it in the pane on the right, not just to a log. See
+`playground/README.md`.
 
 ## Two things worth knowing
 

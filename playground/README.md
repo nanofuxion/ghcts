@@ -21,6 +21,54 @@ fetches them as bytes.
 
 Compiling and running a ten-primes program takes about 15 s in Chrome.
 
+## The file tree
+
+The left panel is the VFS, not a separate model: `project.mjs`'s
+`mountDirectory`/`findEntry` and the tree renderer all read and write the same
+`Vfs` the compiler runs over, so a compiled program's `.jsexe/` output shows
+up right there next to its source. Click a directory row to collapse or
+expand it, click a file to open it in the editor, and the ☰ button hides the
+whole panel. Switching files (or compiling) saves the one currently open back
+into the VFS first, so nothing written is lost by looking somewhere else.
+
+## Opening a folder
+
+"Open a folder…" uses the File System Access API (Chrome and Edge; Firefox
+and Safari do not have it, and the button says so). Every file mounts into
+the VFS at `/project`, and files opened from there also keep their real
+`FileSystemFileHandle` — an edit is written back to both the VFS and the
+actual file on disk, best-effort, whenever you switch away from it or compile.
+
+The entry point is not assumed to be `Main.hs` at the root. `project.mjs`
+looks for a `.cabal` file and reads its first runnable stanza's `main-is` and
+`hs-source-dirs` - the standard Haskell project config - then falls back to
+this repo's own `ghcts.json` shape, then to the conventional `Main.hs` /
+`app/Main.hs` / `src/Main.hs` paths. A `.cabal` file's `build-depends` also
+decides whether the miso package database gets fetched, the same as picking
+the miso template does. None of this is a full Cabal parser - conditional
+`if`/`else` stanzas are not descended into - but it reads every real `.cabal`
+file this repo ships (`references/miso/sample-app/app.cabal`,
+`references/misogram/miso-gram.cabal`) correctly; see `test/project.test.mjs`,
+which is also the honest way to check "does opening a folder work" at all -
+there is no way to script a browser's own native folder picker.
+
+## miso, in the same page
+
+Picking "miso" from the template menu - or opening a folder whose `.cabal`
+depends on `miso` - fetches a second, separate blob (`assets/miso.bin`) the
+first time it is needed, and adds `-package-db /lib/pkgs/package.conf.d
+-package miso` to the compile. The result does not print to the log: it loads
+into the `<iframe>` below it, on a blank page with a `<div id="app">`, exactly
+what `startApp ... { mountPoint = Just "app" }` expects. The iframe is not
+sandboxed, so its own uncaught errors get posted back into the compile log
+above it.
+
+`assets/miso.bin` is `dist/pkgs` (built by `node build/miso-web/build.mjs` -
+see `build/miso-web/README.md`) plus whatever extra boot packages miso's own
+closure needs beyond the Prelude's minimal set (`bytestring`, `containers`,
+`mtl`, `text`, and the rest `pack-assets.mjs --miso` works out from
+`dist/pkgs`'s own `depends:` fields, not a hand-kept list).
+
 ## How it works
 
 `vfs.mjs` is a tree of directories and files with node's `fs` shape over it —
@@ -33,15 +81,6 @@ decides it is on node by looking for `global`, `process`, `require` and
 `module`; give it those and it never asks where the files really are. The same
 function is what the node-side test uses, backed by real files, which is how
 the shim is checked.
-
-## Opening your own folder
-
-"Open a folder…" uses the File System Access API, so a real project directory
-mounts at `/project` and compiles the way it would on disk. Chrome and Edge
-have it; Firefox and Safari do not, and the picker says so.
-
-Writing results back to the folder is not wired up yet: the compiler's output
-lands in the virtual filesystem, and only what the page displays comes out.
 
 ## What the browser needed that node did not
 
@@ -64,7 +103,8 @@ Four things, all in `host.mjs`, none of them touching the compiler:
 | | |
 | --- | --- |
 | `ghc.cjs` | 276 MB, ~21 MB gzipped |
-| `assets/lib.bin` (`--minimal`) | 79 MB |
+| `assets/lib.bin` (`--minimal`) | 79 MB, always fetched |
+| `assets/miso.bin` | ~120 MB, fetched only for a miso program |
 
 Serve both with `Content-Encoding: gzip` and a long cache. Neither has been
 shrunk yet: the compiler is linked at `-O0` with no dead-code pass, and the

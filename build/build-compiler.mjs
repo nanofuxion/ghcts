@@ -33,6 +33,15 @@ if (!install) {
   process.exit(2);
 }
 const { ghc, libdir, ghcPkg } = install;
+// This has to be a *native* GHC that already targets JavaScript, never
+// ghcts's own dist/ghc.cjs bootstrapping itself: findGhcJs()/ghcInstallAt()
+// only ever look at PATH and ghcup, so this can only trip if GHCTS_GHC or
+// --ghc was pointed at the wrong thing by hand. A real compiler binary is
+// never a `.cjs` file - that extension is what bundledCompiler() hands out.
+if (ghc.endsWith(".cjs")) {
+  console.error(`${ghc} looks like ghcts's own compiled output, not a native GHC. Point --ghc/GHCTS_GHC at a javascript-unknown-ghcjs-ghc install instead.`);
+  process.exit(2);
+}
 const out = resolve(root, arg("out", "dist"));
 /** Packages that exist only to build the compiler, and ways nothing links. */
 const buildOnly = /^(ghc-\d|Cabal|Cabal-syntax|haddock|xhtml|ghc-heap)/;
@@ -46,16 +55,36 @@ const run = (cmd, args, opts = {}) => {
   }
 };
 
-console.log(`GHC     ${ghc} (${install.version})`);
+console.log(`GHC     ${ghc} (${install.version}, native - not ghcts's own dist/ghc.cjs)`);
 console.log(`libdir  ${libdir}`);
 console.log(`out     ${out}\n`);
 
+// A marker recording which install produced dist/ghc.cjs, so `--lib-only`
+// can refuse to pair it with a *different* compiler's libraries - which is
+// exactly the failure mode this guards against: nothing about a normal
+// `findGhcJs()` call remembers what built ghc.cjs last time, so an
+// environment change between two runs (a different PATH, ghcup switching its
+// default) silently mismatches an already-built compiler against a
+// different version's boot libraries.
+mkdirSync(out, { recursive: true });
+const marker = join(out, ".ghcts-compiler.json");
+
 // 1. Link the driver. `-ddisable-js-c-sources` is what keeps this pure
 //    JavaScript: without it the link shells out to emcc.
-mkdirSync(out, { recursive: true });
 let work;
 if (process.argv.includes("--lib-only")) {
   console.log("keeping the existing ghc.cjs (--lib-only)");
+  if (existsSync(marker)) {
+    const built = JSON.parse(readFileSync(marker, "utf8"));
+    if (built.ghc !== install.ghc || built.version !== install.version) {
+      console.error(
+        `\ndist/ghc.cjs was built with ${built.ghc} (${built.version}); this run resolved ${install.ghc} (${install.version}).\n` +
+          "Copying this install's libraries next to that compiler would pair mismatched versions.\n" +
+          "Point --ghc/GHCTS_GHC at the compiler in dist/ghc.cjs's own record, or drop --lib-only to rebuild both together.",
+      );
+      process.exit(2);
+    }
+  }
 } else {
   work = mkdtempSync(join(tmpdir(), "ghcts-build-"));
   cpSync(join(here, "Driver.hs"), join(work, "Driver.hs"));
@@ -100,4 +129,5 @@ if (!process.argv.includes("--no-lib")) {
 }
 
 if (work) rmSync(work, { recursive: true, force: true });
+writeFileSync(marker, JSON.stringify({ ghc: install.ghc, version: install.version, libdir }, null, 2));
 console.log("\ndone. `node dist/cli.js --ghcts-version`");

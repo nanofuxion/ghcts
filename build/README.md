@@ -30,6 +30,17 @@ found is asked for its own `--print-libdir` and `--numeric-version`.
    out `ghc`, `Cabal` and `haddock` (needed to build the compiler, never to
    run it) and the profiling and debug ways. 2.7 GB becomes ~130 MB.
 
+`dist/ghc.cjs` is always linked with a *native* GHC that already targets
+JavaScript - never with itself. `findGhcJs()`/`ghcInstallAt()` only ever look
+at `GHCTS_GHC`, `PATH` and ghcup, so there is nothing on that search path to
+self-host with; a compiled bundle is `.cjs`, and the script refuses one.
+
+`--lib-only` skips step 1 and reuses the existing `dist/ghc.cjs`, but still
+resolves an install fresh for step 3 - a PATH or ghcup default can change
+between two runs. `dist/.ghcts-compiler.json` records which install built
+`ghc.cjs` last, and `--lib-only` refuses to pair its libraries with a
+*different* one rather than silently mixing versions.
+
 ## Why -ddisable-js-c-sources
 
 Without it GHC's linker shells out to `emcc` for a package's C sources. That

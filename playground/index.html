@@ -3,73 +3,161 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GHC in the browser</title>
 <style>
-  :root { color-scheme: light dark; --edge: #8883; }
-  body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+  :root { color-scheme: light dark; --edge: #8883; --hover: #8882; --active: #4a90e233; }
+  body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; height: 100vh; display: grid; grid-template-rows: auto auto 1fr; }
   header { display: flex; gap: .75rem; align-items: center; padding: .6rem .9rem; border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
   h1 { font-size: 1rem; margin: 0 .5rem 0 0; font-weight: 600; }
-  button { font: inherit; padding: .3rem .8rem; border: 1px solid var(--edge); border-radius: 6px; background: transparent; cursor: pointer; }
+  button, select { font: inherit; padding: .3rem .8rem; border: 1px solid var(--edge); border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   #status { color: #888; margin-left: auto; }
-  main { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
-  textarea, pre { margin: 0; padding: .8rem; font: 13px/1.5 ui-monospace, monospace; border: 0; background: transparent; color: inherit; }
+  #path { color: #888; font: 12px ui-monospace, monospace; padding: .35rem .8rem; border-bottom: 1px solid var(--edge); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  main { display: flex; min-height: 0; }
+  #sidebar { width: 220px; flex: 0 0 220px; overflow: auto; border-right: 1px solid var(--edge); }
+  #sidebar.collapsed { display: none; }
+  #sidebar.collapsed + .resizer { display: none; }
+  .resizer { flex: 0 0 5px; width: 5px; cursor: col-resize; background: transparent; touch-action: none; }
+  .resizer:hover, .resizer.active { background: var(--active); }
+  body.resizing { cursor: col-resize; user-select: none; }
+  #sidebar-head { display: flex; justify-content: space-between; align-items: center; padding: .5rem .7rem; font-size: 12px; color: #888; }
+  #sidebar-head button { padding: 0 .4rem; border: 0; }
+  #tree ul { list-style: none; margin: 0; padding: 0; }
+  #tree .row { padding: .15rem .6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; font: 12px ui-monospace, monospace; }
+  #tree .row:hover { background: var(--hover); }
+  #tree li.file.active > .row { background: var(--active); font-weight: 600; }
+  #editor, #right { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  textarea, pre { flex: 1; margin: 0; padding: .8rem; font: 13px/1.5 ui-monospace, monospace; border: 0; background: transparent; color: inherit; }
   textarea { resize: none; border-right: 1px solid var(--edge); }
   pre { overflow: auto; white-space: pre-wrap; }
+  #preview { flex: 1; border: 0; background: #fff; }
+  /* A miso app's preview takes the whole column; the compile log only
+     reappears (see the run handler, and the message listener above) if the
+     app itself has something to say - a caught error, most likely. */
+  #right.split #out:empty { display: none; }
+  #right.split #out:not(:empty) { flex: 0 0 8rem; overflow: auto; border-bottom: 1px solid var(--edge); }
   #files { font: 12px ui-monospace, monospace; color: #888; }
 </style>
 
 <header>
   <h1>GHC, in the browser</h1>
+  <button id="sidebar-open" hidden title="Show the file list">Files</button>
   <button id="run" disabled>Compile and run</button>
   <button id="open">Open a folder…</button>
+  <span id="template-row"><select id="template"><option value="prelude">Prelude</option><option value="miso">miso</option></select></span>
   <span id="files"></span>
   <span id="status">loading the compiler…</span>
 </header>
+<div id="path"></div>
 <main>
-  <textarea id="source" spellcheck="false">module Main where
-
-main :: IO ()
-main = putStrLn (unwords (map show (take 10 primes)))
-  where
-    primes = sieve [2 ..]
-    sieve (p : xs) = p : sieve [x | x <- xs, x `mod` p /= 0]
-    sieve [] = []
-</textarea>
-  <pre id="out"></pre>
+  <nav id="sidebar">
+    <div id="sidebar-head"><span>Files</span><button id="sidebar-close" title="Hide the file list">✕</button></div>
+    <div id="tree"></div>
+  </nav>
+  <div class="resizer" id="resize-sidebar"></div>
+  <div id="editor"><textarea id="source" spellcheck="false"></textarea></div>
+  <div class="resizer" id="resize-editor"></div>
+  <div id="right">
+    <pre id="out"></pre>
+    <iframe id="preview" hidden title="program preview"></iframe>
+  </div>
 </main>
 
 <script type="module">
 import { Vfs } from "./vfs.mjs";
 import { runCompiler } from "./host.mjs";
+import { findEntry, mountDirectory } from "./project.mjs";
 
 const $ = (id) => document.getElementById(id);
 const say = (t) => ($("status").textContent = t);
 const print = (t) => ($("out").textContent += t);
+const enc = (s) => new TextEncoder().encode(s);
+const dec = (b) => new TextDecoder().decode(b);
+const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+const TEMPLATES = {
+  prelude: `module Main where
+
+main :: IO ()
+main = putStrLn (unwords (map show (take 10 primes)))
+  where
+    primes = sieve [2 ..]
+    sieve (p : xs) = p : sieve [x | x <- xs, x \`mod\` p /= 0]
+    sieve [] = []
+`,
+  miso: `{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
+module Main where
+
+import Miso
+import qualified Miso.Html as H
+
+data Action = AddOne | SubtractOne
+
+main :: IO ()
+main = startApp defaultEvents (component (0 :: Int) updateModel viewModel) { mountPoint = Just "app" }
+
+updateModel :: Action -> Effect () () Int Action
+updateModel = \\case
+  AddOne      -> modify (+ 1)
+  SubtractOne -> modify (subtract 1)
+
+viewModel :: () -> () -> Int -> View () Int Action
+viewModel _ _ n =
+  H.div_ [] [ H.button_ [ H.onClick AddOne ] [ "+" ], text (ms n), H.button_ [ H.onClick SubtractOne ] [ "-" ] ]
+`,
+};
+
+/** A stall, not just a failure, is the failure mode a fetch of 100+ MB
+ * actually has: the connection sits open with nothing arriving, and `fetch`
+ * on its own waits forever. `onProgress` resets the clock on every chunk, so
+ * this only fires when nothing has arrived for a while - a slow transfer
+ * keeps going as long as bytes keep coming. */
+const STALL_MS = 20_000;
 
 const fetchBytes = async (url, onProgress) => {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${new URL(url, location.href)}`);
-  const total = Number(res.headers.get("content-length")) || 0;
-  const chunks = [];
-  let got = 0;
-  for await (const chunk of res.body) {
-    chunks.push(chunk);
-    got += chunk.length;
-    if (total) onProgress?.(got / total);
+  const controller = new AbortController();
+  let stall = setTimeout(() => controller.abort(new Error(`${url} stalled: nothing arrived for ${STALL_MS / 1000}s`)), STALL_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${new URL(url, location.href)}`);
+    const total = Number(res.headers.get("content-length")) || 0;
+    const chunks = [];
+    let got = 0;
+    for await (const chunk of res.body) {
+      clearTimeout(stall);
+      stall = setTimeout(() => controller.abort(new Error(`${url} stalled: nothing arrived for ${STALL_MS / 1000}s`)), STALL_MS);
+      chunks.push(chunk);
+      got += chunk.length;
+      // A percentage when the server sent a length; downloaded-so-far when it
+      // did not, so "no visible number moving" never means "no visible sign
+      // of life" - those look identical otherwise on a many-second transfer.
+      onProgress?.(total ? { pct: got / total } : { mb: got / 1e6 });
+    }
+    const all = new Uint8Array(got);
+    let at = 0;
+    for (const c of chunks) { all.set(c, at); at += c.length; }
+    return all;
+  } catch (e) {
+    throw e.name === "AbortError" && controller.signal.reason ? controller.signal.reason : e;
+  } finally {
+    clearTimeout(stall);
   }
-  const all = new Uint8Array(got);
-  let at = 0;
-  for (const c of chunks) { all.set(c, at); at += c.length; }
-  return all;
 };
 
 const pct = (x) => `${Math.round(x * 100)}%`;
+const progress = (label) => (p) => say(`${label} ${"pct" in p ? pct(p.pct) : `${p.mb.toFixed(0)} MB`}`);
+
+// A running miso app's own uncaught errors, forwarded from its iframe (see
+// the srcdoc built in the run handler below).
+addEventListener("message", (e) => {
+  if (e.source === $("preview")?.contentWindow && e.data?.ghctsPreviewError) print(`\npreview error: ${e.data.ghctsPreviewError}\n`);
+});
 
 say("fetching the compiler…");
 let source, libBin, libIndex;
 try {
   [source, libBin, libIndex] = await Promise.all([
-    fetchBytes("./assets/ghc.cjs", (p) => say(`compiler ${pct(p)}`)).then((b) => new TextDecoder().decode(b)),
-    fetchBytes("./assets/lib.bin", (p) => say(`libraries ${pct(p)}`)),
+    fetchBytes("./assets/ghc.cjs", progress("compiler")).then(dec),
+    fetchBytes("./assets/lib.bin", progress("libraries")),
     fetch("./assets/lib.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for lib.json`)))),
   ]);
 } catch (e) {
@@ -86,54 +174,239 @@ vfs.mkdirp("/work");
 vfs.mkdirp("/tmp");
 vfs.cwd = "/work";
 
+/** miso's extra boot packages and its own package db, fetched only when a
+ * miso program is actually going to be compiled. */
+let misoPromise;
+const ensureMiso = () =>
+  (misoPromise ??= (async () => {
+    say("fetching miso…");
+    try {
+      const [bin, index] = await Promise.all([
+        fetchBytes("./assets/miso.bin", progress("miso")),
+        fetch("./assets/miso.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for miso.json`)))),
+      ]);
+      for (const { path, offset, size } of index)
+        vfs.writeFile(`/lib/${path}`, { size, load: () => bin.subarray(offset, offset + size) }, 1_600_000_000_000);
+    } catch (e) {
+      // A one-time network hiccup should not wedge the miso template for
+      // the rest of the session: without this, `misoPromise` would stay
+      // set to this same rejected promise, and every later attempt would
+      // fail instantly without ever trying the network again.
+      misoPromise = undefined;
+      throw e;
+    }
+  })());
+
+// --- the file tree, and the one open editor over whichever file is current ---
+
+const editor = $("source");
+/** "/work" for a template, "/project" once a folder is opened. */
+let root = "/work";
+let currentPath;
+/** Real files a folder picker handed us, so edits can be written back to disk. */
+let fileHandles = new Map();
+/** What findEntry() decided about an opened project, or undefined until then. */
+let project;
+/** Toggled by clicking a folder row in the tree. */
+const collapsedDirs = new Set();
+let previewUrl;
+
+async function saveCurrent() {
+  if (!currentPath) return;
+  const bytes = enc(editor.value);
+  vfs.writeFile(currentPath, bytes);
+  const handle = fileHandles.get(currentPath);
+  if (handle) {
+    try {
+      const w = await handle.createWritable();
+      await w.write(bytes);
+      await w.close();
+    } catch (e) {
+      // Best effort: permission can be revoked mid-session, or the browser
+      // granted read-only access. The edit still lives in the VFS either way.
+      console.warn(`could not save ${currentPath} to disk:`, e);
+    }
+  }
+}
+
+function openFile(path) {
+  currentPath = path;
+  editor.value = dec(vfs.readFile(path));
+  $("path").textContent = path;
+  renderTree();
+}
+
+function nodeHtml(path, node, depth) {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const pad = `style="padding-left:${depth * 14 + 6}px"`;
+  if (node.children) {
+    const isCollapsed = collapsedDirs.has(path);
+    const entries = [...node.children.entries()].sort(([an, a], [bn, b]) => (!!a.children === !!b.children ? an.localeCompare(bn) : a.children ? -1 : 1));
+    const kids = isCollapsed ? "" : `<ul>${entries.map(([n, c]) => nodeHtml(`${path}/${n}`, c, depth + 1)).join("")}</ul>`;
+    return `<li class="dir" data-path="${escapeHtml(path)}" data-kind="dir"><div class="row" ${pad}>${isCollapsed ? "▸" : "▾"} ${escapeHtml(name)}/</div>${kids}</li>`;
+  }
+  return `<li class="file${path === currentPath ? " active" : ""}" data-path="${escapeHtml(path)}" data-kind="file"><div class="row" ${pad}>${escapeHtml(name)}</div></li>`;
+}
+
+function renderTree() {
+  const rootNode = vfs.lookup(root);
+  if (!rootNode?.children) { $("tree").innerHTML = ""; return; }
+  const entries = [...rootNode.children.entries()].sort(([an, a], [bn, b]) => (!!a.children === !!b.children ? an.localeCompare(bn) : a.children ? -1 : 1));
+  $("tree").innerHTML = `<ul>${entries.map(([n, c]) => nodeHtml(`${root}/${n}`, c, 0)).join("")}</ul>`;
+}
+
+$("tree").addEventListener("click", async (e) => {
+  const row = e.target.closest("[data-path]");
+  if (!row) return;
+  const path = row.dataset.path;
+  if (row.dataset.kind === "dir") {
+    collapsedDirs.has(path) ? collapsedDirs.delete(path) : collapsedDirs.add(path);
+    renderTree();
+    return;
+  }
+  if (path === currentPath) return;
+  await saveCurrent();
+  openFile(path);
+});
+
+$("sidebar-close").onclick = () => {
+  $("sidebar").classList.add("collapsed");
+  $("sidebar-open").hidden = false;
+};
+$("sidebar-open").onclick = () => {
+  $("sidebar").classList.remove("collapsed");
+  $("sidebar-open").hidden = true;
+};
+
+/** Drag a divider to resize the flex box on its left. `main`'s other panes
+ * (`#right` above all) never get an explicit width, so they simply take up
+ * whatever the dragged ones leave behind. */
+function makeResizer(handle, target, { min, max }) {
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("active");
+    document.body.classList.add("resizing");
+    const startX = e.clientX;
+    const startWidth = target.getBoundingClientRect().width;
+    const onMove = (e2) => {
+      const w = Math.min(max(), Math.max(min, startWidth + (e2.clientX - startX)));
+      target.style.flex = `0 0 ${w}px`;
+    };
+    const onUp = () => {
+      handle.classList.remove("active");
+      document.body.classList.remove("resizing");
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp, { once: true });
+  });
+}
+makeResizer($("resize-sidebar"), $("sidebar"), { min: 140, max: () => innerWidth * 0.6 });
+makeResizer($("resize-editor"), $("editor"), { min: 200, max: () => innerWidth * 0.75 });
+
+// Start on the Prelude template.
+vfs.writeFile("/work/Main.hs", enc(TEMPLATES.prelude));
+openFile("/work/Main.hs");
+renderTree();
+
+$("template").onchange = async () => {
+  await saveCurrent();
+  const kind = $("template").value;
+  vfs.writeFile("/work/Main.hs", enc(TEMPLATES[kind]));
+  openFile("/work/Main.hs");
+  if (kind === "miso") ensureMiso();
+};
+
 say("ready");
 $("run").disabled = false;
 
-/** A folder the user picked, mounted read/write like any other directory. */
-let projectHandle;
 $("open").onclick = async () => {
-  if (!window.showDirectoryPicker) return say("this browser has no folder picker");
-  projectHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-  let count = 0;
-  const mount = async (handle, at) => {
-    for await (const [name, entry] of handle.entries()) {
-      if (entry.kind === "directory") { vfs.mkdirp(`${at}/${name}`); await mount(entry, `${at}/${name}`); }
-      else {
-        const file = await entry.getFile();
-        vfs.writeFile(`${at}/${name}`, new Uint8Array(await file.arrayBuffer()), file.lastModified);
-        count++;
-      }
+  if (!window.showDirectoryPicker) { say("this browser has no folder picker"); return; }
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ mode: "readwrite" });
+  } catch (e) {
+    if (e.name !== "AbortError") say(`could not open a folder: ${e.message}`);
+    return;
+  }
+  try {
+    await saveCurrent();
+    say("reading the folder…");
+    const { count, handles } = await mountDirectory(vfs, handle, "/project");
+    fileHandles = handles;
+    root = "/project";
+    vfs.cwd = "/project";
+    project = findEntry(vfs, "/project");
+    $("template-row").hidden = true;
+    $("files").textContent = `${handle.name}/ — ${count} files`;
+    $("sidebar").classList.remove("collapsed");
+    $("sidebar-open").hidden = true;
+    renderTree();
+    if (project) {
+      openFile(`/project/${project.entry}`);
+      say(project.usesMiso ? "folder mounted — a miso web app; edit and compile" : "folder mounted; edit and compile");
+      if (project.usesMiso) ensureMiso();
+    } else {
+      currentPath = undefined;
+      say("folder mounted, but no entry point was found in it — pick a file to edit");
     }
-  };
-  vfs.mkdirp("/project");
-  await mount(projectHandle, "/project");
-  vfs.cwd = "/project";
-  $("files").textContent = `${projectHandle.name}/ — ${count} files`;
-  say("folder mounted; edit and compile as usual");
+  } catch (e) {
+    say(`could not read the folder: ${e.message}`);
+  }
 };
 
 $("run").onclick = async () => {
   $("run").disabled = true;
   $("out").textContent = "";
+  $("preview").hidden = true;
+  $("right").classList.remove("split");
   try {
-    const inProject = vfs.cwd === "/project";
-    if (!inProject) vfs.writeFile("/work/Main.hs", new TextEncoder().encode($("source").value));
+    await saveCurrent();
+    const inProject = root === "/project";
+    const usesMiso = inProject ? (project?.usesMiso ?? false) : $("template").value === "miso";
+    const entry = inProject ? project?.entry : "Main.hs";
+    if (!entry) { say("pick a file to compile"); return; }
+    const includeDirs = inProject ? project?.includeDirs ?? ["."] : ["."];
+
+    if (usesMiso) { say("fetching miso…"); await ensureMiso(); }
+
+    const args = ["/lib", "-ddisable-js-c-sources", "-O0"];
+    if (usesMiso) args.push("-package-db", "/lib/pkgs/package.conf.d", "-package", "miso");
+    if (includeDirs.length && !(includeDirs.length === 1 && includeDirs[0] === ".")) args.push(`-i${includeDirs.join(":")}`);
+    args.push(entry);
+
     say("compiling…");
     const started = performance.now();
-    const code = await runCompiler({
-      source,
-      vfs,
-      argv: ["/lib", "-ddisable-js-c-sources", "-O0", "Main.hs"],
-      onOutput: print,
-    });
+    const code = await runCompiler({ source, vfs, argv: args, onOutput: print });
     const took = ((performance.now() - started) / 1000).toFixed(1);
     if (code !== 0) { say(`compile failed in ${took}s`); return; }
 
-    say(`compiled in ${took}s — running`);
-    const built = new TextDecoder().decode(vfs.readFile(`${vfs.cwd}/Main.jsexe/all.js`));
-    // The program is another node-shaped bundle; give it the same host.
-    await runCompiler({ source: built, vfs, argv: [], onOutput: print });
-    say(`done in ${took}s to compile`);
+    // GHC names the .jsexe after the entry file's own basename, in cwd -
+    // not after the directory the source lives in.
+    const base = entry.slice(entry.lastIndexOf("/") + 1).replace(/\.hs$/i, "");
+    const allJs = `${root}/${base}.jsexe/all.js`;
+    const built = vfs.readFile(allJs);
+
+    if (usesMiso) {
+      // The compile log ("compilation succeeded" and the like) has done its
+      // job; the app takes the whole column unless it has something to say.
+      $("out").textContent = "";
+      $("right").classList.add("split");
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(new Blob([built], { type: "text/javascript" }));
+      // srcdoc keeps the page's own origin (no `sandbox` attribute), so the
+      // app's own errors can be surfaced straight into the log above it.
+      $("preview").srcdoc = `<!doctype html><meta charset="utf-8"><body><div id="app"></div><script>window.onerror=(m)=>parent.postMessage({ghctsPreviewError:String(m)},"*");<\/script><script src="${previewUrl}"><\/script></body>`;
+      $("preview").hidden = false;
+      say(`done in ${took}s`);
+    } else {
+      say(`compiled in ${took}s — running`);
+      // The program is another node-shaped bundle; give it the same host.
+      await runCompiler({ source: dec(built), vfs, argv: [], onOutput: print });
+      say(`done in ${took}s to compile`);
+    }
   } catch (e) {
     say(`failed: ${e.message}`);
     print(`\n${e.stack ?? e}\n`);
