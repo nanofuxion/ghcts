@@ -1,0 +1,16 @@
+packages: .
+          /Volumes/Storage/Projects/ghcts/references/miso
+          /private/tmp/claude-501/-Volumes-Storage-Projects-ghcts/0a960d38-46a7-418b-a9d2-9973a0c0b314/scratchpad/ghcjs-base
+
+with-compiler: /nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc-9.12.2
+with-hc-pkg:   /nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-ghc-pkg-9.12.2
+program-locations
+  hsc2hs-location: /nix/store/pbhncgl2a7y0wlvpc8nxanxf0lhlf074-javascript-unknown-ghcjs-ghc-native-bignum-9.12.2/bin/javascript-unknown-ghcjs-hsc2hs
+  alex-location: /Volumes/Storage/.local/bin/alex
+  happy-location: /Volumes/Storage/.local/bin/happy
+
+optimization: False
+allow-newer: all:base, all:template-haskell, all:ghc-prim, all:bytestring, all:text, all:containers, all:primitive, all:time, all:transformers, all:mtl, all:deepseq, all:binary
+
+package miso
+  flags: +native
