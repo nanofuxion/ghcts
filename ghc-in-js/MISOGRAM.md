@@ -85,3 +85,21 @@ type family Mutability (a :: MutabilityType s) :: IsItMutable where
 
 `cabal_macros.h` here supplies the `MIN_VERSION_*` macros ghcjs-base expects
 for packages that are not in this build.
+
+## On the device
+
+Packed with `scripts/pack-lynx.mjs` and served as `host-lynx`'s
+`misogram-ghc` route, the bundle GHC-in-JavaScript produced runs on a Pixel
+under Lynx Explorer with no errors in logcat: splash, feed, stories, the
+photo carousel, and tab navigation.
+
+Same gestures, GHC's bundle against ghcts's, measured as the gap between
+`Miso.effects` and `Miso.patches` in logcat:
+
+| | GHC-in-JS bundle | ghcts bundle |
+| --- | --- | --- |
+| swipe -> carousel 1/3 to 2/3 | 4.5 s | 2.0 s |
+| tab tap -> explore grid | 0.55 s | 0.29 s |
+
+ghcts is about twice as fast here, at `-O0` on both sides; GHC's own `-O`
+was not measured.
