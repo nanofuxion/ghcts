@@ -109,3 +109,10 @@ Four things, all in `host.mjs`, none of them touching the compiler:
 Serve both with `Content-Encoding: gzip` and a long cache. Neither has been
 shrunk yet: the compiler is linked at `-O0` with no dead-code pass, and the
 library blob keeps every module of every boot package.
+
+`pack-assets.mjs` splits each of these into 20 MiB chunks (`ghc.cjs.0`,
+`ghc.cjs.1`, … plus `ghc.cjs.chunks.json` naming the count); the page
+refetches and reassembles them before use. This is for Cloudflare Pages,
+which refuses any single deployed file over 25 MiB - the whole `playground/`
+directory, `assets/` included, can be pointed at directly as its build
+output.

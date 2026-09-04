@@ -143,6 +143,23 @@ const fetchBytes = async (url, onProgress) => {
   }
 };
 
+/** Cloudflare Pages refuses any file over 25 MiB, so pack-assets.mjs splits
+ * each blob into `${base}.0`, `${base}.1`, … - `${base}.chunks.json` says
+ * how many to fetch, in order, before they are reassembled into one blob. */
+const fetchChunked = async (base, onProgress) => {
+  const n = Number(await fetch(`${base}.chunks.json`).then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status} for ${base}.chunks.json`)))));
+  const parts = new Array(n);
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    parts[i] = await fetchBytes(`${base}.${i}`, (p) => onProgress?.({ pct: (i + (p.pct ?? 0)) / n }));
+    total += parts[i].length;
+  }
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) { all.set(p, at); at += p.length; }
+  return all;
+};
+
 const pct = (x) => `${Math.round(x * 100)}%`;
 const progress = (label) => (p) => say(`${label} ${"pct" in p ? pct(p.pct) : `${p.mb.toFixed(0)} MB`}`);
 
@@ -156,8 +173,8 @@ say("fetching the compiler…");
 let source, libBin, libIndex;
 try {
   [source, libBin, libIndex] = await Promise.all([
-    fetchBytes("./assets/ghc.cjs", progress("compiler")).then(dec),
-    fetchBytes("./assets/lib.bin", progress("libraries")),
+    fetchChunked("./assets/ghc.cjs", progress("compiler")).then(dec),
+    fetchChunked("./assets/lib.bin", progress("libraries")),
     fetch("./assets/lib.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for lib.json`)))),
   ]);
 } catch (e) {
@@ -182,7 +199,7 @@ const ensureMiso = () =>
     say("fetching miso…");
     try {
       const [bin, index] = await Promise.all([
-        fetchBytes("./assets/miso.bin", progress("miso")),
+        fetchChunked("./assets/miso.bin", progress("miso")),
         fetch("./assets/miso.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for miso.json`)))),
       ]);
       for (const { path, offset, size } of index)

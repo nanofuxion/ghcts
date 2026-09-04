@@ -12,7 +12,7 @@
  * to produce `dist/pkgs` (miso, ghcjs-base, aeson… — everything web miso
  * needs that is not already a boot package).
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,7 +34,20 @@ const allFiles = (dir) => {
   return found;
 };
 
-/** Write one `{name}.bin` + `{name}.json` pair from disk paths and their VFS-relative paths. */
+// Cloudflare Pages refuses any deployed file over 25 MiB, and these blobs
+// are hundreds of MB. Split each one into `${path}.0`, `${path}.1`, … plus
+// a `${path}.chunks.json` naming how many parts to fetch and reassemble;
+// the offsets in `{name}.json` still index into the blob as a whole, so
+// nothing downstream of pack() needs to know it was ever split.
+const CHUNK = 20 * 1024 * 1024;
+function writeChunked(path, buffer) {
+  const n = Math.max(1, Math.ceil(buffer.length / CHUNK));
+  for (let i = 0; i < n; i++) writeFileSync(`${path}.${i}`, buffer.subarray(i * CHUNK, (i + 1) * CHUNK));
+  writeFileSync(`${path}.chunks.json`, String(n));
+  return n;
+}
+
+/** Write one chunked `{name}.bin.*` + `{name}.json` pair from disk paths and their VFS-relative paths. */
 function pack(name, entries) {
   const chunks = [];
   let offset = 0;
@@ -45,9 +58,10 @@ function pack(name, entries) {
     offset += bytes.length;
     return entry;
   });
-  writeFileSync(join(out, `${name}.bin`), Buffer.concat(chunks));
+  const binPath = join(out, `${name}.bin`);
+  const n = writeChunked(binPath, Buffer.concat(chunks));
   writeFileSync(join(out, `${name}.json`), JSON.stringify(index));
-  console.log(`${index.length} files, ${(offset / 1e6).toFixed(0)} MB -> ${join(out, `${name}.bin`)}`);
+  console.log(`${index.length} files, ${(offset / 1e6).toFixed(0)} MB -> ${binPath} (${n} chunk${n === 1 ? "" : "s"})`);
   return index;
 }
 
@@ -63,8 +77,9 @@ if (process.argv.includes("--minimal") || !process.argv.includes("--miso")) {
     console.error(`${compiler} is missing. Build it first: node build/build-compiler.mjs`);
     process.exit(2);
   }
-  cpSync(compiler, join(out, "ghc.cjs"));
-  console.log(`${(statSync(compiler).size / 1e6).toFixed(0)} MB -> ${join(out, "ghc.cjs")}`);
+  const compilerOut = join(out, "ghc.cjs");
+  const n = writeChunked(compilerOut, readFileSync(compiler));
+  console.log(`${(statSync(compiler).size / 1e6).toFixed(0)} MB -> ${compilerOut} (${n} chunks)`);
 
   const wanted = process.argv.includes("--minimal");
   const kept = allFiles(lib)
