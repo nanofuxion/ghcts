@@ -1,6 +1,8 @@
 node_modules/
 dist/
 test/fixtures/*/dist/
+.wrangler/
+bun.lock
 
 # macOS
 .DS_Store
