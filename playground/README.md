@@ -121,7 +121,13 @@ same builds `dist/pkgs` already holds, so the two databases stack and the
 alternate is 11 MB rather than 90. `pack-assets.mjs` packs each one as its own
 blob and records it in `pkgs.json`, and the page fetches it only when a
 mounted project's pin names it. `-package-id miso-1.10.0.0-inplace` is what
-selects it: `-package miso` would take the newest version on offer.
+selects it: `-package miso` would take the newest version on offer. A
+`dist/pkgs-<ref>` holding the same build `dist/pkgs` already does is not packed
+at all, so a pin on the default revision costs no extra fetch.
+
+The examples on haskell-miso.org pin 1.13.0 for the most part, and 1.10.0 or
+1.12.0 for the rest, so those are the builds that ship: 1.13.0 as the default
+`dist/pkgs`, the other two as alternates.
 
 An old miso may need a fix to build or run under this compiler, the same way
 ghcjs-base does. `miso-<ref>.patch` beside `build.mjs` is applied to the

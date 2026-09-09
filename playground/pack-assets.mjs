@@ -187,12 +187,20 @@ if (process.argv.includes("--miso")) {
   // blob, fetched only when a project asks for it, and holds only miso: its
   // dependencies are the ones `pkgs` already carries.
   index.alternates = {};
+  const defaultMiso = readdirSync(confDir).find((f) => f.startsWith("miso-") && f.endsWith(".conf"));
   for (const dir of readdirSync(join(root, "dist")).filter((d) => d.startsWith("pkgs-"))) {
     const ref = dir.slice("pkgs-".length);
     const from = join(root, "dist", dir);
     const conf = readdirSync(join(from, "package.conf.d")).find((f) => f.startsWith("miso-") && f.endsWith(".conf"));
     if (!conf) {
       console.error(`${from} has no miso package; skipping`);
+      continue;
+    }
+    // The same build the default database already carries. Recording it would
+    // cost every project that pins this revision an 11 MB fetch for a package
+    // it has.
+    if (conf === defaultMiso) {
+      console.error(`${ref} is what dist/pkgs holds; not packing it twice`);
       continue;
     }
     pack(`miso-${ref}`, allFiles(from).map((p) => ({ diskPath: p, vfsPath: `${dir}/${relative(from, p)}` })));
