@@ -150,6 +150,26 @@ test("parseCabal turns default-language and default-extensions into -X flags", (
   deepStrictEqual(exe.extensions, ["-XGHC2021", "-XLambdaCase", "-XOverloadedStrings"]);
 });
 
+test("parseCabal reads a common block and the branch that applies", () => {
+  const [exe] = parseCabal(
+    [
+      "common opts",
+      "  default-extensions: LambdaCase",
+      "",
+      "executable app",
+      "  import: opts",
+      "  main-is: Main.hs",
+      "  if arch(wasm32)",
+      "    cpp-options: -DWASM",
+      "  else",
+      "    cpp-options: -DJS",
+      "  default-extensions: OverloadedStrings",
+    ].join("\n"),
+  );
+  deepStrictEqual(exe.extensions, ["-XLambdaCase", "-XOverloadedStrings"], "the common block's are there too");
+  deepStrictEqual(exe.cppOptions, ["-DJS"], "not the wasm branch's");
+});
+
 test("parseGitHubUrl reads the forms people actually paste", () => {
   deepStrictEqual(parseGitHubUrl("https://github.com/haskell-miso/mario"), { owner: "haskell-miso", repo: "mario", ref: "HEAD", dir: "" });
   deepStrictEqual(parseGitHubUrl("haskell-miso/mario"), { owner: "haskell-miso", repo: "mario", ref: "HEAD", dir: "" });

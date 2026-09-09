@@ -486,7 +486,11 @@ $("run").onclick = async () => {
     if (alternate) args.push("-package-db", `/lib/${alternate.db}/package.conf.d`, "-package-id", alternate.id);
     for (const name of needed) if (pkgIndex.expose.includes(name) && !(alternate && name === "miso")) args.push("-package", name);
     if (includeDirs.length && !(includeDirs.length === 1 && includeDirs[0] === ".")) args.push(`-i${includeDirs.join(":")}`);
-    args.push(...(inProject ? project?.extensions ?? [] : []));
+    // What the .cabal asks for: `-X` from default-language and
+    // default-extensions, `-D` from cpp-options, and the extension that makes
+    // those defines reachable at all.
+    const fromCabal = inProject ? [...(project?.extensions ?? []), ...(project?.cppOptions ?? [])] : [];
+    args.push(...fromCabal, ...(fromCabal.some((f) => f.startsWith("-D")) ? ["-XCPP"] : []));
     // Left to itself GHC names the output after the entry file and drops it
     // beside the source, so `src/Main.hs` becomes `src/Main.jsexe`. Naming it
     // instead is one less thing to guess. Clear it first: GHC links nothing

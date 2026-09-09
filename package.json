@@ -15,7 +15,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp dist/cabal.js playground/cabal.js",
     "build:compiler": "npm run build && node build/build-compiler.mjs",
     "test": "npm run build && node --test test/*.test.mjs",
     "check": "tsc -p tsconfig.json --noEmit",

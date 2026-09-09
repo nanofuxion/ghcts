@@ -7,7 +7,12 @@
  * `.cabal` parsing below, are exercised from plain node in
  * `test/project.test.mjs` against a handle built from an object literal.
  * There is no way to script the browser's own folder picker.
+ *
+ * The `.cabal` reading itself is `cabal.js`, the same module the CLI uses,
+ * copied here by `npm run build` because a page can only load what is served
+ * under `playground/`.
  */
+import { dependencies as cabalDependencies, extensions as cabalExtensions, parseCabal as cabalStanzas, withImports, words as cabalWords } from "./cabal.js";
 
 /** Recursively copy a picked directory into the VFS, keeping file handles so
  * edits can be written back to the real files they came from. */
@@ -34,74 +39,27 @@ export async function mountDirectory(vfs, handle, root) {
   return { count, handles };
 }
 
-/** A cabal `key: value` field, value on the same line or indented below it.
- * Not a real parser: stanza nesting (`if`/`else`) is not tracked, so a field
- * written only inside a conditional block is read as if it were not. Real
- * projects put `main-is`/`hs-source-dirs`/`build-depends` at the stanza's top
- * level, which this covers. */
-function parseCabalStanzas(text) {
-  const stanzas = [];
-  let current;
-  let field, fieldIndent;
-  const indentOf = (raw) => raw.length - raw.trimStart().length;
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/--.*$/, "");
-    const header = /^(executable|library|test-suite|benchmark)\b\s*(\S*)/.exec(line);
-    if (header && !/^\s/.test(raw)) {
-      current = { type: header[1], name: header[2] || "", fields: new Map() };
-      stanzas.push(current);
-      field = undefined;
-      continue;
-    }
-    if (!/^\s/.test(raw) && raw.trim() !== "") {
-      current = undefined; // a new top-level (non-stanza) block
-      field = undefined;
-      continue;
-    }
-    if (!current || !raw.trim()) continue;
-    const kv = /^\s+([a-zA-Z][a-zA-Z0-9_-]*):\s*(.*)$/.exec(raw);
-    if (kv) {
-      field = kv[1].toLowerCase();
-      fieldIndent = indentOf(raw);
-      const list = current.fields.get(field) ?? [];
-      if (kv[2].trim()) list.push(kv[2].trim());
-      current.fields.set(field, list);
-    } else if (field && indentOf(raw) > fieldIndent) {
-      // Deeper than the `key:` line it follows, so it is that field's
-      // continuation. Anything shallower is a conditional block
-      // (`if os(darwin)` and the like) this parser does not descend into -
-      // stop attributing lines to `field` until a real key: line appears.
-      current.fields.get(field).push(raw.trim());
-    } else {
-      field = undefined;
-    }
-  }
-  return stanzas;
-}
-
-const words = (values) => values.flatMap((v) => v.split(/\s+/)).filter(Boolean);
-/** `build-depends` entries carry version constraints: `miso >= 1 && < 2`. */
-const bareDependencies = (values) =>
-  values
-    .join(" ")
-    .split(",")
-    .map((s) => s.trim().split(/\s/)[0])
-    .filter(Boolean);
-
-/** Every runnable stanza a `.cabal` file declares, in file order. */
+/** Every runnable stanza a `.cabal` file declares, in file order, reduced to
+ * the pieces a compile needs. */
 export function parseCabal(text) {
-  return parseCabalStanzas(text)
+  const stanzas = cabalStanzas(text);
+  return stanzas
     .filter((s) => s.type === "executable" || s.type === "test-suite")
-    .map((s) => ({
-      name: s.name,
-      mainIs: s.fields.get("main-is")?.join(" ").trim(),
-      hsSourceDirs: s.fields.has("hs-source-dirs") ? words(s.fields.get("hs-source-dirs")) : ["."],
-      dependencies: bareDependencies(s.fields.get("build-depends") ?? []),
-      // `default-language: GHC2021` and `default-extensions:` are `-X` flags
-      // by another name, and a real project's modules do not compile without
-      // them - cabal is what would normally pass them on.
-      extensions: [...words(s.fields.get("default-language") ?? []), ...words(s.fields.get("default-extensions") ?? [])].map((x) => `-X${x}`),
-    }))
+    .map((s) => withImports(stanzas, s))
+    .map((s) => {
+      const dirs = cabalWords(s, "hs-source-dirs");
+      return {
+        name: s.name,
+        mainIs: cabalWords(s, "main-is")[0],
+        hsSourceDirs: dirs.length ? dirs : ["."],
+        dependencies: cabalDependencies(s),
+        // `default-language` and `default-extensions` are `-X` flags by
+        // another name, and `cpp-options` are `-D`s. cabal is what would
+        // otherwise be passing them on.
+        extensions: cabalExtensions(s),
+        cppOptions: cabalWords(s, "cpp-options"),
+      };
+    })
     .filter((e) => e.mainIs);
 }
 
@@ -111,7 +69,7 @@ function parseGhctsJson(text) {
   const j = JSON.parse(text);
   if (!j.entry?.module) return [];
   const dirs = j.sourceRoots?.length ? j.sourceRoots : ["."];
-  return [{ name: j.entry.export ?? "main", mainIs: `${j.entry.module.split(".").join("/")}.hs`, hsSourceDirs: dirs, dependencies: j.dependencies ?? [], extensions: [] }];
+  return [{ name: j.entry.export ?? "main", mainIs: `${j.entry.module.split(".").join("/")}.hs`, hsSourceDirs: dirs, dependencies: j.dependencies ?? [], extensions: [], cppOptions: [] }];
 }
 
 /**
@@ -130,14 +88,14 @@ export function findEntry(vfs, root) {
     for (const dir of c.hsSourceDirs) {
       const rel = dir === "." ? c.mainIs : `${dir}/${c.mainIs}`;
       if (vfs.lookup(`${root}/${rel}`))
-        return { entry: rel, includeDirs: c.hsSourceDirs, dependencies: c.dependencies, extensions: c.extensions, usesMiso: c.dependencies.includes("miso") };
+        return { entry: rel, includeDirs: c.hsSourceDirs, dependencies: c.dependencies, extensions: c.extensions, cppOptions: c.cppOptions, usesMiso: c.dependencies.includes("miso") };
     }
   }
 
   for (const guess of ["Main.hs", "app/Main.hs", "src/Main.hs"])
     if (vfs.lookup(`${root}/${guess}`)) {
       const dir = guess.includes("/") ? guess.slice(0, guess.lastIndexOf("/")) : ".";
-      return { entry: guess, includeDirs: [dir], dependencies: [], extensions: [], usesMiso: false };
+      return { entry: guess, includeDirs: [dir], dependencies: [], extensions: [], cppOptions: [], usesMiso: false };
     }
 
   return undefined;

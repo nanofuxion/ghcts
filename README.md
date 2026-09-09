@@ -29,11 +29,18 @@ Every GHC flag passes straight through. Three are our own:
 ghcts --ghcts-project . -o app
 ```
 
-Project mode reads the directory's `.cabal` and `cabal.project`, checks out
-whatever the project pins to a git revision, and compiles those sources along
-with the program - one `--make` run over both, with the flags each `.cabal`
-asks for, into `dist-ghcts/`. Nothing is prebuilt: the second build only
-redoes what changed, because GHC's own recompilation checking is the cache.
+Project mode reads the directory's `.cabal` and `cabal.project`, and takes
+each dependency the project pins to a git revision.
+
+A pin that is already built is not built again. `dist/pkgs-<revision>` is
+used when it is that revision, and the ordinary `dist/pkgs` otherwise:
+compiling a library takes tens of minutes, and a version mismatch says so in
+seconds. `haskell-miso/mario` builds in 74 seconds this way, `flatris` in 52.
+
+A pin nothing has is fetched and compiled with the program - one `--make` run
+over both, with the flags each `.cabal` asks for, into `dist-ghcts/`. The
+second build only redoes what changed, because GHC's own recompilation
+checking is the cache.
 
 That is the dependency that varies between projects. `miso` is pinned by
 revision in every app in the haskell-miso organisation, and each app wants a
@@ -44,7 +51,9 @@ cabal's job, and `cabal build --with-compiler` is the way to have it.
 
 The `.cabal` reading is real enough for real files: `common` blocks and the
 `import:` that pulls them in, and `if`/`elif`/`else` resolved against this
-compiler rather than collected from every branch at once.
+compiler rather than collected from every branch at once. The browser uses
+the same module - `npm run build` copies it to `playground/cabal.js`, since a
+page can only load what is served under `playground/`.
 
 ## As a library
 

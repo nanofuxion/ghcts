@@ -21,6 +21,10 @@ references/video/
 # Built compiler assets (node build/build-compiler.mjs, node playground/pack-assets.mjs)
 playground/assets/
 
+# The .cabal reader, copied out of dist by `npm run build`: a page can only
+# load what is served under playground/.
+playground/cabal.js
+
 # build/miso-web/build.mjs clones ghcjs-base, checks out a worktree per
 # --ref, and configures cabal at build time; none of that is meant to be
 # committed.

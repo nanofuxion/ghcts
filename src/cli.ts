@@ -14,7 +14,7 @@
  *   --ghcts-version   what this is, and where its pieces live
  *   --ghcts-libdir <dir>
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { bundledCompiler, findGhcJs } from "./find-ghc.js";
 import { compile } from "./compiler.js";
@@ -33,10 +33,10 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
       "",
       "  ghcts --ghcts-project [dir] [ghc flags]",
       "",
-      "Project mode reads the directory's .cabal and cabal.project, checks out",
-      "each dependency it pins to a git revision, and builds those from source",
-      "along with the program. Nothing is prebuilt and nothing is fetched from",
-      "Hackage; a dependency's own dependencies come from a package database.",
+      "Project mode reads the directory's .cabal and cabal.project and takes",
+      "each dependency it pins to a git revision. One a package database has",
+      "already is used as it is; anything else is checked out and built from",
+      "source along with the program. Nothing is fetched from Hackage.",
       "",
       "  --ghcts-version        what this is, and where its pieces live",
       "  --ghcts-libdir <dir>   use another GHC libdir",
@@ -77,10 +77,18 @@ if (project !== undefined) {
   // A pinned dependency is built from source, but its *own* dependencies are
   // ordinary Hackage packages, and those come from the database beside the
   // compiler unless the caller names another.
-  const bundledDb = bundledCompiler() && join(bundledCompiler()!.libdir, "..", "pkgs", "package.conf.d");
+  const dist = bundledCompiler() && join(bundledCompiler()!.libdir, "..");
+  const bundledDb = dist && join(dist, "pkgs", "package.conf.d");
   const named = argv.flatMap((a, i) => (a === "-package-db" ? [argv[i + 1]!] : []));
   const db = bundledDb && existsSync(bundledDb) && named.length === 0 ? [bundledDb] : named;
-  plan = planProject(resolve(project || "."), db);
+  // `dist/pkgs-<revision>` is a build of a pinned dependency at that revision,
+  // the same shape `build/miso-web/build.mjs --ref` writes for the browser.
+  const alternates = Object.fromEntries(
+    (dist && existsSync(dist) ? readdirSync(dist) : [])
+      .filter((d) => d.startsWith("pkgs-"))
+      .map((d) => [d.slice("pkgs-".length), join(dist!, d, "package.conf.d")]),
+  );
+  plan = planProject(resolve(project || "."), db, alternates);
   args = [...(named.length === 0 ? db.flatMap((d) => ["-package-db", d]) : []), ...plan.args, ...argv, plan.entry];
 }
 

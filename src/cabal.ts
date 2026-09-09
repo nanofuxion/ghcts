@@ -5,8 +5,9 @@
  * the only fields read are the ones a build needs. Real projects put those at
  * a stanza's top level, which is what this covers.
  *
- * `playground/project.mjs` parses `.cabal` too, for the browser, over a
- * virtual filesystem and only far enough to find where a program starts.
+ * The browser uses this too: `npm run build` copies the compiled module to
+ * `playground/cabal.js`, because a page can only load what is served under
+ * `playground/`.
  */
 
 export interface Stanza {

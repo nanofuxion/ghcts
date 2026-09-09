@@ -13,6 +13,10 @@
  * One process, one dependency graph, no archives and no package registration.
  * Nothing is fetched from Hackage: a dependency's *own* dependencies come from
  * a package database, which is what `dist/pkgs` still is.
+ *
+ * A pin that is *already built* is not built again. A database named after the
+ * revision is used first, then the default one; only a pin nothing has is
+ * fetched and compiled, which is the slow path and the point of the exercise.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
@@ -84,7 +88,27 @@ export function packageNames(db: string): Set<string> {
  *   has a prebuilt copy in one of them can be hidden in favour of the source
  * @param cache where pinned checkouts are kept, `~/.cache/ghcts/src` by default
  */
-export function planProject(dir: string, databases: string[] = [], cache = join(homedir(), ".cache", "ghcts", "src")): Plan {
+/** The unit id a database holds for a package, which is what selects that
+ * build rather than the newest version on offer. */
+const packageId = (db: string, name: string) =>
+  readdirSync(db)
+    .find((f) => f.startsWith(`${name}-`) && f.endsWith(".conf"))
+    ?.replace(/\.conf$/, "");
+
+/**
+ * @param dir the project root, holding its `.cabal` and `cabal.project`
+ * @param databases package databases the build will see, so a pin one of them
+ *   already holds is used rather than built again
+ * @param alternates package databases by the revision they were built from, so
+ *   a pin naming that revision gets exactly that build
+ * @param cache where pinned checkouts are kept, `~/.cache/ghcts/src` by default
+ */
+export function planProject(
+  dir: string,
+  databases: string[] = [],
+  alternates: Record<string, string> = {},
+  cache = join(homedir(), ".cache", "ghcts", "src"),
+): Plan {
   const registered = new Set(databases.flatMap((db) => [...packageNames(db)]));
   const stanzas = cabalIn(dir);
   const app = stanzas.find((s) => s.type !== "library" && s.fields.has("main-is"));
@@ -102,6 +126,20 @@ export function planProject(dir: string, databases: string[] = [], cache = join(
   // A pin the project does not actually depend on is not worth building.
   const wanted = new Set(dependencies(app));
   for (const pin of pins.filter((p) => wanted.has(p.name))) {
+    // Built already, for this very revision.
+    const alternate = pin.tag ? alternates[pin.tag] : undefined;
+    if (alternate) {
+      const id = packageId(alternate, pin.name);
+      console.error(`ghcts: ${pin.name} ${pin.tag} is built already, in ${alternate}`);
+      hide.push("-package-db", alternate, ...(id ? ["-package-id", id] : ["-package", pin.name]));
+      continue;
+    }
+    // Built already, though not necessarily from this revision. Compiling a
+    // library takes tens of minutes, and a mismatch says so in seconds.
+    if (registered.has(pin.name)) {
+      console.error(`ghcts: ${pin.name} is in a package database already, not building it`);
+      continue;
+    }
     const at = pin.subdir ? join(ensureCheckout(pin, cache), pin.subdir) : ensureCheckout(pin, cache);
     const lib = cabalIn(at).find((s) => s.type === "library");
     if (!lib) throw new Error(`${pin.name} has no library stanza in ${at}`);
@@ -109,9 +147,6 @@ export function planProject(dir: string, databases: string[] = [], cache = join(
     for (const f of extensions(lib)) flags.add(f);
     for (const d of words(lib, "cpp-options")) flags.add(d);
     jsSources.push(...words(lib, "js-sources").map((f) => resolve(at, f)));
-    // A database may hold a build of this same library. The source wins, and
-    // hiding the package is what stops the two colliding.
-    if (registered.has(pin.name)) hide.push("-hide-package", pin.name);
   }
   // `cpp-options` are only reachable with the extension that turns cpp on.
   if ([...flags].some((f) => f.startsWith("-D"))) flags.add("-XCPP");
