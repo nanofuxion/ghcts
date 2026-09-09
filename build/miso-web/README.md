@@ -5,9 +5,19 @@ the way a page renders it — through the DOM, not through Lynx — and collects
 it into a relocatable package database the playground can fetch.
 
 ```bash
-node build/miso-web/build.mjs
+node build/miso-web/build.mjs                # references/miso -> dist/pkgs
+node build/miso-web/build.mjs --ref 1.10.0   # that tag -> dist/pkgs-1.10.0
 node playground/pack-assets.mjs --miso
 ```
+
+`--ref` builds a second miso from a git ref of the same repository, for a
+project whose `cabal.project` pins that one; see "More than one miso" in
+`playground/README.md`. It gets its own worktree and its own cabal project
+beside this one, so the default build is left alone, and only miso is kept
+afterwards - the dependencies are the same builds `dist/pkgs` already holds.
+An old miso may need a fix to build or run under this compiler, the same way
+ghcjs-base does: `miso-<ref>.patch` beside `build.mjs` is applied to the
+worktree if it is there.
 
 ## Why this is a separate build
 
@@ -16,10 +26,10 @@ node playground/pack-assets.mjs --miso
 the default build — the DOM backend, `js/miso.js`, `ffi/js` — same source,
 different package. The one flag asked for is `+template-haskell`, which adds
 `Miso.Lens.TH` and `Miso.FFI.QQ`; the miso examples use both, and the
-playground can run a splice (see `playground/README.md`). Only miso and ghcjs-base are
-rebuilt; the cabal store already has aeson, vector and the rest of
-ghcjs-base's dependencies from an earlier native build against the same
-compiler, and this reuses them rather than rebuilding.
+playground can run a splice (see `playground/README.md`). Only miso and
+ghcjs-base are rebuilt; the cabal store already has aeson, vector and the
+rest of ghcjs-base's dependencies from an earlier native build against the
+same compiler, and this reuses them rather than rebuilding.
 
 `ghcjs-base` at the revision miso pins does not build under GHC 9.12 —
 `ghcjs-base-ghc912.patch` is the fix, recorded first in
