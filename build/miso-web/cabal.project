@@ -14,6 +14,9 @@ allow-newer: all:base, all:template-haskell, all:ghc-prim, all:bytestring,
              all:transformers, all:mtl, all:deepseq, all:binary
 
 package miso
+  -- Miso.Lens.TH and Miso.FFI.QQ, which the examples use. They are Template
+  -- Haskell, which the playground can run: see host.mjs's interpreter.
+  flags: +template-haskell
   ghc-options: -ddisable-js-c-sources
 
 package ghcjs-base

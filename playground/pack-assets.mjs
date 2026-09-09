@@ -10,9 +10,11 @@
  * than 147 MB) and always copies `dist/ghc.cjs` alongside it. `--miso` packs
  * a second, separately-fetched blob: `node build/miso-web/build.mjs` first,
  * to produce `dist/pkgs` (miso, ghcjs-base, aeson… — everything web miso
- * needs that is not already a boot package).
+ * needs that is not already a boot package). It also writes `pkgs.json`, the
+ * module-to-package index the page reads to decide whether a program needs
+ * that blob at all.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,6 +23,12 @@ const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i === -
 const lib = join(root, arg("lib", "dist/lib"));
 const out = join(root, arg("out", "playground/assets"));
 mkdirSync(out, { recursive: true });
+
+// GHC's RTS names a `JSBI` polyfill nothing defines. build-compiler.mjs
+// prepends it to the compiler; a *compiled program* needs it just as much, so
+// the page prepends the same file to whatever it just built. One copy, one
+// source of truth.
+copyFileSync(join(root, "build/jsbi-shim.js"), join(out, "jsbi-shim.js"));
 
 const allFiles = (dir) => {
   const found = [];
@@ -110,26 +118,86 @@ if (process.argv.includes("--miso")) {
   // own packages declare as dependencies.
   const bootIds = new Set(readdirSync(join(lib, "package.conf.d")).filter((f) => f.endsWith(".conf")).map((f) => f.replace(/\.conf$/, "")));
   const minimalIds = new Set([...bootIds].filter((id) => minimal.test(id)));
-  /** `depends:` is a list field: often the value starts on the next,
-   * indented line, and (once `relocate` in build-packages.mjs has dropped
-   * the haddock-* fields that used to follow it) it may be the last field
-   * in the file, with nothing after it to mark where the list ends. */
-  const confDepends = (text) => {
-    const ids = [];
-    let inDepends = false;
+  /** A `.conf` list field (`depends:`, `exposed-modules:`): the value often
+   * starts on the next, indented line, and (once `relocate` in
+   * build-packages.mjs has dropped the haddock-* fields that used to follow
+   * it) it may be the last field in the file, with nothing after it to mark
+   * where the list ends. */
+  const confList = (text, field) => {
+    const items = [];
+    let inside = false;
     for (const line of text.split("\n")) {
-      const m = /^depends:(.*)$/.exec(line);
-      if (m) { inDepends = true; ids.push(...m[1].trim().split(/\s+/).filter(Boolean)); continue; }
-      if (/^\S/.test(line)) { inDepends = false; continue; }
-      if (inDepends) ids.push(...line.trim().split(/\s+/).filter(Boolean));
+      const m = new RegExp(`^${field}:(.*)$`).exec(line);
+      if (m) { inside = true; items.push(...m[1].trim().split(/\s+/).filter(Boolean)); continue; }
+      if (/^\S/.test(line)) { inside = false; continue; }
+      if (inside) items.push(...line.trim().split(/\s+/).filter(Boolean));
     }
-    return ids;
+    return items;
   };
+  const confName = (text) => /^name:\s*(\S+)/m.exec(text)?.[1];
   const confDir = join(pkgs, "package.conf.d");
   const extraBoot = new Set();
   for (const f of readdirSync(confDir).filter((f) => f.endsWith(".conf")))
-    for (const id of confDepends(readFileSync(join(confDir, f), "utf8")))
+    for (const id of confList(readFileSync(join(confDir, f), "utf8"), "depends"))
       if (bootIds.has(id) && !minimalIds.has(id)) extraBoot.add(id);
+
+  // Template Haskell runs a splice in GHC's own interpreter, which is the
+  // `ghci` package and everything under it - linked at compile time, so its
+  // files have to be here even though no program imports them.
+  const libConf = (id) => readFileSync(join(lib, "package.conf.d", `${id}.conf`), "utf8");
+  const closure = (roots) => {
+    const seen = new Set();
+    const todo = [...roots];
+    while (todo.length) {
+      const id = todo.pop();
+      if (!bootIds.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      todo.push(...confList(libConf(id), "depends"));
+    }
+    return seen;
+  };
+  const ghci = [...bootIds].find((id) => id.startsWith("ghci-"));
+  if (!ghci) {
+    console.error(`${lib}/package.conf.d has no ghci package, so Template Haskell cannot run.`);
+    process.exit(2);
+  }
+  for (const id of closure([ghci])) if (!minimalIds.has(id)) extraBoot.add(id);
+
+  // What the page needs to decide, *before* fetching 120 MB, whether this
+  // blob has anything a given program wants: which module comes from which
+  // package, over everything the blob ships. `expose` are the ones that live
+  // in this database and so need `-package name` on the command line; the
+  // boot packages are already registered globally and only need their files.
+  const index = { expose: [], boot: [], modules: {} };
+  const addConf = (text, list) => {
+    const name = confName(text);
+    if (!name) return;
+    list.push(name);
+    for (const mod of confList(text, "exposed-modules"))
+      if (/^[A-Z][A-Za-z0-9_.']*$/.test(mod)) index.modules[mod] = name;
+  };
+  for (const f of readdirSync(confDir).filter((f) => f.endsWith(".conf")))
+    addConf(readFileSync(join(confDir, f), "utf8"), index.expose);
+  for (const id of extraBoot)
+    addConf(readFileSync(join(lib, "package.conf.d", `${id}.conf`), "utf8"), index.boot);
+
+
+  // A `dist/pkgs-<ref>` is a second miso, for projects whose cabal.project
+  // pins that one (see build/miso-web/build.mjs --ref). Each is its own small
+  // blob, fetched only when a project asks for it, and holds only miso: its
+  // dependencies are the ones `pkgs` already carries.
+  index.alternates = {};
+  for (const dir of readdirSync(join(root, "dist")).filter((d) => d.startsWith("pkgs-"))) {
+    const ref = dir.slice("pkgs-".length);
+    const from = join(root, "dist", dir);
+    const conf = readdirSync(join(from, "package.conf.d")).find((f) => f.startsWith("miso-") && f.endsWith(".conf"));
+    if (!conf) {
+      console.error(`${from} has no miso package; skipping`);
+      continue;
+    }
+    pack(`miso-${ref}`, allFiles(from).map((p) => ({ diskPath: p, vfsPath: `${dir}/${relative(from, p)}` })));
+    index.alternates[ref] = { blob: `miso-${ref}`, db: dir, id: conf.replace(/\.conf$/, "") };
+  }
 
   const entries = [];
   for (const p of allFiles(pkgs)) entries.push({ diskPath: p, vfsPath: `pkgs/${relative(pkgs, p)}` });
@@ -137,4 +205,10 @@ if (process.argv.includes("--miso")) {
     if (extraBoot.has(relative(lib, p).split("/")[1])) entries.push({ diskPath: p, vfsPath: relative(lib, p) });
   console.log(`extra boot packages for miso: ${[...extraBoot].join(", ") || "(none)"}`);
   pack("miso", entries);
+
+  writeFileSync(join(out, "pkgs.json"), JSON.stringify(index));
+  console.log(
+    `${index.expose.length} packages, ${Object.keys(index.modules).length} modules, ` +
+      `alternates ${Object.keys(index.alternates).join(", ") || "(none)"} -> ${join(out, "pkgs.json")}`,
+  );
 }

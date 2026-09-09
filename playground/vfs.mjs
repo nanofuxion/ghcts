@@ -155,8 +155,27 @@ export class Vfs {
   }
 }
 
-/** node's `fs`, as much of it as GHC's RTS asks for. */
-export function makeFs(vfs, { stdout, stderr, guard = (f) => f } = {}) {
+/** A stat for something that is not a file in this filesystem: the pipes GHC
+ * makes for its interpreter. `fdType` reads the mode, and `S_IFIFO` is what
+ * tells it not to expect seeking. */
+const fifoStat = () => ({
+  dev: 1, ino: 1, nlink: 1, uid: 0, gid: 0, rdev: 0,
+  mode: 0o010600,
+  size: 0, blksize: 4096, blocks: 0,
+  atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0,
+  isFile: () => false, isDirectory: () => false, isSymbolicLink: () => false,
+  isBlockDevice: () => false, isCharacterDevice: () => false,
+  isFIFO: () => true, isSocket: () => false,
+});
+
+/**
+ * node's `fs`, as much of it as GHC's RTS asks for.
+ *
+ * `fifos` is anything with `has(fd)`: those fds are pipes handed out by
+ * `h$pipe` rather than open files, and stat is the one call that reaches
+ * here for them - reads and writes go through the RTS's own fd table.
+ */
+export function makeFs(vfs, { stdout, stderr, guard = (f) => f, fifos = new Set() } = {}) {
   const write = (fd, chunk) => {
     if (fd === 1) stdout?.(chunk);
     else if (fd === 2) stderr?.(chunk);
@@ -287,6 +306,7 @@ export function makeFs(vfs, { stdout, stderr, guard = (f) => f } = {}) {
       if (open) open.node.bytes = (open.node.bytes ?? new Uint8Array(0)).subarray(0, len);
     },
     fstatSync: (fd) => {
+      if (fifos.has(fd)) return fifoStat();
       const open = vfs.fds.get(fd);
       if (!open) throw err("EBADF", String(fd), "fstat");
       return vfs.statFrom(open.node);

@@ -28,7 +28,9 @@ found is asked for its own `--print-libdir` and `--numeric-version`.
    wraps.
 3. Copy the boot packages a compiled program needs into `dist/lib/`, leaving
    out `ghc`, `Cabal` and `haddock` (needed to build the compiler, never to
-   run it) and the profiling and debug ways. 2.7 GB becomes ~130 MB.
+   run it) and the profiling and debug ways. 2.7 GB becomes ~140 MB.
+   `ghc-heap` stays: `ghci` depends on it, and `ghci` is what runs a Template
+   Haskell splice.
 
 `dist/ghc.cjs` is always linked with a *native* GHC that already targets
 JavaScript - never with itself. `findGhcJs()`/`ghcInstallAt()` only ever look

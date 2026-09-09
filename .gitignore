@@ -21,8 +21,11 @@ references/video/
 # Built compiler assets (node build/build-compiler.mjs, node playground/pack-assets.mjs)
 playground/assets/
 
-# build/miso-web/build.mjs clones ghcjs-base and configures cabal at build
-# time; none of that is meant to be committed.
+# build/miso-web/build.mjs clones ghcjs-base, checks out a worktree per
+# --ref, and configures cabal at build time; none of that is meant to be
+# committed.
 build/miso-web/ghcjs-base/
 build/miso-web/dist-newstyle/
 build/miso-web/cabal.project.local
+build/miso-web/miso-*/
+build/miso-web/alt-*/

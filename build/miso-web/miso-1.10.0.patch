@@ -1,0 +1,13 @@
+diff --git a/src/Miso/JSON.hs b/src/Miso/JSON.hs
+index 4a4dc907..34d0c13f 100644
+--- a/src/Miso/JSON.hs
++++ b/src/Miso/JSON.hs
+@@ -862,7 +862,7 @@ foreign import javascript unsafe
+ -----------------------------------------------------------------------------
+ #ifdef GHCJS_NEW
+ foreign import javascript unsafe
+-  "(($1) => { return JSON.stringify($1, null, $2); })"
++  "(($1, $2) => { return JSON.stringify($1, null, $2); })"
+   encodePretty_ffi :: JSVal -> Int -> IO MisoString
+ #endif
+ -----------------------------------------------------------------------------

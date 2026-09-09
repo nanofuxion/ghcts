@@ -2,7 +2,7 @@ import { deepStrictEqual, ok } from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Vfs } from "../playground/vfs.mjs";
-import { findEntry, mountDirectory, parseCabal } from "../playground/project.mjs";
+import { findEntry, haskellSources, importedModules, mountDirectory, mountGitHub, neededPackages, parseCabal, parseGitHubUrl, pinnedMiso, usesTemplateHaskell } from "../playground/project.mjs";
 
 const enc = (s) => new TextEncoder().encode(s);
 
@@ -108,4 +108,99 @@ test("findEntry returns undefined when nothing looks like a program", () => {
   const vfs = new Vfs();
   vfs.mkdirp("/empty");
   deepStrictEqual(findEntry(vfs, "/empty"), undefined);
+});
+
+/** The shape pack-assets.mjs writes to playground/assets/pkgs.json. */
+const INDEX = {
+  expose: ["miso", "random"],
+  boot: ["containers", "mtl"],
+  modules: { Miso: "miso", "Miso.Random": "miso", "System.Random": "random", "Data.Map": "containers", "Data.Map.Strict": "containers" },
+};
+
+test("importedModules reads plain, qualified and dotted imports", () => {
+  const text = ["module Main where", "import Data.List", "import qualified Data.Map as M", "import System.Random (randomRIO)", "  import NotAnImport"].join("\n");
+  deepStrictEqual(importedModules(text), ["Data.List", "Data.Map", "System.Random"]);
+});
+
+test("neededPackages picks up a lone file's imports, with no .cabal at all", () => {
+  deepStrictEqual(neededPackages(["module Main where\nimport System.Random\n"], [], INDEX), ["random"]);
+});
+
+test("neededPackages takes build-depends the database has, and ignores the rest", () => {
+  deepStrictEqual(neededPackages([], ["base", "containers", "miso", "mtl"], INDEX), ["containers", "miso", "mtl"]);
+});
+
+test("neededPackages says nothing is needed for a Prelude-only program", () => {
+  deepStrictEqual(neededPackages(["module Main where\nimport Data.List\nmain = pure ()\n"], ["base"], INDEX), []);
+});
+
+test("haskellSources reads every .hs under the root, and nothing else", () => {
+  const vfs = new Vfs();
+  vfs.mkdirp("/p/src");
+  vfs.writeFile("/p/src/Main.hs", enc("import Miso\n"));
+  vfs.writeFile("/p/src/Cards.hs", enc("import Data.Map\n"));
+  vfs.writeFile("/p/README.md", enc("import System.Random\n"));
+  deepStrictEqual(neededPackages(haskellSources(vfs, "/p"), [], INDEX).sort(), ["containers", "miso"]);
+});
+
+test("parseCabal turns default-language and default-extensions into -X flags", () => {
+  const [exe] = parseCabal(
+    ["executable app", "  main-is: Main.hs", "  default-language: GHC2021", "  default-extensions:", "    LambdaCase", "    OverloadedStrings"].join("\n"),
+  );
+  deepStrictEqual(exe.extensions, ["-XGHC2021", "-XLambdaCase", "-XOverloadedStrings"]);
+});
+
+test("parseGitHubUrl reads the forms people actually paste", () => {
+  deepStrictEqual(parseGitHubUrl("https://github.com/haskell-miso/mario"), { owner: "haskell-miso", repo: "mario", ref: "HEAD", dir: "" });
+  deepStrictEqual(parseGitHubUrl("haskell-miso/mario"), { owner: "haskell-miso", repo: "mario", ref: "HEAD", dir: "" });
+  deepStrictEqual(parseGitHubUrl("github.com/dmjio/miso.git"), { owner: "dmjio", repo: "miso", ref: "HEAD", dir: "" });
+  deepStrictEqual(parseGitHubUrl("https://github.com/a/b/tree/main/sample-app"), { owner: "a", repo: "b", ref: "main", dir: "sample-app" });
+  deepStrictEqual(parseGitHubUrl("not a url"), undefined);
+});
+
+test("mountGitHub takes the sources and leaves the rest behind", async () => {
+  const tree = [
+    { type: "blob", path: "app.cabal" },
+    { type: "blob", path: "src/Main.hs" },
+    { type: "blob", path: "docs/table.png" },
+    { type: "tree", path: "src" },
+  ];
+  const fetched = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    fetched.push(url);
+    if (url.startsWith("https://api.github.com/")) return { ok: true, json: async () => ({ tree }) };
+    return { ok: true, arrayBuffer: async () => enc(`-- ${url}`).buffer };
+  };
+  try {
+    const vfs = new Vfs();
+    const { count } = await mountGitHub(vfs, { owner: "o", repo: "r", ref: "HEAD", dir: "" }, "/project");
+    deepStrictEqual(count, 2);
+    ok(vfs.lookup("/project/src/Main.hs"));
+    ok(!vfs.lookup("/project/docs/table.png"), "a png is not something the compiler reads");
+    deepStrictEqual(fetched.filter((u) => u.startsWith("https://api.github.com/")).length, 1, "the rate-limited endpoint is asked once");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("usesTemplateHaskell sees the pragma and the cabal extension", () => {
+  ok(usesTemplateHaskell(["{-# LANGUAGE TemplateHaskell #-}\nmodule Model where\n"]));
+  ok(usesTemplateHaskell([], ["-XGHC2021", "-XQuasiQuotes"]));
+  ok(!usesTemplateHaskell(["{-# LANGUAGE OverloadedStrings #-}\n"], ["-XLambdaCase"]));
+});
+
+test("pinnedMiso reads a cabal.project's source-repository-package tag", () => {
+  const vfs = new Vfs();
+  vfs.mkdirp("/p");
+  vfs.writeFile(
+    "/p/cabal.project",
+    enc(["packages: .", "", "source-repository-package", "  type: git", "  location: https://github.com/dmjio/miso", "  tag: 1.13.0"].join("\n")),
+  );
+  deepStrictEqual(pinnedMiso(vfs, "/p"), "1.13.0");
+
+  const bare = new Vfs();
+  bare.mkdirp("/p");
+  bare.writeFile("/p/cabal.project", enc("packages: .\n"));
+  deepStrictEqual(pinnedMiso(bare, "/p"), undefined);
 });

@@ -44,7 +44,7 @@ if (ghc.endsWith(".cjs")) {
 }
 const out = resolve(root, arg("out", "dist"));
 /** Packages that exist only to build the compiler, and ways nothing links. */
-const buildOnly = /^(ghc-\d|Cabal|Cabal-syntax|haddock|xhtml|ghc-heap)/;
+const buildOnly = /^(ghc-\d|Cabal|Cabal-syntax|haddock|xhtml)/;
 const unusedWay = (f) => f.endsWith(".p_hi") || f.endsWith("_p.a") || f.includes("_debug") || f.includes("_thr");
 
 const run = (cmd, args, opts = {}) => {

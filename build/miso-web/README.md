@@ -12,9 +12,11 @@ node playground/pack-assets.mjs --miso
 ## Why this is a separate build
 
 `references/miso`'s own `cabal.project` asks for `+native`: LynxJS, phones,
-`scripts/build-lynx-bundles.mjs`. Listing it as a package here instead, with
-no `flags:` line, gets the default build — the DOM backend, `js/miso.js`,
-`ffi/js` — same source, different package. Only miso and ghcjs-base are
+`scripts/build-lynx-bundles.mjs`. Listing it as a package here instead gets
+the default build — the DOM backend, `js/miso.js`, `ffi/js` — same source,
+different package. The one flag asked for is `+template-haskell`, which adds
+`Miso.Lens.TH` and `Miso.FFI.QQ`; the miso examples use both, and the
+playground can run a splice (see `playground/README.md`). Only miso and ghcjs-base are
 rebuilt; the cabal store already has aeson, vector and the rest of
 ghcjs-base's dependencies from an earlier native build against the same
 compiler, and this reuses them rather than rebuilding.

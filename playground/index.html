@@ -35,6 +35,10 @@
   #right.split #out:empty { display: none; }
   #right.split #out:not(:empty) { flex: 0 0 8rem; overflow: auto; border-bottom: 1px solid var(--edge); }
   #files { font: 12px ui-monospace, monospace; color: #888; }
+  #repo { font: inherit; padding: .3rem .8rem; border: 1px solid var(--edge); border-radius: 6px; background: transparent; color: inherit; width: 15rem; }
+  #stdin-row:not([hidden]) { display: flex; border-top: 1px solid var(--edge); }
+  #stdin { flex: 1; border: 0; background: transparent; color: inherit; padding: .5rem .8rem; font: 13px ui-monospace, monospace; }
+  #stdin:focus { outline: 0; }
 </style>
 
 <header>
@@ -42,6 +46,7 @@
   <button id="sidebar-open" hidden title="Show the file list">Files</button>
   <button id="run" disabled>Compile and run</button>
   <button id="open">Open a folder…</button>
+  <input id="repo" spellcheck="false" autocomplete="off" placeholder="github.com/owner/repo">
   <span id="template-row"><select id="template"><option value="prelude">Prelude</option><option value="miso">miso</option></select></span>
   <span id="files"></span>
   <span id="status">loading the compiler…</span>
@@ -57,18 +62,19 @@
   <div class="resizer" id="resize-editor"></div>
   <div id="right">
     <pre id="out"></pre>
+    <div id="stdin-row" hidden><input id="stdin" spellcheck="false" autocomplete="off" placeholder="the program is asking for input — type a line and press Enter"></div>
     <iframe id="preview" hidden title="program preview"></iframe>
   </div>
 </main>
 
 <script type="module">
 import { Vfs } from "./vfs.mjs";
-import { runCompiler } from "./host.mjs";
-import { findEntry, mountDirectory } from "./project.mjs";
+import { makeStdin, runCompiler } from "./host.mjs";
+import { findEntry, haskellSources, mountDirectory, mountGitHub, neededPackages, parseGitHubUrl, pinnedMiso, usesTemplateHaskell } from "./project.mjs";
 
 const $ = (id) => document.getElementById(id);
 const say = (t) => ($("status").textContent = t);
-const print = (t) => ($("out").textContent += t);
+const print = (t) => { $("out").textContent += t; $("out").scrollTop = $("out").scrollHeight; };
 const enc = (s) => new TextEncoder().encode(s);
 const dec = (b) => new TextDecoder().decode(b);
 const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -105,6 +111,21 @@ viewModel _ _ n =
   H.div_ [] [ H.button_ [ H.onClick AddOne ] [ "+" ], text (ms n), H.button_ [ H.onClick SubtractOne ] [ "-" ] ]
 `,
 };
+
+/**
+ * `-ddisable-js-c-sources` (see build/README.md) leaves out the JavaScript
+ * GHC's linker would have made from a package's C sources, so anything a
+ * program reaches through one has to be supplied here instead. splitmix's is
+ * a single function - 64 bits of seed, high word returned and low word left
+ * in `h$ret1` - and `initStdGen` sits on top of it, which is every
+ * `randomRIO` and `newStdGen` a program might call.
+ */
+const SPLITMIX_SHIM = "function h$splitmix_init(){h$ret1=(Math.random()*4294967296)>>>0;return (((Date.now()>>>0)^(Math.random()*4294967296))>>>0);}\n";
+
+/** The above plus `assets/jsbi-shim.js`, which the compiler bundle already
+ * carries and a compiled program needs for the same reason: GHC's RTS calls
+ * `JSBI.*` in its 64-bit helpers and nothing defines it. */
+let C_SHIMS = SPLITMIX_SHIM;
 
 /** A stall, not just a failure, is the failure mode a fetch of 100+ MB
  * actually has: the connection sits open with nothing arriving, and `fetch`
@@ -169,14 +190,22 @@ addEventListener("message", (e) => {
   if (e.source === $("preview")?.contentWindow && e.data?.ghctsPreviewError) print(`\npreview error: ${e.data.ghctsPreviewError}\n`);
 });
 
+/** What packages the second blob would bring, if it were fetched. Written by
+ * `pack-assets.mjs --miso`; without it there is no `miso.bin` either, so an
+ * empty index and "no extra packages available" are the same answer. */
+const EMPTY_PKGS = { expose: [], boot: [], modules: {}, alternates: {} };
+
 say("fetching the compiler…");
-let source, libBin, libIndex;
+let source, libBin, libIndex, pkgIndex, jsbi;
 try {
-  [source, libBin, libIndex] = await Promise.all([
+  [source, libBin, libIndex, pkgIndex, jsbi] = await Promise.all([
     fetchChunked("./assets/ghc.cjs", progress("compiler")).then(dec),
     fetchChunked("./assets/lib.bin", progress("libraries")),
     fetch("./assets/lib.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for lib.json`)))),
+    fetch("./assets/pkgs.json").then((r) => (r.ok ? r.json() : EMPTY_PKGS)).catch(() => EMPTY_PKGS),
+    fetch("./assets/jsbi-shim.js").then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status} for jsbi-shim.js`)))),
   ]);
+  C_SHIMS = `${jsbi}\n${SPLITMIX_SHIM}`;
 } catch (e) {
   // The run button stays disabled: there is nothing to run.
   say(`could not load: ${e.message}`);
@@ -191,28 +220,35 @@ vfs.mkdirp("/work");
 vfs.mkdirp("/tmp");
 vfs.cwd = "/work";
 
-/** miso's extra boot packages and its own package db, fetched only when a
- * miso program is actually going to be compiled. */
-let misoPromise;
-const ensureMiso = () =>
-  (misoPromise ??= (async () => {
-    say("fetching miso…");
-    try {
-      const [bin, index] = await Promise.all([
-        fetchChunked("./assets/miso.bin", progress("miso")),
-        fetch("./assets/miso.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for miso.json`)))),
-      ]);
-      for (const { path, offset, size } of index)
-        vfs.writeFile(`/lib/${path}`, { size, load: () => bin.subarray(offset, offset + size) }, 1_600_000_000_000);
-    } catch (e) {
-      // A one-time network hiccup should not wedge the miso template for
-      // the rest of the session: without this, `misoPromise` would stay
-      // set to this same rejected promise, and every later attempt would
-      // fail instantly without ever trying the network again.
-      misoPromise = undefined;
-      throw e;
-    }
-  })());
+/** A blob of libraries, fetched the first time something needs it and mounted
+ * where its index says. `miso` is the big one - miso itself, the boot packages
+ * beyond the Prelude's, and GHC's interpreter - and each `miso-<ref>` is a
+ * second miso for a project that pins that revision. */
+const blobs = new Map();
+const ensureBlob = (name) => {
+  if (!blobs.has(name))
+    blobs.set(
+      name,
+      (async () => {
+        try {
+          const [bin, index] = await Promise.all([
+            fetchChunked(`./assets/${name}.bin`, progress(name)),
+            fetch(`./assets/${name}.json`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} for ${name}.json`)))),
+          ]);
+          for (const { path, offset, size } of index)
+            vfs.writeFile(`/lib/${path}`, { size, load: () => bin.subarray(offset, offset + size) }, 1_600_000_000_000);
+        } catch (e) {
+          // A one-time network hiccup should not wedge this blob for the rest
+          // of the session: without this the rejected promise would stay in
+          // the map, and every later attempt would fail without trying again.
+          blobs.delete(name);
+          throw e;
+        }
+      })(),
+    );
+  return blobs.get(name);
+};
+const ensureMiso = () => ensureBlob("miso");
 
 // --- the file tree, and the one open editor over whichever file is current ---
 
@@ -224,6 +260,9 @@ let currentPath;
 let fileHandles = new Map();
 /** What findEntry() decided about an opened project, or undefined until then. */
 let project;
+/** Where a repo's own files live, so a preview's relative `assets/…` URLs
+ * resolve against the repository rather than against this page. */
+let projectBase;
 /** Toggled by clicking a folder row in the tree. */
 const collapsedDirs = new Set();
 let previewUrl;
@@ -339,6 +378,57 @@ $("template").onchange = async () => {
 say("ready");
 $("run").disabled = false;
 
+/** Throw away whatever project was mounted before. Without this a second
+ * repo lands on top of the first, and the old `.cabal` still decides where
+ * the program starts. */
+function clearProject() {
+  vfs.lookup("/project", { parent: true })?.children.delete("project");
+  collapsedDirs.clear();
+  currentPath = undefined;
+  project = undefined;
+}
+
+/** Whatever was just mounted at /project becomes the thing that compiles. */
+function adoptProject(label) {
+  root = "/project";
+  vfs.cwd = "/project";
+  project = findEntry(vfs, "/project");
+  $("template-row").hidden = true;
+  $("files").textContent = label;
+  $("sidebar").classList.remove("collapsed");
+  $("sidebar-open").hidden = true;
+  renderTree();
+  if (!project) {
+    currentPath = undefined;
+    say("mounted, but no entry point was found — pick a file to edit");
+    return;
+  }
+  openFile(`/project/${project.entry}`);
+  say(project.usesMiso ? "mounted — a miso web app; edit and compile" : "mounted; edit and compile");
+  if (project.usesMiso) ensureMiso();
+}
+
+/** Load a public repo straight from GitHub. There is no server of ours in
+ * this page, and none in this either: the tree API and
+ * raw.githubusercontent.com both allow cross-origin reads. */
+async function loadRepo() {
+  const repo = parseGitHubUrl($("repo").value);
+  if (!repo) { say("that does not look like a GitHub repository"); return; }
+  projectBase = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.ref}/${repo.dir ? `${repo.dir}/` : ""}`;
+  $("repo").blur();
+  try {
+    await saveCurrent();
+    say(`fetching ${repo.owner}/${repo.repo}…`);
+    clearProject();
+    fileHandles = new Map(); // nothing here came off a disk we can write to
+    const { count } = await mountGitHub(vfs, repo, "/project", (done, total) => say(`fetching ${repo.owner}/${repo.repo}… ${done}/${total}`));
+    adoptProject(`${repo.owner}/${repo.repo} — ${count} files`);
+  } catch (e) {
+    say(`could not load ${repo.owner}/${repo.repo}: ${e.message}`);
+  }
+}
+$("repo").addEventListener("keydown", (e) => { if (e.key === "Enter") loadRepo(); });
+
 $("open").onclick = async () => {
   if (!window.showDirectoryPicker) { say("this browser has no folder picker"); return; }
   let handle;
@@ -351,24 +441,11 @@ $("open").onclick = async () => {
   try {
     await saveCurrent();
     say("reading the folder…");
+    clearProject();
     const { count, handles } = await mountDirectory(vfs, handle, "/project");
     fileHandles = handles;
-    root = "/project";
-    vfs.cwd = "/project";
-    project = findEntry(vfs, "/project");
-    $("template-row").hidden = true;
-    $("files").textContent = `${handle.name}/ — ${count} files`;
-    $("sidebar").classList.remove("collapsed");
-    $("sidebar-open").hidden = true;
-    renderTree();
-    if (project) {
-      openFile(`/project/${project.entry}`);
-      say(project.usesMiso ? "folder mounted — a miso web app; edit and compile" : "folder mounted; edit and compile");
-      if (project.usesMiso) ensureMiso();
-    } else {
-      currentPath = undefined;
-      say("folder mounted, but no entry point was found in it — pick a file to edit");
-    }
+    projectBase = undefined; // a picked folder is not reachable by URL
+    adoptProject(`${handle.name}/ — ${count} files`);
   } catch (e) {
     say(`could not read the folder: ${e.message}`);
   }
@@ -377,33 +454,68 @@ $("open").onclick = async () => {
 $("run").onclick = async () => {
   $("run").disabled = true;
   $("out").textContent = "";
+  $("stdin-row").hidden = true;
   $("preview").hidden = true;
   $("right").classList.remove("split");
   try {
     await saveCurrent();
     const inProject = root === "/project";
-    const usesMiso = inProject ? (project?.usesMiso ?? false) : $("template").value === "miso";
     const entry = inProject ? project?.entry : "Main.hs";
     if (!entry) { say("pick a file to compile"); return; }
     const includeDirs = inProject ? project?.includeDirs ?? ["."] : ["."];
 
-    if (usesMiso) { say("fetching miso…"); await ensureMiso(); }
+    // Anything beyond the Prelude - miso, random, containers - lives in the
+    // second blob. What this program imports, and what its .cabal asks for,
+    // is what decides whether to fetch it and what to expose from it.
+    const sources = haskellSources(vfs, root);
+    const needed = neededPackages(sources, inProject ? project?.dependencies ?? [] : [], pkgIndex);
+    const usesMiso = needed.includes("miso");
+    // A Template Haskell splice runs in GHC's own interpreter, and the `ghci`
+    // package that is rides in the same blob - nothing imports it, so nothing
+    // else would have asked for it.
+    const usesTH = usesTemplateHaskell(sources, inProject ? project?.extensions ?? [] : []);
+    // A project that pins a revision of miso we also built gets that one. Its
+    // database is stacked on top of the default, and naming the unit id is
+    // what picks it - `-package miso` alone would take the newest version.
+    const alternate = inProject ? pkgIndex.alternates?.[pinnedMiso(vfs, root)] : undefined;
+    if (needed.length || usesTH) { say("fetching libraries…"); await ensureMiso(); }
+    if (alternate) { say(`fetching miso ${alternate.blob.replace("miso-", "")}…`); await ensureBlob(alternate.blob); }
 
     const args = ["/lib", "-ddisable-js-c-sources", "-O0"];
-    if (usesMiso) args.push("-package-db", "/lib/pkgs/package.conf.d", "-package", "miso");
+    if (needed.length) args.push("-package-db", "/lib/pkgs/package.conf.d");
+    if (alternate) args.push("-package-db", `/lib/${alternate.db}/package.conf.d`, "-package-id", alternate.id);
+    for (const name of needed) if (pkgIndex.expose.includes(name) && !(alternate && name === "miso")) args.push("-package", name);
     if (includeDirs.length && !(includeDirs.length === 1 && includeDirs[0] === ".")) args.push(`-i${includeDirs.join(":")}`);
-    args.push(entry);
+    args.push(...(inProject ? project?.extensions ?? [] : []));
+    // Left to itself GHC names the output after the entry file and drops it
+    // beside the source, so `src/Main.hs` becomes `src/Main.jsexe`. Naming it
+    // instead is one less thing to guess. Clear it first: GHC links nothing
+    // at all when the module it compiled is not `Main`, and running whatever
+    // the *last* compile left behind is worse than saying so.
+    const outDir = `${root}/ghcts-out.jsexe`;
+    vfs.lookup(outDir, { parent: true })?.children.delete("ghcts-out.jsexe");
+    args.push("-o", `${root}/ghcts-out`, entry);
 
     say("compiling…");
     const started = performance.now();
     const code = await runCompiler({ source, vfs, argv: args, onOutput: print });
     const took = ((performance.now() - started) / 1000).toFixed(1);
-    if (code !== 0) { say(`compile failed in ${took}s`); return; }
+    if (code !== 0) {
+      say(`compile failed in ${took}s`);
+      // One build of miso is shipped. A project written against a different
+      // revision of it fails with a plain type error and no hint as to why.
+      const pin = inProject && !alternate ? pinnedMiso(vfs, root) : undefined;
+      if (pin && usesMiso)
+        print(`\nThis project's cabal.project pins miso at ${pin}, and the page ships one build\nof miso which is not that revision.\n`);
+      return;
+    }
 
-    // GHC names the .jsexe after the entry file's own basename, in cwd -
-    // not after the directory the source lives in.
-    const base = entry.slice(entry.lastIndexOf("/") + 1).replace(/\.hs$/i, "");
-    const allJs = `${root}/${base}.jsexe/all.js`;
+    const allJs = `${outDir}/all.js`;
+    if (!vfs.lookup(allJs)) {
+      say(`compiled in ${took}s, but nothing to run`);
+      print(`\nNothing was linked: ${entry} has to be \`module Main\` with a \`main\`.\n`);
+      return;
+    }
     const built = vfs.readFile(allJs);
 
     if (usesMiso) {
@@ -412,16 +524,34 @@ $("run").onclick = async () => {
       $("out").textContent = "";
       $("right").classList.add("split");
       if (previewUrl) URL.revokeObjectURL(previewUrl);
-      previewUrl = URL.createObjectURL(new Blob([built], { type: "text/javascript" }));
+      previewUrl = URL.createObjectURL(new Blob([C_SHIMS, built], { type: "text/javascript" }));
       // srcdoc keeps the page's own origin (no `sandbox` attribute), so the
       // app's own errors can be surfaced straight into the log above it.
-      $("preview").srcdoc = `<!doctype html><meta charset="utf-8"><body><div id="app"></div><script>window.onerror=(m)=>parent.postMessage({ghctsPreviewError:String(m)},"*");<\/script><script src="${previewUrl}"><\/script></body>`;
+      $("preview").srcdoc = `<!doctype html><meta charset="utf-8">${projectBase ? `<base href="${escapeHtml(projectBase)}">` : ""}<body><div id="app"></div><script>window.onerror=(m)=>parent.postMessage({ghctsPreviewError:String(m)},"*");<\/script><script src="${previewUrl}"><\/script></body>`;
       $("preview").hidden = false;
       say(`done in ${took}s`);
     } else {
       say(`compiled in ${took}s — running`);
-      // The program is another node-shaped bundle; give it the same host.
-      await runCompiler({ source: dec(built), vfs, argv: [], onOutput: print });
+      // A console program can ask for input, and there is no terminal here:
+      // the row below the log is stdin, one typed line at a time, echoed
+      // into the log so the transcript reads the way a terminal's would.
+      const io = makeStdin();
+      const onKey = (e) => {
+        if (e.key !== "Enter") return;
+        print(`${$("stdin").value}\n`);
+        io.write(enc(`${$("stdin").value}\n`));
+        $("stdin").value = "";
+      };
+      $("stdin").addEventListener("keydown", onKey);
+      $("stdin-row").hidden = false;
+      $("stdin").focus();
+      try {
+        // The program is another node-shaped bundle; give it the same host.
+        await runCompiler({ source: C_SHIMS + dec(built), vfs, argv: [], onOutput: print, stdin: io });
+      } finally {
+        $("stdin").removeEventListener("keydown", onKey);
+        $("stdin-row").hidden = true;
+      }
       say(`done in ${took}s to compile`);
     }
   } catch (e) {

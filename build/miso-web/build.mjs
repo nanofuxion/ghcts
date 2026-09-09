@@ -8,13 +8,19 @@
  * the same package with no flags at all, so only miso and ghcjs-base are
  * rebuilt here; aeson, vector and the rest are reused from the store.
  *
- *   node build/miso-web/build.mjs
+ *   node build/miso-web/build.mjs                # references/miso -> dist/pkgs
+ *   node build/miso-web/build.mjs --ref 1.10.0   # that tag -> dist/pkgs-1.10.0
+ *
+ * `--ref` builds a second miso from a git ref of the same repository, for
+ * projects whose `cabal.project` pins an older one. Only miso itself is kept:
+ * its dependencies are the same builds the default database already holds, so
+ * the two databases are stacked and the pinned `-package-id` picks the miso.
  *
  * The compiler must be the one that produced `dist/lib`, or the interfaces
  * will not match. Point `GHCTS_GHC` at it.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { findGhcJs, ghcInstallAt } from "../../dist/find-ghc.js";
@@ -78,12 +84,40 @@ if (spawnSync("git", ["apply", "--check", patch], { cwd: src }).status === 0) {
   run("git", ["apply", patch], { cwd: src });
 }
 
+// 1b. A `--ref` build gets its own worktree of references/miso and its own
+//     cabal project beside it, so the default build's dist-newstyle is left
+//     alone and the two can coexist.
+const ref = arg("ref");
+const projectDir = ref ? join(here, `alt-${ref}`) : here;
+if (ref) {
+  const worktree = join(here, `miso-${ref}`);
+  if (!existsSync(worktree)) {
+    console.log(`checking out miso ${ref}`);
+    run("git", ["worktree", "add", "-f", "--detach", worktree, ref], { cwd: join(root, "references/miso") });
+  }
+  // An old miso may need a fix to build or run under this compiler, the same
+  // way ghcjs-base does. `miso-<ref>.patch` beside this script is applied if
+  // it is there.
+  const fix = join(here, `miso-${ref}.patch`);
+  if (existsSync(fix) && spawnSync("git", ["apply", "--check", fix], { cwd: worktree }).status === 0) {
+    console.log(`patching miso ${ref}`);
+    run("git", ["apply", fix], { cwd: worktree });
+  }
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(
+    join(projectDir, "cabal.project"),
+    readFileSync(join(here, "cabal.project"), "utf8")
+      .replace("../../references/miso", `../miso-${ref}`)
+      .replace("./ghcjs-base", "../ghcjs-base"),
+  );
+}
+
 // 2. Point cabal at the same compiler.
 const hsc2hs = ["javascript-unknown-ghcjs-hsc2hs", `javascript-unknown-ghcjs-hsc2hs-ghc-${install.version}`]
   .map((f) => join(dirname(install.ghc), f))
   .find((p) => existsSync(p));
 writeFileSync(
-  join(here, "cabal.project.local"),
+  join(projectDir, "cabal.project.local"),
   [
     `with-compiler: ${install.ghc}`,
     ...(install.ghcPkg ? [`with-hc-pkg: ${install.ghcPkg}`] : []),
@@ -94,27 +128,44 @@ writeFileSync(
 
 // 3. Build miso. ghcjs-base comes with it; everything else is already in the
 //    store from an earlier build against this same compiler.
-console.log(`building miso for the web with GHC ${install.version}`);
-run("cabal", ["build", "miso"], { cwd: here });
+console.log(`building miso${ref ? ` ${ref}` : ""} for the web with GHC ${install.version}`);
+run("cabal", ["build", "miso"], { cwd: projectDir });
 
 // 4. Collect miso's closure into a relocatable database.
 // The store keeps one directory per compiler ABI, and this machine has more
 // than one for 9.12.2. Only the ABI that matches dist/lib can be linked
 // against: its unit ids are the ones dist/lib's boot packages carry.
 const abi = compilerId.replace(/^javascript-ghcjs-ghc-/, "");
-const storeDir = capture("cabal", ["path", "--store-dir"], { cwd: here });
+const storeDir = capture("cabal", ["path", "--store-dir"], { cwd: projectDir });
 const storeDb = [join(storeDir, `ghc-${abi}`, "package.db")].filter(existsSync);
 if (storeDb.length === 0) {
   console.error(`No cabal store for ghc-${abi}; miso's dependencies were built by another compiler.`);
   process.exit(1);
 }
-const inplaceDb = join(here, "dist-newstyle", "packagedb", `ghc-${install.version}`);
+const inplaceDb = join(projectDir, "dist-newstyle", "packagedb", `ghc-${install.version}`);
 
+const outDir = join(root, ref ? `dist/pkgs-${ref}` : "dist/pkgs");
 run("node", [
   join(root, "build/build-packages.mjs"),
   ...[inplaceDb, ...storeDb].flatMap((d) => ["--db", d]),
   "--package",
   "miso",
   "--out",
-  join(root, "dist/pkgs"),
+  outDir,
 ]);
+
+// 5. An alternate keeps only miso. Its dependencies came from the same store
+//    as the default database's, with the same unit ids, so shipping them
+//    twice would only make the download bigger.
+if (ref) {
+  const confs = join(outDir, "package.conf.d");
+  for (const id of readdirSync(outDir)) {
+    if (id === "package.conf.d" || id.startsWith("miso-")) continue;
+    if (!existsSync(join(root, "dist/pkgs", id))) continue;
+    rmSync(join(outDir, id), { recursive: true, force: true });
+    rmSync(join(confs, `${id}.conf`), { force: true });
+  }
+  run(install.ghcPkg, ["recache", `--package-db=${confs}`]);
+  const kept = readdirSync(confs).filter((f) => f.endsWith(".conf"));
+  console.log(`wrote ${outDir} (${kept.join(", ")})`);
+}
