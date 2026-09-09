@@ -70,7 +70,7 @@
 <script type="module">
 import { Vfs } from "./vfs.mjs";
 import { makeStdin, runCompiler } from "./host.mjs";
-import { findEntry, haskellSources, mountDirectory, mountGitHub, neededPackages, parseGitHubUrl, pinnedMiso, usesTemplateHaskell } from "./project.mjs";
+import { findEntry, haskellSources, mountDirectory, mountGitHub, neededPackages, parseGitHubUrl, pinnedMiso, usesNativeMiso, usesTemplateHaskell } from "./project.mjs";
 
 const $ = (id) => document.getElementById(id);
 const say = (t) => ($("status").textContent = t);
@@ -506,6 +506,10 @@ $("run").onclick = async () => {
     const took = ((performance.now() - started) / 1000).toFixed(1);
     if (code !== 0) {
       say(`compile failed in ${took}s`);
+      if (usesNativeMiso(sources)) {
+        print("\nThis project imports `Miso.Native`, which is miso's LynxJS build.\nThe page has the web one, and a browser cannot render through Lynx.\n");
+        return;
+      }
       // One build of miso is shipped. A project written against a different
       // revision of it fails with a plain type error and no hint as to why.
       const pin = inProject && !alternate ? pinnedMiso(vfs, root) : undefined;

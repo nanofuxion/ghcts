@@ -218,3 +218,14 @@ export function pinnedMiso(vfs, root) {
   }
   return undefined;
 }
+
+/**
+ * Whether a project is a LynxJS app rather than a web one.
+ *
+ * `Miso.Native.*` exists only in the build miso's `native` flag selects, which
+ * renders through Lynx and not the DOM. The page has the web build, so what
+ * GHC says is that a module is missing, and the version pin is not the reason.
+ */
+export function usesNativeMiso(sources) {
+  return sources.some((text) => importedModules(text).some((m) => m === "Miso.Native" || m.startsWith("Miso.Native.")));
+}

@@ -2,7 +2,7 @@ import { deepStrictEqual, ok } from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Vfs } from "../playground/vfs.mjs";
-import { findEntry, haskellSources, importedModules, mountDirectory, mountGitHub, neededPackages, parseCabal, parseGitHubUrl, pinnedMiso, usesTemplateHaskell } from "../playground/project.mjs";
+import { findEntry, haskellSources, importedModules, mountDirectory, mountGitHub, neededPackages, parseCabal, parseGitHubUrl, pinnedMiso, usesNativeMiso, usesTemplateHaskell } from "../playground/project.mjs";
 
 const enc = (s) => new TextEncoder().encode(s);
 
@@ -223,4 +223,10 @@ test("pinnedMiso reads a cabal.project's source-repository-package tag", () => {
   bare.mkdirp("/p");
   bare.writeFile("/p/cabal.project", enc("packages: .\n"));
   deepStrictEqual(pinnedMiso(bare, "/p"), undefined);
+});
+
+test("usesNativeMiso spots a LynxJS app", () => {
+  ok(usesNativeMiso(["module M where\nimport Miso.Native.MainThread\n"]));
+  ok(usesNativeMiso(["import qualified Miso.Native.Element.View.Event as VE\n"]));
+  ok(!usesNativeMiso(["import Miso\nimport Miso.Html\n"]), "the web build is not the native one");
 });
